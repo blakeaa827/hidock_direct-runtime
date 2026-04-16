@@ -1,0 +1,352 @@
+"""Per-file offload pipeline: size-stable check, chunked download, SHA verify,
+atomic rename, state update.
+
+See PRD §2.3 for the step-by-step contract. The atomicity invariant is load
+bearing: any exception leaves zero partial files in the archive and zero
+entries in `offload_state.json`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import shutil
+import threading
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, List, Optional
+
+from .device import (
+    DeviceAdapter,
+    DeviceError,
+    DeviceFile,
+    TransferAborted as DeviceTransferAborted,
+    sanitize_device_filename,
+)
+from .events import (
+    DownloadComplete,
+    DownloadProgress,
+    DownloadStarted,
+    EventBus,
+    FileDiscovered,
+    ScanComplete,
+    ScanStarted,
+    TransferAborted,
+)
+from .jensen import HTAConverter
+from .state import DeviceKey, StateStore, wav_duration_minutes
+
+
+MAX_DEVICE_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB hard ceiling (PRD §7)
+SIZE_STABLE_DELAY_SECONDS = 1.0
+HTA_EXTENSION = ".hda"
+WAV_EXTENSION = ".wav"
+
+
+class OffloadError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class OffloadResult:
+    device_filename: str
+    archive_path: Path
+    sha256: str
+    size_bytes: int
+    duration_minutes: float
+    converted_from_hda: bool
+
+
+def _chunked_sha256_of_file(path: os.PathLike[str] | str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while True:
+            data = fh.read(chunk)
+            if not data:
+                break
+            h.update(data)
+    return h.hexdigest()
+
+
+def _archive_basename(device_mtime: Optional[datetime], fallback_mtime: Optional[datetime]) -> str:
+    """Return the `YYYY-MM-DD_HHMMSS.wav` basename per PRD §2.3.2.
+
+    `device_mtime` wins; `fallback_mtime` (supplied by the caller, derived
+    from the clock) kicks in when the device offered no metadata.
+    """
+    when = device_mtime or fallback_mtime
+    if when is None:
+        when = datetime.now()
+    return f"{when.strftime('%Y-%m-%d_%H%M%S')}.wav"
+
+
+def _archive_subdir(when: datetime) -> Path:
+    return Path(f"{when.year:04d}") / f"{when.month:02d}"
+
+
+def _unique_archive_path(archive_dir: Path, basename: str, when: datetime) -> Path:
+    """Return a collision-free archive path.
+
+    Collisions happen when two recordings share a second-precision timestamp
+    (rare, but the device does emit them). Append `-1`, `-2`, ... before the
+    extension rather than overwriting an existing archive file.
+    """
+    subdir = archive_dir / _archive_subdir(when)
+    subdir.mkdir(parents=True, exist_ok=True)
+    candidate = subdir / basename
+    if not candidate.exists():
+        return candidate
+    stem, ext = os.path.splitext(basename)
+    i = 1
+    while True:
+        alt = subdir / f"{stem}-{i}{ext}"
+        if not alt.exists():
+            return alt
+        i += 1
+
+
+class Offloader:
+    """Runs the size-stable -> download -> verify -> rename -> state pipeline.
+
+    `cancel_event` is the signal that detach hand-off uses to abort an
+    in-flight download cleanly. If the event is set mid-stream, the vendored
+    jensen layer returns a non-"OK" status which we surface as
+    `TransferAborted`.
+    """
+
+    def __init__(
+        self,
+        *,
+        adapter: DeviceAdapter,
+        store: StateStore,
+        bus: EventBus,
+        archive_dir: Path,
+        tmp_dir: Path,
+        delete_after_offload: bool,
+        hta_converter: Optional[HTAConverter] = None,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], datetime] = datetime.now,
+    ):
+        self._adapter = adapter
+        self._store = store
+        self._bus = bus
+        self._archive_dir = archive_dir
+        self._tmp_dir = tmp_dir
+        self._delete_after_offload = delete_after_offload
+        self._hta = hta_converter
+        self._sleep = sleep
+        self._clock = clock
+
+    def ensure_dirs(self) -> None:
+        self._archive_dir.mkdir(parents=True, exist_ok=True)
+        self._tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    def clean_stale_partials(self) -> int:
+        """Remove any `*.partial` from a prior crashed run. Returns count removed."""
+        if not self._tmp_dir.exists():
+            return 0
+        removed = 0
+        for child in self._tmp_dir.iterdir():
+            if child.suffix == ".partial" and child.is_file():
+                try:
+                    child.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        return removed
+
+    def scan_new_files(self, device_key: DeviceKey) -> List[DeviceFile]:
+        """Emit ScanStarted/Complete; return files that are new AND size-stable."""
+        self._bus.publish(ScanStarted())
+        snapshot_a = self._adapter.list_files()
+        self._sleep(SIZE_STABLE_DELAY_SECONDS)
+        snapshot_b = self._adapter.list_files()
+        by_name_b = {f.name: f.size for f in snapshot_b}
+        stable_new: List[DeviceFile] = []
+        for file in snapshot_a:
+            if self._store.is_processed(device_key, file.name):
+                continue
+            if file.size <= 0:
+                continue
+            if file.size > MAX_DEVICE_FILE_SIZE:
+                continue
+            size_b = by_name_b.get(file.name)
+            if size_b is None or size_b != file.size:
+                continue
+            stable_new.append(file)
+            self._bus.publish(FileDiscovered(device_filename=file.name, size_bytes=file.size))
+        self._bus.publish(ScanComplete(new_file_count=len(stable_new)))
+        return stable_new
+
+    def offload(
+        self,
+        *,
+        device_key: DeviceKey,
+        file: DeviceFile,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> OffloadResult:
+        """Pull one file. Raises `TransferAborted`-derived errors on cancel/detach,
+        `OffloadError` on verify/convert failures. State/filesystem stay clean on failure.
+        """
+        device_filename = sanitize_device_filename(file.name)
+        if file.size > MAX_DEVICE_FILE_SIZE:
+            raise OffloadError(f"Device-reported size exceeds {MAX_DEVICE_FILE_SIZE}-byte ceiling: {file.size}")
+
+        self.ensure_dirs()
+        converted_from_hda = device_filename.lower().endswith(HTA_EXTENSION)
+
+        # Staging: download raw bytes to a .partial under .tmp/.
+        staged_name = f"{device_filename}.partial"
+        staged = self._tmp_dir / staged_name
+        if staged.exists():
+            staged.unlink()
+
+        basis_time = file.device_mtime or self._clock()
+        target_basename = _archive_basename(file.device_mtime, basis_time)
+        target_path = _unique_archive_path(self._archive_dir, target_basename, basis_time)
+
+        self._bus.publish(DownloadStarted(device_filename=device_filename, target_path=str(target_path)))
+
+        sha = hashlib.sha256()
+        bytes_written = 0
+
+        def on_chunk(chunk: bytes) -> None:
+            nonlocal bytes_written
+            staged_fh.write(chunk)
+            sha.update(chunk)
+            bytes_written += len(chunk)
+
+        def on_progress(done: int, total: int) -> None:
+            self._bus.publish(DownloadProgress(device_filename=device_filename, bytes_done=done, bytes_total=total))
+
+        try:
+            with open(staged, "wb") as staged_fh:
+                try:
+                    self._adapter.download_file(
+                        device_filename,
+                        file.size,
+                        on_chunk=on_chunk,
+                        on_progress=on_progress,
+                        cancel_event=cancel_event,
+                    )
+                finally:
+                    staged_fh.flush()
+                    os.fsync(staged_fh.fileno())
+        except (DeviceTransferAborted, DeviceError, OSError) as exc:
+            self._safe_unlink(staged)
+            reason = getattr(exc, "reason", None) or str(exc) or exc.__class__.__name__
+            self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+            raise DeviceTransferAborted(reason) from exc
+
+        # Verify size and SHA against what we just streamed.
+        actual_size = staged.stat().st_size
+        if actual_size != file.size:
+            self._safe_unlink(staged)
+            reason = f"size mismatch (expected {file.size}, got {actual_size})"
+            self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+            raise OffloadError(reason)
+        streamed_sha = sha.hexdigest()
+        disk_sha = _chunked_sha256_of_file(staged)
+        if streamed_sha != disk_sha:
+            self._safe_unlink(staged)
+            reason = "sha mismatch between stream and disk"
+            self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+            raise OffloadError(reason)
+
+        # .hda -> .wav conversion happens BEFORE atomic rename. We replace
+        # staged with the converted output and recompute its SHA on the
+        # converted bytes. That's what ends up in the archive + state.
+        if converted_from_hda:
+            converter = self._hta or HTAConverter()
+            try:
+                converted = converter.convert_hta_to_wav(str(staged))
+            except Exception as exc:  # noqa: BLE001 — vendored code raises a variety
+                self._safe_unlink(staged)
+                reason = f"hta conversion failed: {exc}"
+                self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+                raise OffloadError(reason) from exc
+            if not converted or not Path(converted).exists():
+                self._safe_unlink(staged)
+                reason = "hta conversion produced no output"
+                self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+                raise OffloadError(reason)
+            try:
+                self._safe_unlink(staged)
+                converted_path = Path(converted)
+                new_staged = self._tmp_dir / (device_filename + ".wav.partial")
+                if new_staged.exists():
+                    new_staged.unlink()
+                shutil.move(str(converted_path), str(new_staged))
+                staged = new_staged
+            except OSError as exc:
+                self._safe_unlink(staged)
+                reason = f"hta conversion rename failed: {exc}"
+                self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+                raise OffloadError(reason) from exc
+            disk_sha = _chunked_sha256_of_file(staged)
+
+        # Atomic rename into the archive.
+        try:
+            os.replace(staged, target_path)
+        except OSError as exc:
+            self._safe_unlink(staged)
+            reason = f"archive rename failed: {exc}"
+            self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+            raise OffloadError(reason) from exc
+
+        # Derive duration from the WAV header *after* the rename so we read
+        # what actually landed.
+        duration_minutes = wav_duration_minutes(target_path)
+
+        self._store.record_processed(
+            device_key,
+            device_filename=device_filename,
+            size_bytes=target_path.stat().st_size,
+            device_mtime=file.device_mtime.isoformat() if file.device_mtime else None,
+            sha256=disk_sha,
+            archive_path=str(target_path.relative_to(self._archive_dir)),
+            device_deleted=False,
+            duration_minutes=duration_minutes,
+        )
+
+        if self._delete_after_offload:
+            try:
+                self._adapter.delete_file(device_filename)
+                self._mark_device_deleted(device_key, device_filename)
+            except DeviceError:
+                # Leave archive intact; retries happen naturally on next scan.
+                pass
+
+        self._bus.publish(
+            DownloadComplete(
+                device_filename=device_filename,
+                archive_path=str(target_path),
+                sha256=disk_sha,
+            )
+        )
+
+        return OffloadResult(
+            device_filename=device_filename,
+            archive_path=target_path,
+            sha256=disk_sha,
+            size_bytes=target_path.stat().st_size,
+            duration_minutes=duration_minutes,
+            converted_from_hda=converted_from_hda,
+        )
+
+    def _mark_device_deleted(self, device_key: DeviceKey, device_filename: str) -> None:
+        with self._store._mutate() as data:  # type: ignore[attr-defined]
+            device = data["devices"].get(device_key.namespaced)
+            if device and device_filename in device.get("processed_recordings", {}):
+                device["processed_recordings"][device_filename]["device_deleted"] = True
+
+    @staticmethod
+    def _safe_unlink(path: os.PathLike[str] | str) -> None:
+        try:
+            Path(path).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass

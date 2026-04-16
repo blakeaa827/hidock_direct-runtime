@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hidock-direct"
+version = "0.1.0"
+description = "Foreground macOS TUI that pulls audio off the HiDock device over USB into a local archive."
+requires-python = ">=3.11"
+dependencies = [
+    "pyusb>=1.2",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+hidock-direct = "hidock_direct.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"hidock_direct.jensen" = ["VENDORED_COMMIT", "README.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["src/hidock_direct"]
+omit = [
+    # Vendored third-party code — pinned by commit in jensen/VENDORED_COMMIT.
+    # Not ours to own; upstream tests apply.
+    "src/hidock_direct/jensen/*",
+    # Entry point + TUI rendering — hardware-coupled, exercised by the
+    # manual Gate 4 procedure in scripts/manual_verify.sh rather than
+    # unit tests.
+    "src/hidock_direct/__main__.py",
+    "src/hidock_direct/tui.py",
+    "src/hidock_direct/usb_watcher.py",
+    "src/hidock_direct/device.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
