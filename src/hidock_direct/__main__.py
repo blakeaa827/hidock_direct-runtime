@@ -49,6 +49,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         archive_dir=config.archive_dir,
         tmp_dir=config.tmp_dir,
         delete_after_offload=config.delete_from_device_after_offload,
+        transcribe_on_offload=config.transcribe_on_offload,
     )
     app = App(
         adapter=adapter,

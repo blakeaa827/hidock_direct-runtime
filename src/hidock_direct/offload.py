@@ -144,6 +144,7 @@ class Offloader:
         archive_dir: Path,
         tmp_dir: Path,
         delete_after_offload: bool,
+        transcribe_on_offload: bool = True,
         hta_converter: Optional[HTAConverter] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = datetime.now,
@@ -154,6 +155,7 @@ class Offloader:
         self._archive_dir = archive_dir
         self._tmp_dir = tmp_dir
         self._delete_after_offload = delete_after_offload
+        self._transcribe_on_offload = transcribe_on_offload
         self._hta = hta_converter
         self._sleep = sleep
         self._clock = clock
@@ -361,6 +363,10 @@ class Offloader:
                 sha256=disk_sha,
             )
         )
+
+        if self._transcribe_on_offload:
+            from .transcribe import transcribe_file as _transcribe
+            _transcribe(target_path, self._archive_dir)
 
         return OffloadResult(
             device_filename=device_filename,

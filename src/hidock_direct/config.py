@@ -34,6 +34,7 @@ class Config:
     archive_dir: Path
     poll_interval_seconds: int
     delete_from_device_after_offload: bool
+    transcribe_on_offload: bool
     log_level: str
     source: str  # "env" or "<path>" — for diagnostics
 
@@ -94,6 +95,7 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     archive = _resolve("HIDOCK_ARCHIVE_DIR", "~/HiDock/archive", env_values, overlay)
     poll = _resolve("POLL_INTERVAL_SECONDS", "10", env_values, overlay)
     delete = _resolve("DELETE_FROM_DEVICE_AFTER_OFFLOAD", "false", env_values, overlay)
+    transcribe = _resolve("TRANSCRIBE_ON_OFFLOAD", "true", env_values, overlay)
     log = _resolve("LOG_LEVEL", "info", env_values, overlay).lower()
 
     try:
@@ -104,6 +106,7 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
         raise ValueError(f"POLL_INTERVAL_SECONDS must be > 0, got {poll_int}")
 
     delete_bool = str(delete).strip().lower() in _TRUE_SET
+    transcribe_bool = str(transcribe).strip().lower() in _TRUE_SET
     if log not in ("debug", "info", "warning", "error"):
         raise ValueError(f"LOG_LEVEL must be one of debug/info/warning/error, got {log!r}")
 
@@ -111,6 +114,7 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
         archive_dir=Path(archive).expanduser(),
         poll_interval_seconds=poll_int,
         delete_from_device_after_offload=delete_bool,
+        transcribe_on_offload=transcribe_bool,
         log_level=log,
         source=str(env_path) if env_path else "env",
     )
