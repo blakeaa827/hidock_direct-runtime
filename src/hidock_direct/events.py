@@ -80,6 +80,29 @@ class TransferAborted(Event):
 
 
 @dataclass(frozen=True)
+class TranscribeSkipped(Event):
+    device_filename: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class TranscribeStarted(Event):
+    device_filename: str
+
+
+@dataclass(frozen=True)
+class TranscribeComplete(Event):
+    device_filename: str
+    drive_file_id: Optional[str]
+
+
+@dataclass(frozen=True)
+class TranscribeFailed(Event):
+    device_filename: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class IdleWaiting(Event):
     state: str
 

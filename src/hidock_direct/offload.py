@@ -366,7 +366,12 @@ class Offloader:
 
         if self._transcribe_on_offload:
             from .transcribe import transcribe_file as _transcribe
-            _transcribe(target_path, self._archive_dir)
+            _transcribe(
+                target_path,
+                self._archive_dir,
+                bus=self._bus,
+                device_filename=device_filename,
+            )
 
         return OffloadResult(
             device_filename=device_filename,

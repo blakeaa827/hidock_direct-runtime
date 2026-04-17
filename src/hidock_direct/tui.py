@@ -37,6 +37,10 @@ from .events import (
     ScanComplete,
     ScanStarted,
     Severity,
+    TranscribeComplete,
+    TranscribeFailed,
+    TranscribeSkipped,
+    TranscribeStarted,
     TransferAborted,
 )
 
@@ -117,6 +121,23 @@ class TUI:
                 self._progress.pop(event.device_filename, None)
                 self._log.append(
                     (datetime.now(), f"✗ {event.device_filename}: {event.reason}", Severity.WARNING)
+                )
+            elif isinstance(event, TranscribeStarted):
+                self._log.append(
+                    (datetime.now(), f"⎋ transcribe → {event.device_filename}", Severity.INFO)
+                )
+            elif isinstance(event, TranscribeComplete):
+                drive = event.drive_file_id or "(no drive id)"
+                self._log.append(
+                    (datetime.now(), f"⎋ transcribe ✓ {event.device_filename} drive={drive}", Severity.INFO)
+                )
+            elif isinstance(event, TranscribeSkipped):
+                self._log.append(
+                    (datetime.now(), f"⎋ transcribe SKIPPED {event.device_filename}: {event.reason}", Severity.WARNING)
+                )
+            elif isinstance(event, TranscribeFailed):
+                self._log.append(
+                    (datetime.now(), f"⎋ transcribe FAILED {event.device_filename}: {event.reason}", Severity.ERROR)
                 )
             elif isinstance(event, Error):
                 ctx = f" [{event.context}]" if event.context else ""

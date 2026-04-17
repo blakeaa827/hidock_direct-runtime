@@ -9,15 +9,48 @@ from __future__ import annotations
 import signal
 import sys
 
+# Run BEFORE importing any editable-installed sibling (diarize_audio,
+# blake_commons). iCloud's UF_HIDDEN on __editable__*.pth makes site.py
+# skip them silently; this reinserts the paths into sys.path.
+from . import _pth_bootstrap
+
+_pth_bootstrap.bootstrap()
+
 from .app import App
 from .config import load_config
 from .device import JensenDeviceAdapter
-from .events import EventBus
+from .events import EventBus, TranscribeSkipped
 from .locks import FileLock, LockHeld
 from .offload import Offloader
 from .state import StateStore
 from .tui import TUI
 from .usb_watcher import PollingUSBWatcher
+
+
+def _preflight_transcribe(bus: EventBus) -> None:
+    """Fail loud if `TRANSCRIBE_ON_OFFLOAD=true` but diarize_audio is missing.
+
+    Publishes a `TranscribeSkipped` so the TUI surfaces it, and prints a
+    banner to stderr so the operator sees it even before the TUI takes
+    over the screen.
+    """
+    try:
+        import diarize_audio  # noqa: F401
+        return
+    except ImportError as exc:
+        msg = (
+            "⚠️  TRANSCRIBE_ON_OFFLOAD=true but `diarize_audio` is not importable "
+            f"({exc}).\n   Offloads will succeed but will NOT be transcribed.\n"
+            "   Likely cause: iCloud flagged __editable__*.pth UF_HIDDEN.\n"
+            "   Remediation: re-run `pip install -e` or `chflags nohidden` on the .pth files."
+        )
+        print(msg, file=sys.stderr, flush=True)
+        bus.publish(
+            TranscribeSkipped(
+                device_filename="(startup)",
+                reason="diarize_audio not importable at startup",
+            )
+        )
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept for future flags
@@ -60,6 +93,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         poll_interval_seconds=config.poll_interval_seconds,
     )
     tui = TUI(bus=bus)
+
+    if config.transcribe_on_offload:
+        _preflight_transcribe(bus)
 
     def _shutdown(signum, frame):  # noqa: ARG001
         app.stop()
