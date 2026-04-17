@@ -17,7 +17,7 @@ from .locks import FileLock, LockHeld
 from .offload import Offloader
 from .state import StateStore
 from .tui import TUI
-from .usb_watcher import IOKitUSBWatcher
+from .usb_watcher import PollingUSBWatcher
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept for future flags
@@ -41,7 +41,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
     bus = EventBus()
     store = StateStore(config.state_path)
     adapter = JensenDeviceAdapter()
-    watcher = IOKitUSBWatcher()
+    watcher = PollingUSBWatcher()
     offloader = Offloader(
         adapter=adapter,
         store=store,
