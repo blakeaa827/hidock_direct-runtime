@@ -161,7 +161,7 @@ class App:
             # Connected: periodic scan + drain.
             try:
                 self._run_scan_and_drain()
-            except DeviceNotConnected:
+            except (DeviceNotConnected, ConnectionError):
                 self._handle_disconnect()
                 continue
             except DeviceError as exc:

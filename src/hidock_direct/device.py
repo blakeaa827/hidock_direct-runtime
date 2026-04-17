@@ -169,7 +169,10 @@ class JensenDeviceAdapter:
 
     def list_files(self) -> List[DeviceFile]:
         jensen = self._require()
-        result = jensen.list_files() or {}
+        try:
+            result = jensen.list_files() or {}
+        except ConnectionError as exc:
+            raise DeviceNotConnected(str(exc)) from exc
         if result.get("error"):
             raise DeviceError(f"list_files failed: {result['error']}")
         out: List[DeviceFile] = []
@@ -201,19 +204,25 @@ class JensenDeviceAdapter:
     ) -> None:
         jensen = self._require()
         safe = sanitize_device_filename(name)
-        status = jensen.stream_file(
-            safe,
-            size,
-            data_callback=on_chunk,
-            progress_callback=on_progress,
-            cancel_event=cancel_event,
-        )
+        try:
+            status = jensen.stream_file(
+                safe,
+                size,
+                data_callback=on_chunk,
+                progress_callback=on_progress,
+                cancel_event=cancel_event,
+            )
+        except ConnectionError as exc:
+            raise DeviceNotConnected(str(exc)) from exc
         if status != "OK":
             raise TransferAborted(status)
 
     def delete_file(self, name: str) -> None:
         jensen = self._require()
         safe = sanitize_device_filename(name)
-        result = jensen.delete_file(safe)
+        try:
+            result = jensen.delete_file(safe)
+        except ConnectionError as exc:
+            raise DeviceNotConnected(str(exc)) from exc
         if isinstance(result, dict) and result.get("error"):
             raise DeviceError(f"delete_file failed: {result['error']}")
