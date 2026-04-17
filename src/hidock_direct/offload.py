@@ -43,6 +43,8 @@ MAX_DEVICE_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB hard ceiling (PRD §7)
 SIZE_STABLE_DELAY_SECONDS = 1.0
 HTA_EXTENSION = ".hda"
 WAV_EXTENSION = ".wav"
+MP3_EXTENSION = ".mp3"
+MP3_SYNC_WORD = b"\xff\xfb"
 
 
 class OffloadError(RuntimeError):
@@ -70,8 +72,25 @@ def _chunked_sha256_of_file(path: os.PathLike[str] | str, chunk: int = 1 << 20) 
     return h.hexdigest()
 
 
-def _archive_basename(device_mtime: Optional[datetime], fallback_mtime: Optional[datetime]) -> str:
-    """Return the `YYYY-MM-DD_HHMMSS.wav` basename per PRD §2.3.2.
+def _detect_real_extension(staged_path: Path) -> str:
+    """Sniff the first 2 bytes of a staged file to detect MP3-in-.hda-clothing.
+
+    HiDock P1 stores recordings as MP3 with a `.hda` extension. Older H1
+    models use a genuine proprietary HTA container. We check the sync word
+    to tell them apart so the archive filename reflects the real format.
+    """
+    try:
+        with open(staged_path, "rb") as f:
+            header = f.read(2)
+        if header == MP3_SYNC_WORD:
+            return MP3_EXTENSION
+    except OSError:
+        pass
+    return WAV_EXTENSION
+
+
+def _archive_basename(device_mtime: Optional[datetime], fallback_mtime: Optional[datetime], ext: str = WAV_EXTENSION) -> str:
+    """Return the `YYYY-MM-DD_HHMMSS.<ext>` basename.
 
     `device_mtime` wins; `fallback_mtime` (supplied by the caller, derived
     from the clock) kicks in when the device offered no metadata.
@@ -79,7 +98,7 @@ def _archive_basename(device_mtime: Optional[datetime], fallback_mtime: Optional
     when = device_mtime or fallback_mtime
     if when is None:
         when = datetime.now()
-    return f"{when.strftime('%Y-%m-%d_%H%M%S')}.wav"
+    return f"{when.strftime('%Y-%m-%d_%H%M%S')}{ext}"
 
 
 def _archive_subdir(when: datetime) -> Path:
@@ -195,7 +214,7 @@ class Offloader:
             raise OffloadError(f"Device-reported size exceeds {MAX_DEVICE_FILE_SIZE}-byte ceiling: {file.size}")
 
         self.ensure_dirs()
-        converted_from_hda = device_filename.lower().endswith(HTA_EXTENSION)
+        is_hda = device_filename.lower().endswith(HTA_EXTENSION)
 
         # Staging: download raw bytes to a .partial under .tmp/.
         staged_name = f"{device_filename}.partial"
@@ -203,6 +222,11 @@ class Offloader:
         if staged.exists():
             staged.unlink()
 
+        # Archive extension is determined after download by sniffing the
+        # header — HiDock P1 writes MP3 with .hda extension; older H1
+        # uses a genuine HTA container that needs conversion to .wav.
+        # We use .wav as a placeholder here; the real extension is set
+        # after the format-detection step below.
         basis_time = file.device_mtime or self._clock()
         target_basename = _archive_basename(file.device_mtime, basis_time)
         target_path = _unique_archive_path(self._archive_dir, target_basename, basis_time)
@@ -255,37 +279,46 @@ class Offloader:
             self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
             raise OffloadError(reason)
 
-        # .hda -> .wav conversion happens BEFORE atomic rename. We replace
-        # staged with the converted output and recompute its SHA on the
-        # converted bytes. That's what ends up in the archive + state.
-        if converted_from_hda:
-            converter = self._hta or HTAConverter()
-            try:
-                converted = converter.convert_hta_to_wav(str(staged))
-            except Exception as exc:  # noqa: BLE001 — vendored code raises a variety
-                self._safe_unlink(staged)
-                reason = f"hta conversion failed: {exc}"
-                self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
-                raise OffloadError(reason) from exc
-            if not converted or not Path(converted).exists():
-                self._safe_unlink(staged)
-                reason = "hta conversion produced no output"
-                self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
-                raise OffloadError(reason)
-            try:
-                self._safe_unlink(staged)
-                converted_path = Path(converted)
-                new_staged = self._tmp_dir / (device_filename + ".wav.partial")
-                if new_staged.exists():
-                    new_staged.unlink()
-                shutil.move(str(converted_path), str(new_staged))
-                staged = new_staged
-            except OSError as exc:
-                self._safe_unlink(staged)
-                reason = f"hta conversion rename failed: {exc}"
-                self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
-                raise OffloadError(reason) from exc
-            disk_sha = _chunked_sha256_of_file(staged)
+        # .hda handling: sniff the staged bytes to detect the real format.
+        # HiDock P1 stores MP3 with .hda extension — archive as .mp3.
+        # Older H1 models use a genuine HTA container → convert to .wav.
+        converted_from_hda = False
+        if is_hda:
+            real_ext = _detect_real_extension(staged)
+            if real_ext == MP3_EXTENSION:
+                # MP3-in-.hda-clothing — just fix the extension, no conversion.
+                new_basename = _archive_basename(file.device_mtime, basis_time, ext=MP3_EXTENSION)
+                target_path = _unique_archive_path(self._archive_dir, new_basename, basis_time)
+            else:
+                # Genuine HTA container — convert to WAV.
+                converter = self._hta or HTAConverter()
+                try:
+                    converted = converter.convert_hta_to_wav(str(staged))
+                except Exception as exc:  # noqa: BLE001
+                    self._safe_unlink(staged)
+                    reason = f"hta conversion failed: {exc}"
+                    self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+                    raise OffloadError(reason) from exc
+                if not converted or not Path(converted).exists():
+                    self._safe_unlink(staged)
+                    reason = "hta conversion produced no output"
+                    self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+                    raise OffloadError(reason)
+                try:
+                    self._safe_unlink(staged)
+                    converted_path = Path(converted)
+                    new_staged = self._tmp_dir / (device_filename + ".wav.partial")
+                    if new_staged.exists():
+                        new_staged.unlink()
+                    shutil.move(str(converted_path), str(new_staged))
+                    staged = new_staged
+                except OSError as exc:
+                    self._safe_unlink(staged)
+                    reason = f"hta conversion rename failed: {exc}"
+                    self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
+                    raise OffloadError(reason) from exc
+                disk_sha = _chunked_sha256_of_file(staged)
+                converted_from_hda = True
 
         # Atomic rename into the archive.
         try:
@@ -296,8 +329,10 @@ class Offloader:
             self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
             raise OffloadError(reason) from exc
 
-        # Derive duration from the WAV header *after* the rename so we read
-        # what actually landed.
+        # Derive duration from audio header. wav_duration_minutes handles WAV
+        # only; MP3s return 0.0 (duration is computed from bitrate, not a
+        # simple header read — acceptable for MVP; cumulative minutes will
+        # undercount MP3 sources).
         duration_minutes = wav_duration_minutes(target_path)
 
         self._store.record_processed(
