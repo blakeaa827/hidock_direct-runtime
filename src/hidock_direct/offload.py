@@ -45,7 +45,6 @@ from .state import DeviceKey, StateStore, wav_duration_minutes
 
 
 MAX_DEVICE_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB hard ceiling (PRD §7)
-SIZE_STABLE_DELAY_SECONDS = 1.0
 HTA_EXTENSION = ".hda"
 WAV_EXTENSION = ".wav"
 MP3_EXTENSION = ".mp3"
@@ -198,62 +197,49 @@ class Offloader:
         return removed
 
     def scan_new_files(self, device_key: DeviceKey) -> List[DeviceFile]:
-        """DEPRECATED compatibility wrapper. Returns all stable-new files
-        regardless of classification. Prefer `scan_pending_files` which
-        partitions meetings from whispers/unknowns per PRD §2.3.
-
-        Retained so pipeline-mechanics tests (size-stable, already-processed,
-        collision, HTA conversion) remain anchored on their existing fixtures.
-        The App uses `scan_pending_files` for production routing.
+        """DEPRECATED compatibility wrapper. Returns all new files regardless
+        of classification. Prefer `scan_pending_files`.
         """
         self._bus.publish(ScanStarted())
-        snapshot_a = self._adapter.list_files()
-        self._sleep(SIZE_STABLE_DELAY_SECONDS)
-        snapshot_b = self._adapter.list_files()
-        by_name_b = {f.name: f.size for f in snapshot_b}
-        stable_new: List[DeviceFile] = []
-        for file in snapshot_a:
+        files = self._adapter.list_files()
+        new: List[DeviceFile] = []
+        for file in files:
             if self._store.is_processed(device_key, file.name):
                 continue
             if file.size <= 0 or file.size > MAX_DEVICE_FILE_SIZE:
                 continue
-            size_b = by_name_b.get(file.name)
-            if size_b is None or size_b != file.size:
-                continue
-            stable_new.append(file)
+            new.append(file)
             self._bus.publish(FileDiscovered(device_filename=file.name, size_bytes=file.size))
-        self._bus.publish(ScanComplete(new_file_count=len(stable_new)))
-        return stable_new
+        self._bus.publish(ScanComplete(new_file_count=len(new)))
+        return new
 
     def scan_pending_files(self, device_key: DeviceKey) -> ScanResult:
-        """Scan and classify. Meetings get the size-stable check (auto-offload
-        candidates must be settled); whispers/unknowns skip it because the TUI
-        operator sees them in a modal before any download begins -- a growing
-        file that's still being recorded will not be selected in practice.
+        """Scan and classify.
+
+        Single `list_files` call -- no size-stability re-poll. The double-poll
+        check was in the original PRD as defensive code against mid-recording
+        files, but hardware verification on 2026-04-23 confirmed the Jensen
+        firmware simply doesn't expose in-progress files via `list_files`
+        (see `project_hidock_list_files_hides_in_progress` memory). If a name
+        appears here, it's a finalized recording.
 
         Publishes `ScanStarted`, `ScanComplete(new_file_count=len(meetings))`,
         plus `WhispersDetected` / `UnknownsDetected` when either bucket is
         non-empty.
         """
         self._bus.publish(ScanStarted())
-        snapshot_a = self._adapter.list_files()
-        self._sleep(SIZE_STABLE_DELAY_SECONDS)
-        snapshot_b = self._adapter.list_files()
-        by_name_b = {f.name: f.size for f in snapshot_b}
+        files = self._adapter.list_files()
 
         meetings: List[DeviceFile] = []
         whispers: List[DeviceFile] = []
         unknowns: List[DeviceFile] = []
-        for file in snapshot_a:
+        for file in files:
             if self._store.is_processed(device_key, file.name):
                 continue
             if file.size <= 0 or file.size > MAX_DEVICE_FILE_SIZE:
                 continue
             kind = classify_recording(file.name)
             if kind is RecordingKind.MEETING:
-                size_b = by_name_b.get(file.name)
-                if size_b is None or size_b != file.size:
-                    continue
                 meetings.append(file)
                 self._bus.publish(
                     FileDiscovered(device_filename=file.name, size_bytes=file.size)

@@ -99,7 +99,17 @@ def handle_unknown_prompt(
 
 
 def keys_active_in_state(state: str) -> bool:
-    """Whisper/unknown key bindings only activate in CONNECTED_IDLE (PRD §2.6).
-    During SCANNING / DRAINING the TUI ignores the keypress silently.
+    """Whisper/unknown key bindings activate in CONNECTED_IDLE or SCANNING.
+
+    Originally (PRD §2.6) restricted to CONNECTED_IDLE to avoid USB
+    contention. Relaxed 2026-04-23: Jensen's `_usb_lock` already serializes
+    adapter calls, so an offload triggered mid-scan just waits behind the
+    current `list_files` -- no correctness problem. And since the new
+    count-delta scan architecture keeps the app in CONNECTED_IDLE almost
+    continuously (SCANNING fires only on count change), the old gate made
+    the feature nearly inaccessible on large devices (~27s list_files).
+
+    DRAINING stays excluded: an active download should not compete with
+    a new operator-initiated transfer on the same adapter.
     """
-    return state == "CONNECTED_IDLE"
+    return state in ("CONNECTED_IDLE", "SCANNING")

@@ -142,11 +142,14 @@ def test_unknown_prompt_unknown_key_ignored() -> None:
 # ---- state gating --------------------------------------------------------
 
 
-def test_keys_inactive_during_scanning() -> None:
-    assert keys_active_in_state("SCANNING") is False
+def test_keys_inactive_during_draining_and_disconnected() -> None:
+    # DRAINING stays excluded: an active download shouldn't compete with a
+    # new operator-initiated transfer on the same adapter.
     assert keys_active_in_state("DRAINING") is False
     assert keys_active_in_state("IDLE_DISCONNECTED") is False
 
 
-def test_keys_active_in_connected_idle() -> None:
+def test_keys_active_in_connected_idle_and_scanning() -> None:
+    # SCANNING was relaxed on 2026-04-23 — see keys_active_in_state docstring.
     assert keys_active_in_state("CONNECTED_IDLE") is True
+    assert keys_active_in_state("SCANNING") is True

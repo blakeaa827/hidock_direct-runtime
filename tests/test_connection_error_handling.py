@@ -91,6 +91,11 @@ class ConnectionErrorDevice(MockDevice):
             raise ConnectionError("Device not connected.")
         return super().list_files()
 
+    def get_file_count(self) -> int:
+        if "get_file_count" in self._fail_on:
+            raise ConnectionError("Device not connected.")
+        return super().get_file_count()
+
     def download_file(self, name, size, *, on_chunk, on_progress=None, cancel_event=None):
         if "download_file" in self._fail_on:
             raise ConnectionError("Device not connected.")
@@ -213,8 +218,12 @@ class TestWorkerSurvivesConnectionError:
             watcher.fire_attach()
             _wait_for_state(app, AppState.CONNECTED_IDLE, timeout=5.0)
 
-            mock._fail_on.add("list_files")
-            # Wait for the worker to hit the error and recover
+            # After the count-delta refactor, `get_file_count` is what the
+            # worker calls on every poll tick. Failing list_files wouldn't
+            # be reached unless the count changed. To verify "worker
+            # survives a USB error during periodic polling," inject on
+            # get_file_count -- the equivalent continuous operation.
+            mock._fail_on.add("get_file_count")
             _wait_for_state(app, AppState.IDLE_DISCONNECTED, timeout=5.0)
 
             # Worker thread must still be alive

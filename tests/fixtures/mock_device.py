@@ -41,23 +41,25 @@ def make_wav_bytes(*, duration_seconds: float = 1.0, sample_rate: int = 16000) -
 
 @dataclass
 class MockFile:
-    """A single mock recording on the device."""
+    """A single mock recording on the device.
+
+    Historical note: an earlier `pending_size_sequence` field simulated
+    growing-size polls for the size-stability check. Removed on 2026-04-23
+    after hardware verification confirmed Jensen `list_files` only exposes
+    completed recordings (see `project_hidock_list_files_hides_in_progress`
+    memory entry). Size is now always the final content length.
+    """
 
     name: str
     content: bytes
     device_mtime: Optional[datetime] = None
-    """Optional timestamp reported by the device for this recording."""
-
-    # For the size-stable-check test: if `pending_size_sequence` is non-empty,
-    # list_files() returns each size from the sequence in turn (mutating the
-    # sequence). When exhausted, the actual content length is returned. This
-    # simulates a recording whose size is growing between polls because
-    # firmware is still writing.
-    pending_size_sequence: List[int] = field(default_factory=list)
+    # Override for tests that need to simulate a pathological size (e.g.,
+    # oversized-file rejection) without allocating gigabytes of content.
+    size_override: Optional[int] = None
 
     def report_size(self) -> int:
-        if self.pending_size_sequence:
-            return self.pending_size_sequence.pop(0)
+        if self.size_override is not None:
+            return self.size_override
         return len(self.content)
 
 
@@ -109,6 +111,11 @@ class MockDevice:
         for f in self._files.values():
             out.append(DeviceFile(name=f.name, size=f.report_size(), device_mtime=f.device_mtime))
         return out
+
+    def get_file_count(self) -> int:
+        if not self._connected:
+            raise DeviceNotConnected()
+        return len(self._files)
 
     def download_file(
         self,

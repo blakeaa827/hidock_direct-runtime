@@ -130,6 +130,12 @@ class App:
         # disconnect so a new device doesn't see stale entries.
         self._pending_whispers: list = []
         self._pending_unknowns: list = []
+        # Last-observed device file count. `get_file_count` is cheap (~0.2s
+        # vs ~27s for `list_files` on a 1201-file P1) so we poll the count
+        # every tick and run a full classified scan only when it changes
+        # (or on first-after-attach, signalled by `None`). Leaves the app
+        # in CONNECTED_IDLE continuously, keeping `w`/`u` keys responsive.
+        self._last_known_count: Optional[int] = None
 
     @property
     def state(self) -> AppState:
@@ -346,11 +352,22 @@ class App:
         self._device_key = None
         self._pending_whispers = []
         self._pending_unknowns = []
+        self._last_known_count = None
         self._transition(AppState.IDLE_DISCONNECTED)
 
     def _run_scan_and_drain(self) -> None:
         if self._device_key is None:
             raise DeviceNotConnected()
+        # Count-delta gate. `get_file_count` is cheap; run the expensive
+        # `list_files` scan only when something actually changed on the
+        # device (or on first-after-attach when `_last_known_count` is None).
+        current_count = self._adapter.get_file_count()
+        if self._last_known_count is not None and current_count == self._last_known_count:
+            # Nothing new on the device. Stay in CONNECTED_IDLE so key
+            # bindings remain active. No bus events -- the last scan's
+            # pending buckets are still valid.
+            return
+        self._last_known_count = current_count
         self._transition(AppState.SCANNING)
         scan = self._offloader.scan_pending_files(self._device_key)
         # Expose the classified scan for the TUI's whisper/unknown modals.

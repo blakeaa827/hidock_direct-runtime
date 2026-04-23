@@ -64,6 +64,7 @@ class DeviceAdapter(Protocol):
     def disconnect(self) -> None: ...
     def is_connected(self) -> bool: ...
     def list_files(self) -> List[DeviceFile]: ...
+    def get_file_count(self) -> int: ...
     def download_file(
         self,
         name: str,
@@ -172,6 +173,20 @@ class JensenDeviceAdapter:
         if self._jensen is None or not self._jensen.is_connected():
             raise DeviceNotConnected()
         return self._jensen
+
+    def get_file_count(self) -> int:
+        """Return the total file count on the device. Cheap single-packet
+        USB op (~0.2-0.5s); used as a change detector so the expensive
+        `list_files` only fires when something actually changed.
+        """
+        jensen = self._require()
+        try:
+            result = jensen.get_file_count() or {}
+        except ConnectionError as exc:
+            raise DeviceNotConnected(str(exc)) from exc
+        if result.get("error"):
+            raise DeviceError(f"get_file_count failed: {result['error']}")
+        return int(result.get("count", 0))
 
     def list_files(self) -> List[DeviceFile]:
         jensen = self._require()

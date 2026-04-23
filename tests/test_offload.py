@@ -46,25 +46,6 @@ def test_offload_happy_path(offloader, mock_device: MockDevice, archive_dir: Pat
     assert len(started) == len(completed) == 3
 
 
-def test_offload_size_stable_check(offloader, mock_device: MockDevice):
-    content = make_wav_bytes(duration_seconds=1.0)
-    # First poll reports a smaller size; second poll reports a different size; third (after the delay)
-    # returns true. The first scan should skip; only after stable should it offer the file.
-    grow = MockFile(
-        name="REC_GROWING.wav",
-        content=content,
-        pending_size_sequence=[len(content) - 10, len(content) - 5],
-    )
-    mock_device.add_file(grow)
-
-    first = offloader.scan_new_files(DEVICE_KEY)
-    assert first == [], "size still growing — should not be offered"
-
-    # Next scan call pair: first returns real content length, second returns real content length
-    second = offloader.scan_new_files(DEVICE_KEY)
-    assert [f.name for f in second] == ["REC_GROWING.wav"]
-
-
 def test_offload_already_processed(offloader, mock_device: MockDevice, state_store):
     f = MockFile(name="REC_X.wav", content=make_wav_bytes(duration_seconds=1.0))
     mock_device.add_file(f)
@@ -185,10 +166,12 @@ def test_skips_oversized_file(offloader, mock_device: MockDevice):
     from hidock_direct.offload import MAX_DEVICE_FILE_SIZE
 
     # Device claims the file is bigger than the ceiling — scan drops it.
+    # `size_override` simulates a pathological device report without
+    # actually allocating 2+ GB of memory.
     too_big = MockFile(
         name="REC_HUGE.wav",
         content=b"\x00",
-        pending_size_sequence=[MAX_DEVICE_FILE_SIZE + 1, MAX_DEVICE_FILE_SIZE + 1],
+        size_override=MAX_DEVICE_FILE_SIZE + 1,
     )
     mock_device.add_file(too_big)
     files = offloader.scan_new_files(DEVICE_KEY)
