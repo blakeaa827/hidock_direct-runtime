@@ -80,6 +80,11 @@ class ConnectionErrorDevice(MockDevice):
         super().__init__(**kw)
         self._fail_on: set[str] = set()
 
+    def connect(self) -> DeviceInfo:
+        if "connect" in self._fail_on:
+            raise ConnectionError("Device not connected.")
+        return super().connect()
+
     def list_files(self) -> List[DeviceFile]:
         if "list_files" in self._fail_on:
             raise ConnectionError("Device not connected.")
@@ -214,6 +219,126 @@ class TestWorkerSurvivesConnectionError:
             # Worker thread must still be alive
             assert app._worker is not None and app._worker.is_alive(), \
                 "worker thread died after ConnectionError"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 tests: adapter.connect() must translate ConnectionError, and the
+# worker loop must survive a ConnectionError raised from _handle_attach.
+# Bug report: planning/bug_report_connect_connectionerror_kills_worker.md
+# ---------------------------------------------------------------------------
+
+class FakeJensenFailingConnect(FakeJensen):
+    """FakeJensen that raises ConnectionError from connect()."""
+
+    def connect(self, **kw):
+        raise ConnectionError("USB backend not available to HiDockJensen class.")
+
+
+class FakeJensenFailingInfo(FakeJensen):
+    """FakeJensen that connects OK but raises ConnectionError from get_device_info()."""
+
+    def get_device_info(self):
+        raise ConnectionError("Device not connected.")
+
+
+class TestAdapterConnectTranslatesConnectionError:
+    """JensenDeviceAdapter.connect() must translate builtin ConnectionError
+    from Jensen's connect() or get_device_info() into DeviceNotConnected."""
+
+    def _patch_enumerate(self, monkeypatch):
+        monkeypatch.setattr(
+            JensenDeviceAdapter, "enumerate_attached",
+            staticmethod(lambda: [(0x10D6, 0xAF0C)]),
+        )
+
+    def test_connect_connection_error_from_jensen_connect(self, monkeypatch):
+        self._patch_enumerate(monkeypatch)
+        adapter = JensenDeviceAdapter()
+        adapter._backend = object()
+        adapter._jensen = FakeJensenFailingConnect()
+
+        with pytest.raises(DeviceNotConnected) as excinfo:
+            adapter.connect()
+
+        assert "USB backend not available" in str(excinfo.value)
+
+    def test_connect_connection_error_from_get_device_info(self, monkeypatch):
+        self._patch_enumerate(monkeypatch)
+        adapter = JensenDeviceAdapter()
+        adapter._backend = object()
+        adapter._jensen = FakeJensenFailingInfo()
+
+        with pytest.raises(DeviceNotConnected) as excinfo:
+            adapter.connect()
+
+        assert "Device not connected" in str(excinfo.value)
+
+
+class TestWorkerSurvivesConnectionErrorDuringAttach:
+    """_handle_attach must not let a ConnectionError from adapter.connect()
+    kill the worker thread. The app must publish a WARNING and stay in
+    IDLE_DISCONNECTED, then successfully connect on the next attach."""
+
+    def test_worker_survives_connection_error_during_attach(self, tmp_path: Path):
+        from hidock_direct.events import Severity
+
+        mock = ConnectionErrorDevice(files=[])
+        mock._fail_on.add("connect")
+
+        archive = tmp_path / "arch"
+        (archive / ".state").mkdir(parents=True, exist_ok=True)
+        (archive / ".tmp").mkdir(parents=True, exist_ok=True)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        store = StateStore(archive / ".state" / "offload_state.json")
+        watcher = FakeWatcher()
+        offloader = Offloader(
+            adapter=mock, store=store, bus=bus,
+            archive_dir=archive, tmp_dir=archive / ".tmp",
+            delete_after_offload=False, sleep=lambda *a, **k: None,
+        )
+        app = App(
+            adapter=mock, watcher=watcher, offloader=offloader,
+            store=store, bus=bus, poll_interval_seconds=1,
+            sleep=lambda *a, **k: None,
+        )
+        runner = threading.Thread(target=app.run, daemon=True)
+        runner.start()
+        try:
+            _wait_until(lambda: watcher.started)
+            watcher.fire_attach()
+
+            # A WARNING event with context="connect" must be published,
+            # confirming _handle_attach caught the failure instead of
+            # letting it kill the worker.
+            def has_connect_warning():
+                from hidock_direct.events import Error
+                return any(
+                    isinstance(e, Error)
+                    and e.severity == Severity.WARNING
+                    and e.context == "connect"
+                    and "Device not connected" in e.message
+                    for e in events
+                )
+            _wait_until(has_connect_warning, timeout=3.0,
+                        msg="no connect-failure WARNING was published")
+
+            # State must still be IDLE_DISCONNECTED.
+            assert app.state == AppState.IDLE_DISCONNECTED
+
+            # Worker must still be alive.
+            assert app._worker is not None and app._worker.is_alive(), \
+                "worker thread died after ConnectionError during attach"
+
+            # Next attach (device recovers) must succeed -- proves the worker
+            # is not just alive but still consuming attach events.
+            mock._fail_on.discard("connect")
+            watcher.fire_attach()
+            _wait_for_state(app, AppState.CONNECTED_IDLE, timeout=3.0)
         finally:
             app.stop()
             runner.join(timeout=3.0)

@@ -182,7 +182,7 @@ class App:
     def _handle_attach(self) -> None:
         try:
             info = self._adapter.connect()
-        except DeviceError as exc:
+        except (DeviceError, ConnectionError) as exc:
             self._bus.publish(Error(message=str(exc), severity=Severity.WARNING, context="connect"))
             self._transition(AppState.IDLE_DISCONNECTED)
             return

@@ -143,10 +143,16 @@ class JensenDeviceAdapter:
             raise DeviceNotConnected("No HiDock device attached")
         vid, pid = attached[0]
         self._vid, self._pid = vid, pid
-        ok, err = self._jensen.connect(target_interface_number=0, vid=vid, pid=pid)
+        try:
+            ok, err = self._jensen.connect(target_interface_number=0, vid=vid, pid=pid)
+        except ConnectionError as exc:
+            raise DeviceNotConnected(str(exc)) from exc
         if not ok:
             raise DeviceError(f"Failed to connect to device: {err}")
-        info_dict = self._jensen.get_device_info() or {}
+        try:
+            info_dict = self._jensen.get_device_info() or {}
+        except ConnectionError as exc:
+            raise DeviceNotConnected(str(exc)) from exc
         serial = info_dict.get("sn") or "UNKNOWN"
         self._info = DeviceInfo(model=model_from_pid(pid), serial=serial)
         return self._info
