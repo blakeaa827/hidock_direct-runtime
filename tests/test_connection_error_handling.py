@@ -457,6 +457,34 @@ class TestCompetingClaimErrorTranslation:
             app.stop()
             runner.join(timeout=3.0)
 
+    def test_health_check_failure_translates_to_replug_guidance(self, tmp_path):
+        """Jensen raises ConnectionError('Device health check failed') when
+        its first probe after interface claim times out. Common post-release
+        state when another app just freed the device. Must translate to
+        replug guidance so a fresh-launch operator knows what to do."""
+        app, runner, watcher, events = _run_app_with_failing_connect(
+            tmp_path,
+            "Device health check failed",
+        )
+        try:
+            _wait_until(lambda: any(
+                getattr(e, "context", None) == "connect" for e in events
+            ), timeout=3.0, msg="no connect warning")
+            warn = self._get_connect_warning(events)
+            msg = warn.message
+
+            # Semantic pin (Gate 1 step 4): must name the symptom AND the
+            # action. Conjunction of three tokens that each carry meaning:
+            # "replug" (action), "wait" (timing detail that proves this
+            # isn't a boilerplate error), "health check" (surfaces the
+            # cause class so the raw error is recognizable).
+            assert "replug" in msg.lower(), f"action not named: {msg!r}"
+            assert "wait" in msg.lower(), f"timing detail missing: {msg!r}"
+            assert "health check" in msg.lower(), f"cause class missing: {msg!r}"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
     def test_unknown_device_error_is_passed_through(self, tmp_path):
         """Negative case: a DeviceError that isn't in the competing-claim
         class must not receive the web-interface translation. Prevents

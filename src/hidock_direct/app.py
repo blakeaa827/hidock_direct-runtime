@@ -52,11 +52,26 @@ _COMPETING_CLAIM_MARKERS = (
     "Device busy",
 )
 
+# Jensen raises `ConnectionError("Device health check failed")` when the first
+# get_device_info probe after a successful interface claim times out or returns
+# empty. Empirically this happens when the device was just released by another
+# app (HiDock web interface) and hasn't fully re-settled, or after a stale
+# session left the firmware in an odd state. A physical replug resolves it.
+_UNSETTLED_DEVICE_MARKERS = (
+    "health check failed",
+    "Health check failed",
+)
+
 
 def _translate_connect_error(raw: str) -> str:
-    """Rewrite libusb connect failures that indicate a competing USB claim
-    into an operator-actionable message. Non-matching errors pass through
-    unchanged so the real failure text still reaches the TUI.
+    """Rewrite libusb/Jensen connect failures into operator-actionable messages.
+
+    Two translation classes today:
+    - competing-claim: another userland process holds the USB interface
+    - unsettled-device: Jensen claimed the interface but the first probe failed
+
+    Non-matching errors pass through unchanged so the real failure text still
+    reaches the TUI.
     """
     if any(marker in raw for marker in _COMPETING_CLAIM_MARKERS):
         return (
@@ -64,6 +79,14 @@ def _translate_connect_error(raw: str) -> str:
             "(likely the HiDock web interface open in a browser tab). "
             "Close that browser tab (or any other HiDock-aware app) "
             "and replug the device. Raw error: " + raw
+        )
+    if any(marker in raw for marker in _UNSETTLED_DEVICE_MARKERS):
+        return (
+            "HiDock did not respond to the startup health check. "
+            "This usually clears with a physical replug -- especially right "
+            "after another app (like the HiDock web interface) was using the "
+            "device. Unplug the HiDock, wait ~5 seconds, and plug it back in. "
+            "Raw error: " + raw
         )
     return raw
 
