@@ -92,7 +92,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         bus=bus,
         poll_interval_seconds=config.poll_interval_seconds,
     )
-    tui = TUI(bus=bus)
+    tui = TUI(
+        bus=bus,
+        app=app,
+        pending_whispers_provider=lambda: app._pending_whispers,
+        pending_unknowns_provider=lambda: app._pending_unknowns,
+    )
 
     if config.transcribe_on_offload:
         _preflight_transcribe(bus)
