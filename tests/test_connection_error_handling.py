@@ -20,6 +20,7 @@ import pytest
 
 from hidock_direct.app import App, AppState
 from hidock_direct.device import (
+    DeviceError,
     DeviceFile,
     DeviceInfo,
     DeviceNotConnected,
@@ -339,6 +340,225 @@ class TestWorkerSurvivesConnectionErrorDuringAttach:
             mock._fail_on.discard("connect")
             watcher.fire_attach()
             _wait_for_state(app, AppState.CONNECTED_IDLE, timeout=3.0)
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 tests: competing-WebUSB-claim error translation + spurious-detach
+# suppression.
+# Bug report: planning/bug_report_first_plug_usb_state_unrecoverable.md
+# ---------------------------------------------------------------------------
+
+class _FailingConnectAdapter(MockDevice):
+    """MockDevice whose connect() raises a configurable DeviceError message.
+
+    Used to drive the app through the competing-claim code path without
+    touching pyusb or hardware.
+    """
+
+    def __init__(self, *, error_message: str, **kw):
+        super().__init__(**kw)
+        self._error_message = error_message
+
+    def connect(self) -> DeviceInfo:
+        raise DeviceError(self._error_message)
+
+
+def _run_app_with_failing_connect(tmp_path: Path, error_message: str):
+    """Spin up the app with a failing adapter, fire one attach, collect events.
+
+    Returns (app, runner, watcher, events) so the caller can inspect and then
+    clean up. Always fire detach / stop from the caller.
+    """
+    mock = _FailingConnectAdapter(error_message=error_message)
+    archive = tmp_path / "arch"
+    (archive / ".state").mkdir(parents=True, exist_ok=True)
+    (archive / ".tmp").mkdir(parents=True, exist_ok=True)
+    bus = EventBus()
+    events: list[Event] = []
+    bus.subscribe(events.append)
+    store = StateStore(archive / ".state" / "offload_state.json")
+    watcher = FakeWatcher()
+    offloader = Offloader(
+        adapter=mock, store=store, bus=bus,
+        archive_dir=archive, tmp_dir=archive / ".tmp",
+        delete_after_offload=False, sleep=lambda *a, **k: None,
+    )
+    app = App(
+        adapter=mock, watcher=watcher, offloader=offloader,
+        store=store, bus=bus, poll_interval_seconds=1,
+        sleep=lambda *a, **k: None,
+    )
+    runner = threading.Thread(target=app.run, daemon=True)
+    runner.start()
+    _wait_until(lambda: watcher.started)
+    watcher.fire_attach()
+    return app, runner, watcher, events
+
+
+class TestCompetingClaimErrorTranslation:
+    """errno 13 / errno 19 / 'Access denied' / 'No such device' during
+    adapter.connect() must be translated into a WARNING that names the
+    likely culprit (HiDock web interface / browser tab) and the remediation
+    (close it). A raw libusb string leaves the operator with no actionable
+    guidance -- that is the bug."""
+
+    def _get_connect_warning(self, events):
+        from hidock_direct.events import Error, Severity
+        matches = [
+            e for e in events
+            if isinstance(e, Error) and e.severity == Severity.WARNING and e.context == "connect"
+        ]
+        assert matches, "no connect WARNING was published"
+        return matches[-1]
+
+    def test_access_denied_translates_to_actionable_message(self, tmp_path):
+        app, runner, watcher, events = _run_app_with_failing_connect(
+            tmp_path,
+            "Access denied to device. It might be in use by another app or require admin rights.",
+        )
+        try:
+            _wait_until(lambda: any(
+                getattr(e, "context", None) == "connect" for e in events
+            ), timeout=3.0, msg="no connect warning")
+            warn = self._get_connect_warning(events)
+            msg = warn.message
+
+            # Semantic pin (Gate 1 step 4): the translated message must
+            # name *the cause* AND *the action*. A mention-check on any
+            # single token would pass against a message that only named
+            # the cause without remediation, or vice versa. The conjunction
+            # is the correctness check.
+            assert "HiDock web interface" in msg, f"cause not named: {msg!r}"
+            assert "browser tab" in msg, f"browser tab not mentioned: {msg!r}"
+            assert "close" in msg.lower(), f"action not named: {msg!r}"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+    def test_no_such_device_translates_to_actionable_message(self, tmp_path):
+        app, runner, watcher, events = _run_app_with_failing_connect(
+            tmp_path,
+            "Failed to connect to device: USB Error: [Errno 19] No such device (it may have been disconnected)",
+        )
+        try:
+            _wait_until(lambda: any(
+                getattr(e, "context", None) == "connect" for e in events
+            ), timeout=3.0, msg="no connect warning")
+            warn = self._get_connect_warning(events)
+            msg = warn.message
+
+            assert "HiDock web interface" in msg, f"cause not named: {msg!r}"
+            assert "browser tab" in msg, f"browser tab not mentioned: {msg!r}"
+            assert "close" in msg.lower(), f"action not named: {msg!r}"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+    def test_unknown_device_error_is_passed_through(self, tmp_path):
+        """Negative case: a DeviceError that isn't in the competing-claim
+        class must not receive the web-interface translation. Prevents
+        over-translation."""
+        raw = "Firmware protocol error: bad response header"
+        app, runner, watcher, events = _run_app_with_failing_connect(tmp_path, raw)
+        try:
+            _wait_until(lambda: any(
+                getattr(e, "context", None) == "connect" for e in events
+            ), timeout=3.0, msg="no connect warning")
+            warn = self._get_connect_warning(events)
+            msg = warn.message
+
+            # Must not translate: no web-interface text.
+            assert "HiDock web interface" not in msg, \
+                f"over-translated non-claim error: {msg!r}"
+            assert "browser tab" not in msg, \
+                f"over-translated non-claim error: {msg!r}"
+            # Must surface the original error text so the operator sees
+            # the real failure.
+            assert raw in msg, f"raw error not surfaced: {msg!r}"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+
+class TestSpuriousDetachSuppressed:
+    """When the watcher fires detach but no attach ever successfully
+    connected (_device_key is None), DeviceDetached must not be published.
+    Publishing it as serial='unknown' confuses the operator by making a
+    benign watcher poll look like a real device event."""
+
+    def test_no_detach_event_when_no_prior_attach_succeeded(self, tmp_path):
+        from hidock_direct.events import DeviceDetached
+
+        app, runner, watcher, events = _run_app_with_failing_connect(
+            tmp_path,
+            "Access denied to device. It might be in use by another app or require admin rights.",
+        )
+        try:
+            # Wait for the connect WARNING so we know the attach was processed.
+            _wait_until(lambda: any(
+                getattr(e, "context", None) == "connect" for e in events
+            ), timeout=3.0, msg="no connect warning")
+
+            # Fire detach. Since no attach ever succeeded, _device_key is None.
+            watcher.fire_detach()
+
+            # Give the watcher callback a moment to run (it's synchronous
+            # in FakeWatcher.fire_detach, but the bus subscriber runs on
+            # the publish path which is also synchronous -- small sleep
+            # guards against scheduling weirdness).
+            time.sleep(0.2)
+
+            detach_events = [e for e in events if isinstance(e, DeviceDetached)]
+            assert not detach_events, \
+                f"DeviceDetached should be suppressed when _device_key is None; got: {detach_events}"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+    def test_detach_still_published_after_successful_attach(self, tmp_path):
+        """Positive case: once a real attach has succeeded and set
+        _device_key, a subsequent detach MUST still publish DeviceDetached
+        -- the suppression is narrow, not a blanket silencing."""
+        from hidock_direct.events import DeviceDetached
+
+        mock = MockDevice()
+        archive = tmp_path / "arch"
+        (archive / ".state").mkdir(parents=True, exist_ok=True)
+        (archive / ".tmp").mkdir(parents=True, exist_ok=True)
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        store = StateStore(archive / ".state" / "offload_state.json")
+        watcher = FakeWatcher()
+        offloader = Offloader(
+            adapter=mock, store=store, bus=bus,
+            archive_dir=archive, tmp_dir=archive / ".tmp",
+            delete_after_offload=False, sleep=lambda *a, **k: None,
+        )
+        app = App(
+            adapter=mock, watcher=watcher, offloader=offloader,
+            store=store, bus=bus, poll_interval_seconds=1,
+            sleep=lambda *a, **k: None,
+        )
+        runner = threading.Thread(target=app.run, daemon=True)
+        runner.start()
+        try:
+            _wait_until(lambda: watcher.started)
+            watcher.fire_attach()
+            _wait_for_state(app, AppState.CONNECTED_IDLE, timeout=3.0)
+
+            watcher.fire_detach()
+            _wait_until(
+                lambda: any(isinstance(e, DeviceDetached) for e in events),
+                timeout=2.0, msg="DeviceDetached was not published after real attach",
+            )
+            detach_events = [e for e in events if isinstance(e, DeviceDetached)]
+            # Must use the real serial, not 'unknown'.
+            assert any(e.serial == "SN-TEST-1234" for e in detach_events), \
+                f"DeviceDetached did not carry the real serial; got: {detach_events}"
         finally:
             app.stop()
             runner.join(timeout=3.0)

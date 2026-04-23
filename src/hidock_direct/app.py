@@ -38,6 +38,36 @@ class AppState(str, Enum):
     DRAINING = "DRAINING"
 
 
+# libusb error fragments that mean "another userland process holds the USB
+# interface claim." The canonical culprit in this project is the HiDock web
+# interface (Chrome/WebUSB); other HiDock-aware apps can also trigger it.
+# Errno 13 = EACCES, 16 = EBUSY, 19 = ENODEV (mid-transfer reset race).
+_COMPETING_CLAIM_MARKERS = (
+    "Access denied",
+    "No such device",
+    "Errno 19",
+    "Errno 13",
+    "Errno 16",
+    "Resource busy",
+    "Device busy",
+)
+
+
+def _translate_connect_error(raw: str) -> str:
+    """Rewrite libusb connect failures that indicate a competing USB claim
+    into an operator-actionable message. Non-matching errors pass through
+    unchanged so the real failure text still reaches the TUI.
+    """
+    if any(marker in raw for marker in _COMPETING_CLAIM_MARKERS):
+        return (
+            "HiDock USB interface is claimed by another process "
+            "(likely the HiDock web interface open in a browser tab). "
+            "Close that browser tab (or any other HiDock-aware app) "
+            "and replug the device. Raw error: " + raw
+        )
+    return raw
+
+
 class App:
     """Orchestrator. `run()` blocks until `stop()` is called (signal handler, Ctrl-C)."""
 
@@ -138,8 +168,13 @@ class App:
     def _on_detach(self, vid: int, pid: int) -> None:  # noqa: ARG002
         self._cancel_transfer.set()
         self._detach_signal.set()
-        serial = self._device_key.serial if self._device_key else "unknown"
-        self._bus.publish(DeviceDetached(serial=serial))
+        if self._device_key is None:
+            # No attach ever completed -- publishing DeviceDetached with a
+            # placeholder serial confuses the operator into thinking a real
+            # device event happened. The failed attach already published its
+            # own WARNING; the spurious detach adds noise, not signal.
+            return
+        self._bus.publish(DeviceDetached(serial=self._device_key.serial))
 
     # -- worker loop ----------------------------------------------------
 
@@ -183,7 +218,11 @@ class App:
         try:
             info = self._adapter.connect()
         except (DeviceError, ConnectionError) as exc:
-            self._bus.publish(Error(message=str(exc), severity=Severity.WARNING, context="connect"))
+            self._bus.publish(Error(
+                message=_translate_connect_error(str(exc)),
+                severity=Severity.WARNING,
+                context="connect",
+            ))
             self._transition(AppState.IDLE_DISCONNECTED)
             return
         self._device_key = DeviceKey(model=info.model, serial=info.serial)
