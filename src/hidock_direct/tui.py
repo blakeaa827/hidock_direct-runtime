@@ -320,12 +320,50 @@ class TUI:
         if in_unknown:
             self._handle_unknown_prompt_key(ch)
             return
+        # Top-level key. Log EVERY received keystroke + the reason it was
+        # accepted or ignored. Without this, "I pressed `w` and nothing
+        # happened" has three indistinguishable causes: the key never reached
+        # the TUI, the state gate rejected it, or the pending bucket was empty.
+        display = ch if ch.isprintable() else f"\\x{ord(ch):02x}"
+        whisper_count = len(self._pending_whispers_provider())
+        unknown_count = len(self._pending_unknowns_provider())
         if not keys_active_in_state(current_state):
+            with self._lock:
+                self._log.append((
+                    datetime.now(),
+                    f"key '{display}' ignored: state={current_state} (keys active only in CONNECTED_IDLE)",
+                    Severity.WARNING,
+                ))
             return
         if ch == "w":
+            if whisper_count == 0:
+                with self._lock:
+                    self._log.append((
+                        datetime.now(),
+                        "key 'w' ignored: no whispers pending on device",
+                        Severity.WARNING,
+                    ))
+                return
             self._open_whisper_modal()
         elif ch == "u":
+            if unknown_count == 0:
+                with self._lock:
+                    self._log.append((
+                        datetime.now(),
+                        "key 'u' ignored: no unknown files pending",
+                        Severity.WARNING,
+                    ))
+                return
             self._open_unknown_prompt()
+        else:
+            # Unmapped key at top level. Log it so the operator sees the
+            # keystroke reached the dispatcher even if there's no binding.
+            with self._lock:
+                self._log.append((
+                    datetime.now(),
+                    f"key '{display}' received but has no binding at top level",
+                    Severity.INFO,
+                ))
 
     def _open_whisper_modal(self) -> None:
         names = [f.name for f in self._pending_whispers_provider()]
@@ -521,6 +559,21 @@ class TUI:
         # setup doesn't race with a concurrent render that might still be
         # reading stdin state. Reader no-ops when stdin is not a TTY (tests).
         self._keyboard.start()
+        # Surface the keyboard-reader status to the operator so pressing `w`
+        # with no response is diagnosable without re-reading the source.
+        # Without this, a non-TTY stdin or a failed termios setup is invisible.
+        if getattr(self._keyboard, "_is_tty", False) and getattr(self._keyboard, "_thread", None) is not None:
+            msg = "Keyboard input active. Press w for whispers, u for unknowns (only in CONNECTED_IDLE)."
+            sev = Severity.INFO
+        else:
+            msg = (
+                "Keyboard input NOT active -- stdin is not a TTY (e.g., launched "
+                "from an IDE run panel, piped, or under `nohup`). Relaunch in a "
+                "real terminal (Terminal.app, iTerm2) to enable `w`/`u` keys."
+            )
+            sev = Severity.WARNING
+        with self._lock:
+            self._log.append((datetime.now(), msg, sev))
 
     def stop(self) -> None:
         self._keyboard.stop()
