@@ -12,6 +12,8 @@ from enum import Enum
 from threading import RLock
 from typing import Callable, List, Optional
 
+from .classify import RecordingKind
+
 Subscriber = Callable[["Event"], None]
 
 
@@ -105,6 +107,28 @@ class TranscribeFailed(Event):
 @dataclass(frozen=True)
 class IdleWaiting(Event):
     state: str
+
+
+@dataclass(frozen=True)
+class WhispersDetected(Event):
+    count: int
+
+
+@dataclass(frozen=True)
+class UnknownsDetected(Event):
+    count: int
+    filenames: List[str]
+
+
+@dataclass(frozen=True)
+class WhisperOffloadRequested(Event):
+    device_filename: str
+
+
+@dataclass(frozen=True)
+class UnknownRouted(Event):
+    device_filename: str
+    as_kind: RecordingKind
 
 
 @dataclass(frozen=True)

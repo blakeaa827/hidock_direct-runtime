@@ -76,6 +76,19 @@ def _wait_until(predicate, timeout: float = 3.0, message: str = "predicate never
     raise AssertionError(message)
 
 
+class _FakeHTAConverter:
+    """Canned converter used by state-machine tests. Meeting-pattern filenames
+    now require `.hda` extension (PRD §2.1), but these tests pre-upload WAV
+    bytes to the device — we stamp them through as-is without conversion.
+    """
+
+    def convert_hta_to_wav(self, hta_path: str, output_path=None) -> str:
+        from pathlib import Path as _Path
+        out = _Path(hta_path).with_suffix(".wav")
+        out.write_bytes(_Path(hta_path).read_bytes())
+        return str(out)
+
+
 def _build_app(tmp_path: Path, *, files: List[MockFile] | None = None):
     archive = tmp_path / "arch"
     (archive / ".state").mkdir(parents=True, exist_ok=True)
@@ -93,6 +106,7 @@ def _build_app(tmp_path: Path, *, files: List[MockFile] | None = None):
         archive_dir=archive,
         tmp_dir=archive / ".tmp",
         delete_after_offload=False,
+        hta_converter=_FakeHTAConverter(),
         sleep=lambda *_a, **_k: None,
     )
     app = App(
@@ -108,7 +122,10 @@ def _build_app(tmp_path: Path, *, files: List[MockFile] | None = None):
 
 
 def test_state_machine_attach_detach(tmp_path: Path):
-    files = [MockFile(name="REC_M.wav", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 12, 10, 0, 0))]
+    # Meeting-pattern filename (PRD §2.1) so the classifier routes it to the
+    # auto-offload bucket. Extension is `.hda` because that's what HiDock
+    # firmware emits; the fake HTA converter stamps the WAV bytes through.
+    files = [MockFile(name="20260412-100000-Rec1.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 12, 10, 0, 0))]
     app, bus, events, mock, watcher, archive = _build_app(tmp_path, files=files)
     runner = threading.Thread(target=app.run, daemon=True)
     runner.start()
@@ -131,7 +148,8 @@ def test_state_machine_attach_detach(tmp_path: Path):
 def test_state_machine_detach_mid_drain(tmp_path: Path):
     # Large file so that the drain takes long enough for detach to hit mid-stream.
     big_content = make_wav_bytes(duration_seconds=20.0)
-    files = [MockFile(name="REC_BIG.wav", content=big_content)]
+    # Meeting-pattern name (PRD §2.1) so classifier routes it to auto-drain.
+    files = [MockFile(name="20260412-110000-Rec2.hda", content=big_content, device_mtime=datetime(2026, 4, 12, 11, 0, 0))]
     app, bus, events, mock, watcher, archive = _build_app(tmp_path, files=files)
 
     # Slow the mock's chunk loop so detach has time to land mid-stream.

@@ -42,10 +42,29 @@ from .events import (
     TranscribeSkipped,
     TranscribeStarted,
     TransferAborted,
+    UnknownsDetected,
+    WhispersDetected,
 )
 
 
 RECENT_LOG_LIMIT = 10
+
+
+def format_pending_footer(whisper_count: int, unknown_count: int) -> str:
+    """Render the whisper/unknown count line for the TUI footer (PRD §2.6).
+
+    Pure function -- empty when nothing is pending, otherwise joins the
+    fragments that apply. Separated from the rich layout so tests assert
+    the exact operator-visible string.
+    """
+    parts: list[str] = []
+    if whisper_count > 0:
+        label = "whisper" if whisper_count == 1 else "whispers"
+        parts.append(f"{whisper_count} {label} on device [press w to pick]")
+    if unknown_count > 0:
+        label = "unknown" if unknown_count == 1 else "unknowns"
+        parts.append(f"{unknown_count} {label} [press u to review]")
+    return "   ".join(parts)
 
 
 def _home_relative(path: str) -> str:
@@ -72,6 +91,8 @@ class TUI:
         self._log: deque[tuple[datetime, str, Severity]] = deque(maxlen=RECENT_LOG_LIMIT)
         self._session_files = 0
         self._session_bytes = 0
+        self._whisper_count = 0
+        self._unknown_count = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -139,6 +160,18 @@ class TUI:
                 self._log.append(
                     (datetime.now(), f"⎋ transcribe FAILED {event.device_filename}: {event.reason}", Severity.ERROR)
                 )
+            elif isinstance(event, WhispersDetected):
+                self._whisper_count = event.count
+                if event.count > 0:
+                    self._log.append(
+                        (datetime.now(), f"{event.count} whisper(s) on device — press w to review", Severity.INFO)
+                    )
+            elif isinstance(event, UnknownsDetected):
+                self._unknown_count = event.count
+                if event.count > 0:
+                    self._log.append(
+                        (datetime.now(), f"{event.count} unknown file(s) — press u to route", Severity.WARNING)
+                    )
             elif isinstance(event, Error):
                 ctx = f" [{event.context}]" if event.context else ""
                 self._log.append((datetime.now(), f"ERROR{ctx}: {event.message}", event.severity))
@@ -153,13 +186,15 @@ class TUI:
             log_snapshot = list(self._log)
             files = self._session_files
             bytes_ = self._session_bytes
+            whispers = self._whisper_count
+            unknowns = self._unknown_count
 
         layout = Layout()
         layout.split_column(
             Layout(self._render_header(state, device), name="header", size=3),
             Layout(self._render_transfers(progress_snapshot), name="transfers", ratio=2),
             Layout(self._render_log(log_snapshot), name="log", ratio=3),
-            Layout(self._render_footer(files, bytes_), name="footer", size=3),
+            Layout(self._render_footer(files, bytes_, whispers, unknowns), name="footer", size=3),
         )
         return layout
 
@@ -204,10 +239,13 @@ class TUI:
         return Panel(table, title="Recent activity", border_style="magenta")
 
     @staticmethod
-    def _render_footer(files: int, bytes_: int) -> Panel:
+    def _render_footer(files: int, bytes_: int, whisper_count: int, unknown_count: int) -> Panel:
         mb = bytes_ / (1024 * 1024)
-        msg = Text(f"Session: pulled {files} files, {mb:.1f} MB total.", style="dim")
-        return Panel(msg, title="Session", border_style="cyan")
+        lines: list[Text] = [Text(f"Session: pulled {files} files, {mb:.1f} MB total.", style="dim")]
+        pending = format_pending_footer(whisper_count, unknown_count)
+        if pending:
+            lines.append(Text(pending, style="bold yellow"))
+        return Panel(Group(*lines), title="Session", border_style="cyan")
 
     # -- lifecycle ------------------------------------------------------
 

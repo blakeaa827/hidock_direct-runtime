@@ -17,6 +17,7 @@ import time
 from enum import Enum
 from typing import Callable, Optional
 
+from .classify import RecordingKind
 from .device import DeviceAdapter, DeviceError, DeviceNotConnected, TransferAborted
 from .events import (
     DeviceAttached,
@@ -123,6 +124,12 @@ class App:
 
         self._worker: Optional[threading.Thread] = None
         self._device_key: Optional[DeviceKey] = None
+
+        # Latest classified scan buckets — read by the TUI for the footer
+        # whisper/unknown counts and the modal/prompt handlers. Cleared on
+        # disconnect so a new device doesn't see stale entries.
+        self._pending_whispers: list = []
+        self._pending_unknowns: list = []
 
     @property
     def state(self) -> AppState:
@@ -253,6 +260,81 @@ class App:
         self._bus.publish(DeviceAttached(model=info.model, serial=info.serial))
         self._transition(AppState.CONNECTED_IDLE)
 
+    # -- whisper / unknown routing (TUI entry points) -------------------
+
+    def offload_whisper(self, device_filename: str) -> bool:
+        """Offload a single whisper by name from the pending bucket.
+
+        Returns True on success, False if the filename is no longer in the
+        pending bucket or the pipeline aborted. Publishes an operator-
+        actionable `Error` on failure per PRD §2.7.
+        """
+        return self._offload_pending(
+            device_filename,
+            bucket=self._pending_whispers,
+            kind=RecordingKind.WHISPER,
+            failure_context="whisper_offload",
+        )
+
+    def route_unknown(self, device_filename: str, as_kind: RecordingKind) -> bool:
+        """Route a file in the unknown bucket as MEETING or WHISPER."""
+        return self._offload_pending(
+            device_filename,
+            bucket=self._pending_unknowns,
+            kind=as_kind,
+            failure_context="unknown_route",
+        )
+
+    def _offload_pending(self, device_filename: str, *, bucket: list, kind: RecordingKind, failure_context: str) -> bool:
+        if self._device_key is None:
+            return False
+        target = next((f for f in bucket if f.name == device_filename), None)
+        if target is None:
+            return False
+        try:
+            self._offloader.offload_one(
+                device_key=self._device_key,
+                file=target,
+                kind=kind,
+                cancel_event=self._cancel_transfer,
+            )
+        except TransferAborted as exc:
+            # A transfer-aborted mid-stream is the only class that leaves the
+            # file on the device in a retriable state. The operator should be
+            # told what failed and what to do next, not the raw adapter text.
+            reason = getattr(exc, "reason", None) or str(exc) or "transfer aborted"
+            action = "meeting offload" if kind is RecordingKind.MEETING else "whisper offload"
+            self._bus.publish(Error(
+                message=(
+                    f"{action.capitalize()} failed: {reason}. "
+                    f"{device_filename} remains on the device -- retry from the "
+                    "TUI, or check the USB connection and replug if needed."
+                ),
+                severity=Severity.WARNING,
+                context=failure_context,
+            ))
+            return False
+        except DeviceError as exc:
+            action = "meeting offload" if kind is RecordingKind.MEETING else "whisper offload"
+            self._bus.publish(Error(
+                message=(
+                    f"{action.capitalize()} failed: {exc}. "
+                    f"{device_filename} remains on the device. "
+                    "Check that the HiDock is still connected; if another app "
+                    "took the USB interface, close it and replug."
+                ),
+                severity=Severity.ERROR,
+                context=failure_context,
+            ))
+            return False
+        # Success -- remove the file from the pending bucket so the TUI's
+        # footer count reflects the remaining queue.
+        try:
+            bucket.remove(target)
+        except ValueError:
+            pass
+        return True
+
     def _handle_disconnect(self) -> None:
         if self._adapter.is_connected():
             try:
@@ -262,19 +344,26 @@ class App:
         self._cancel_transfer.clear()
         self._detach_signal.clear()
         self._device_key = None
+        self._pending_whispers = []
+        self._pending_unknowns = []
         self._transition(AppState.IDLE_DISCONNECTED)
 
     def _run_scan_and_drain(self) -> None:
         if self._device_key is None:
             raise DeviceNotConnected()
         self._transition(AppState.SCANNING)
-        new_files = self._offloader.scan_new_files(self._device_key)
-        if not new_files:
+        scan = self._offloader.scan_pending_files(self._device_key)
+        # Expose the classified scan for the TUI's whisper/unknown modals.
+        # Stored unconditionally (including empty lists) so the footer can
+        # clear stale counts when a device is re-scanned.
+        self._pending_whispers = scan.whispers
+        self._pending_unknowns = scan.unknowns
+        if not scan.meetings:
             self._transition(AppState.CONNECTED_IDLE)
             return
 
         self._transition(AppState.DRAINING)
-        for file in new_files:
+        for file in scan.meetings:
             if self._cancel_transfer.is_set() or self._stop_signal.is_set():
                 return
             try:
@@ -282,6 +371,7 @@ class App:
                     device_key=self._device_key,
                     file=file,
                     cancel_event=self._cancel_transfer,
+                    kind=RecordingKind.MEETING,
                 )
             except TransferAborted as exc:
                 self._bus.publish(

@@ -260,6 +260,163 @@ def test_offload_hda_conversion_failure(archive_dir: Path, mock_device: MockDevi
     assert not state_store.is_processed(DEVICE_KEY, "REC_BAD.hda")
 
 
+def test_scan_pending_files_returns_typed_bundle(offloader, mock_device: MockDevice, event_sink):
+    """PRD §5.3: 1 meeting, 2 whispers, 1 unknown — bucketed correctly."""
+    bus, events = event_sink
+    mock_device.add_file(MockFile(name="20260414-161650-Rec31.hda", content=make_wav_bytes(duration_seconds=0.5), device_mtime=datetime(2026, 4, 14, 16, 16, 50)))
+    mock_device.add_file(MockFile(name="20260414-161700-Wip1.hda", content=make_wav_bytes(duration_seconds=0.2), device_mtime=datetime(2026, 4, 14, 16, 17, 0)))
+    mock_device.add_file(MockFile(name="20260414-161800-Wip2.hda", content=make_wav_bytes(duration_seconds=0.2), device_mtime=datetime(2026, 4, 14, 16, 18, 0)))
+    mock_device.add_file(MockFile(name="20260414-161900-Foo7.hda", content=make_wav_bytes(duration_seconds=0.2), device_mtime=datetime(2026, 4, 14, 16, 19, 0)))
+
+    result = offloader.scan_pending_files(DEVICE_KEY)
+    assert [f.name for f in result.meetings] == ["20260414-161650-Rec31.hda"]
+    assert sorted(f.name for f in result.whispers) == ["20260414-161700-Wip1.hda", "20260414-161800-Wip2.hda"]
+    assert [f.name for f in result.unknowns] == ["20260414-161900-Foo7.hda"]
+
+
+def test_scan_publishes_whispers_and_unknowns_events(offloader, mock_device: MockDevice, event_sink):
+    """PRD §5.3: WhispersDetected + UnknownsDetected published on scan."""
+    from hidock_direct.events import ScanComplete, UnknownsDetected, WhispersDetected
+
+    bus, events = event_sink
+    mock_device.add_file(MockFile(name="20260414-161650-Rec31.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 16, 16, 50)))
+    mock_device.add_file(MockFile(name="20260414-161700-Wip1.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 16, 17, 0)))
+    mock_device.add_file(MockFile(name="20260414-161700-Wip2.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 16, 17, 0)))
+    mock_device.add_file(MockFile(name="weirdfile.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 16, 18, 0)))
+
+    offloader.scan_pending_files(DEVICE_KEY)
+    whispers = [e for e in events if isinstance(e, WhispersDetected)]
+    unknowns = [e for e in events if isinstance(e, UnknownsDetected)]
+    scans = [e for e in events if isinstance(e, ScanComplete)]
+    assert len(whispers) == 1 and whispers[0].count == 2
+    assert len(unknowns) == 1 and unknowns[0].count == 1
+    assert unknowns[0].filenames == ["weirdfile.hda"]
+    # ScanComplete.new_file_count == meeting count (PRD §2.5).
+    assert scans[-1].new_file_count == 1
+
+
+def test_scan_no_whispers_events_when_only_meetings(offloader, mock_device: MockDevice, event_sink):
+    from hidock_direct.events import UnknownsDetected, WhispersDetected
+
+    bus, events = event_sink
+    mock_device.add_file(MockFile(name="20260414-161650-Rec31.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 16, 16, 50)))
+    offloader.scan_pending_files(DEVICE_KEY)
+    assert not any(isinstance(e, WhispersDetected) for e in events)
+    assert not any(isinstance(e, UnknownsDetected) for e in events)
+
+
+def test_offload_one_whisper_routes_to_whispers_dir(offloader, mock_device: MockDevice, archive_dir: Path):
+    from hidock_direct.classify import RecordingKind
+
+    mock_device.add_file(MockFile(name="20250827-012419-Wip67.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2025, 8, 27, 1, 24, 19)))
+    # Use scan_pending_files so the whisper shows up even without size-stable.
+    result = offloader.scan_pending_files(DEVICE_KEY)
+    assert len(result.whispers) == 1
+    out = offloader.offload_one(device_key=DEVICE_KEY, file=result.whispers[0], kind=RecordingKind.WHISPER)
+    assert "whispers" in out.archive_path.parts
+    rel = out.archive_path.relative_to(archive_dir).as_posix()
+    assert rel.startswith("whispers/")
+    assert out.archive_path.exists()
+
+
+def test_offload_one_meeting_routes_to_meetings_root(offloader, mock_device: MockDevice, archive_dir: Path):
+    from hidock_direct.classify import RecordingKind
+
+    mock_device.add_file(MockFile(name="20260414-161650-Rec31.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2026, 4, 14, 16, 16, 50)))
+    result = offloader.scan_pending_files(DEVICE_KEY)
+    out = offloader.offload_one(device_key=DEVICE_KEY, file=result.meetings[0], kind=RecordingKind.MEETING)
+    rel = out.archive_path.relative_to(archive_dir).as_posix()
+    assert not rel.startswith("whispers/")
+
+
+def test_offload_one_records_kind_in_ledger(offloader, mock_device: MockDevice, state_store):
+    from hidock_direct.classify import RecordingKind
+
+    mock_device.add_file(MockFile(name="20260414-161650-Rec31.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2026, 4, 14, 16, 16, 50)))
+    mock_device.add_file(MockFile(name="20250827-012419-Wip67.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2025, 8, 27, 1, 24, 19)))
+    result = offloader.scan_pending_files(DEVICE_KEY)
+    offloader.offload_one(device_key=DEVICE_KEY, file=result.meetings[0], kind=RecordingKind.MEETING)
+    offloader.offload_one(device_key=DEVICE_KEY, file=result.whispers[0], kind=RecordingKind.WHISPER)
+    assert state_store.kind_for(DEVICE_KEY, "20260414-161650-Rec31.hda") is RecordingKind.MEETING
+    assert state_store.kind_for(DEVICE_KEY, "20250827-012419-Wip67.hda") is RecordingKind.WHISPER
+
+
+def test_delete_after_offload_filters_to_meetings(archive_dir: Path, mock_device: MockDevice, state_store, event_sink):
+    """PRD §2.3: delete-after-offload only applies to MEETING files."""
+    from hidock_direct.classify import RecordingKind
+    from hidock_direct.offload import Offloader
+
+    bus, _ = event_sink
+    mock_device.connect()
+    mock_device.add_file(MockFile(name="20260414-161650-Rec31.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2026, 4, 14, 16, 16, 50)))
+    mock_device.add_file(MockFile(name="20260414-161700-Wip1.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2026, 4, 14, 16, 17, 0)))
+    off = Offloader(
+        adapter=mock_device,
+        store=state_store,
+        bus=bus,
+        archive_dir=archive_dir,
+        tmp_dir=archive_dir / ".tmp",
+        delete_after_offload=True,
+        sleep=lambda *_a, **_k: None,
+    )
+    result = off.scan_pending_files(DEVICE_KEY)
+    off.offload_one(device_key=DEVICE_KEY, file=result.meetings[0], kind=RecordingKind.MEETING)
+    off.offload_one(device_key=DEVICE_KEY, file=result.whispers[0], kind=RecordingKind.WHISPER)
+    remaining = {f.name for f in mock_device.list_raw()}
+    # Meeting is device-deleted; whisper stays on device.
+    assert "20260414-161650-Rec31.hda" not in remaining
+    assert "20260414-161700-Wip1.hda" in remaining
+    snap = state_store.snapshot()
+    recs = snap["devices"][DEVICE_KEY.namespaced]["processed_recordings"]
+    assert recs["20260414-161650-Rec31.hda"]["device_deleted"] is True
+    assert recs["20260414-161700-Wip1.hda"]["device_deleted"] is False
+
+
+def test_skipped_whisper_no_ledger_entry(offloader, mock_device: MockDevice, state_store):
+    """PRD §2.2: whispers the operator doesn't select get no ledger entry."""
+    mock_device.add_file(MockFile(name="20260414-161700-Wip1.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 16, 17, 0)))
+    result = offloader.scan_pending_files(DEVICE_KEY)
+    assert result.whispers  # scan finds it
+    # ...but the operator never offloads it. No ledger entry.
+    assert not state_store.is_processed(DEVICE_KEY, "20260414-161700-Wip1.hda")
+
+
+def test_ensure_whispers_dir_error_publishes_actionable_message(archive_dir: Path, mock_device: MockDevice, state_store, event_sink, monkeypatch):
+    """PRD §2.7: mkdir failure for whispers dir surfaces cause + remediation."""
+    from hidock_direct.classify import RecordingKind
+    from hidock_direct.events import Error, Severity
+    from hidock_direct.offload import OffloadError, Offloader
+
+    bus, events = event_sink
+    mock_device.connect()
+    mock_device.add_file(MockFile(name="20250827-012419-Wip67.hda", content=b"\xff\xfb" + b"\x00" * 2048, device_mtime=datetime(2025, 8, 27, 1, 24, 19)))
+    off = Offloader(
+        adapter=mock_device,
+        store=state_store,
+        bus=bus,
+        archive_dir=archive_dir,
+        tmp_dir=archive_dir / ".tmp",
+        delete_after_offload=False,
+        sleep=lambda *_a, **_k: None,
+    )
+    # Force mkdir to fail only for the whispers subdir (simulates the archive
+    # root being writable but the sibling create failing).
+    original_mkdir = Path.mkdir
+    def selective_boom(self, *a, **k):
+        if self.name == "whispers":
+            raise PermissionError("read-only file system")
+        return original_mkdir(self, *a, **k)
+    monkeypatch.setattr(Path, "mkdir", selective_boom)
+    result = off.scan_pending_files(DEVICE_KEY)
+    with pytest.raises(OffloadError):
+        off.offload_one(device_key=DEVICE_KEY, file=result.whispers[0], kind=RecordingKind.WHISPER)
+    err = next((e for e in events if isinstance(e, Error) and e.context == "archive_setup"), None)
+    assert err is not None
+    assert err.severity is Severity.ERROR
+    assert "whispers archive" in err.message
+    assert "writable" in err.message  # remediation language
+
+
 def test_offload_collision_gets_suffix(offloader, mock_device: MockDevice, archive_dir: Path):
     # Two recordings with the same second-precision timestamp → second gets `-1`.
     shared = datetime(2026, 4, 12, 12, 0, 0)

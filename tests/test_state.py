@@ -8,15 +8,134 @@ from pathlib import Path
 
 import pytest
 
-from hidock_direct.state import DeviceKey, StateStore, default_schema, wav_duration_minutes
+from hidock_direct.classify import RecordingKind
+from hidock_direct.state import (
+    DeviceKey,
+    SCHEMA_VERSION,
+    StateStore,
+    default_schema,
+    wav_duration_minutes,
+)
 
 
 def test_state_initial_load(archive_dir: Path) -> None:
     store = StateStore(archive_dir / ".state" / "offload_state.json")
     data = store.load()
     assert data == default_schema()
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["global"]["cumulative_audio_minutes"] == 0.0
+
+
+def test_schema_version_is_2(archive_dir: Path) -> None:
+    assert SCHEMA_VERSION == 2
+    store = StateStore(archive_dir / ".state" / "offload_state.json")
+    assert store.load()["schema_version"] == 2
+
+
+def test_v1_to_v2_migration_on_load(archive_dir: Path) -> None:
+    path = archive_dir / ".state" / "offload_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    v1_payload = {
+        "schema_version": 1,
+        "devices": {
+            "hidock-h1-SN1": {
+                "device_model": "hidock-h1",
+                "serial": "SN1",
+                "first_seen": "2026-04-12T00:00:00+00:00",
+                "processed_recordings": {
+                    "20260412-143300-Rec1.hda": {
+                        "size_bytes": 10,
+                        "device_mtime": None,
+                        "sha256": "a",
+                        "archive_path": "2026/04/x.wav",
+                        "device_deleted": False,
+                    },
+                },
+            },
+        },
+        "global": {"last_run": None, "cumulative_audio_minutes": 0.0},
+    }
+    path.write_text(json.dumps(v1_payload))
+    store = StateStore(path)
+    data = store.load()
+    assert data["schema_version"] == 2
+    entry = data["devices"]["hidock-h1-SN1"]["processed_recordings"]["20260412-143300-Rec1.hda"]
+    assert entry["kind"] == "meeting"
+    # .bak retains the pre-migration v1 payload.
+    bak = path.with_suffix(path.suffix + ".bak")
+    assert bak.exists()
+    retained = json.loads(bak.read_text())
+    assert retained["schema_version"] == 1
+    assert "kind" not in retained["devices"]["hidock-h1-SN1"]["processed_recordings"]["20260412-143300-Rec1.hda"]
+
+
+def test_v2_load_is_idempotent(archive_dir: Path) -> None:
+    path = archive_dir / ".state" / "offload_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Write a canonical v2 payload.
+    v2_payload = {
+        "schema_version": 2,
+        "devices": {},
+        "global": {"last_run": None, "cumulative_audio_minutes": 0.0},
+    }
+    path.write_text(json.dumps(v2_payload))
+    # Remove any .bak from prior test setup.
+    bak = path.with_suffix(path.suffix + ".bak")
+    if bak.exists():
+        bak.unlink()
+    pre_mtime = path.stat().st_mtime_ns
+
+    store = StateStore(path)
+    store.load()
+    # No rewrite → no .bak created, file mtime unchanged.
+    assert not bak.exists()
+    assert path.stat().st_mtime_ns == pre_mtime
+
+
+def test_kind_for_returns_recorded_kind(archive_dir: Path) -> None:
+    store = StateStore(archive_dir / ".state" / "offload_state.json")
+    key = DeviceKey(model="hidock-h1", serial="SN-K")
+    store.record_processed(
+        key,
+        device_filename="20260412-143300-Rec1.hda",
+        size_bytes=10,
+        device_mtime=None,
+        sha256="a",
+        archive_path="2026/04/x.wav",
+        device_deleted=False,
+        duration_minutes=0.1,
+        kind=RecordingKind.MEETING,
+    )
+    store.record_processed(
+        key,
+        device_filename="20260412-143400-Wip1.hda",
+        size_bytes=5,
+        device_mtime=None,
+        sha256="b",
+        archive_path="whispers/2026/04/y.wav",
+        device_deleted=False,
+        duration_minutes=0.05,
+        kind=RecordingKind.WHISPER,
+    )
+    assert store.kind_for(key, "20260412-143300-Rec1.hda") is RecordingKind.MEETING
+    assert store.kind_for(key, "20260412-143400-Wip1.hda") is RecordingKind.WHISPER
+    assert store.kind_for(key, "not-there.hda") is None
+
+
+def test_record_processed_defaults_to_meeting(archive_dir: Path) -> None:
+    store = StateStore(archive_dir / ".state" / "offload_state.json")
+    key = DeviceKey(model="hidock-h1", serial="SN-D")
+    store.record_processed(
+        key,
+        device_filename="20260412-143300-Rec1.hda",
+        size_bytes=10,
+        device_mtime=None,
+        sha256="a",
+        archive_path="2026/04/x.wav",
+        device_deleted=False,
+        duration_minutes=0.0,
+    )
+    assert store.kind_for(key, "20260412-143300-Rec1.hda") is RecordingKind.MEETING
 
 
 def test_state_atomic_write(archive_dir: Path) -> None:

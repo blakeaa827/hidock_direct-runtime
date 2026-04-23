@@ -1,10 +1,16 @@
 """`offload_state.json` read/write (atomic, `.bak` fallback) and cumulative
 audio minute accounting.
 
-Schema is versioned (`schema_version: 1`). All writes go through `_atomic_write`:
+Schema is versioned (`schema_version: 2`). All writes go through `_atomic_write`:
   - snapshot the existing state.json to state.json.bak (one revision)
   - write the new payload to state.json.tmp and fsync
   - rename state.json.tmp -> state.json
+
+v1 -> v2 migration: v2 adds a per-entry `kind` field (`meeting`/`whisper`/
+`unknown`) so the offload sweep can leave whispers on device. On first load
+after upgrade, v1 entries are auto-rewritten as `kind: "meeting"` (every
+pre-existing offload predates the whispers feature and landed in the meetings
+archive root). The v1 payload is retained as the `.bak` revision.
 """
 
 from __future__ import annotations
@@ -22,7 +28,10 @@ from threading import RLock
 from typing import Any, Dict, Iterable, Optional
 
 
-SCHEMA_VERSION = 1
+from .classify import RecordingKind
+
+
+SCHEMA_VERSION = 2
 
 
 def _utcnow_iso() -> str:
@@ -94,8 +103,28 @@ class StateStore:
 
     def load(self) -> Dict[str, Any]:
         with self._lock:
-            self._data = self._read_with_fallback()
+            raw = self._read_with_fallback()
+            migrated, changed = self._migrate_if_needed(raw)
+            if changed:
+                # `_atomic_write` snapshots the existing on-disk file to .bak
+                # before rewriting, so the v1 payload is retained unmodified.
+                self._atomic_write(migrated)
+            self._data = migrated
             return self._data
+
+    @staticmethod
+    def _migrate_if_needed(data: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+        """Apply forward migrations in place. Return `(data, changed)`."""
+        version = int(data.get("schema_version", 1))
+        if version >= SCHEMA_VERSION:
+            return data, False
+        # v1 -> v2: stamp every processed recording with kind="meeting".
+        for device in data.get("devices", {}).values():
+            for entry in device.get("processed_recordings", {}).values():
+                if "kind" not in entry:
+                    entry["kind"] = RecordingKind.MEETING.value
+        data["schema_version"] = SCHEMA_VERSION
+        return data, True
 
     def _read_with_fallback(self) -> Dict[str, Any]:
         for candidate in (self._path, self.bak_path):
@@ -163,6 +192,25 @@ class StateStore:
             device = self._data["devices"].get(key.namespaced)
             return bool(device and device_filename in device.get("processed_recordings", {}))
 
+    def kind_for(self, key: DeviceKey, device_filename: str) -> Optional[RecordingKind]:
+        """Return the recorded `kind` for a processed file, or None if unseen."""
+        with self._lock:
+            if self._data is None:
+                self._data = self._read_with_fallback()
+            device = self._data["devices"].get(key.namespaced)
+            if not device:
+                return None
+            entry = device.get("processed_recordings", {}).get(device_filename)
+            if entry is None:
+                return None
+            raw = entry.get("kind")
+            if raw is None:
+                return None
+            try:
+                return RecordingKind(raw)
+            except ValueError:
+                return None
+
     def processed_names(self, key: DeviceKey) -> Iterable[str]:
         with self._lock:
             if self._data is None:
@@ -181,6 +229,7 @@ class StateStore:
         archive_path: str,
         device_deleted: bool,
         duration_minutes: float,
+        kind: RecordingKind = RecordingKind.MEETING,
     ) -> None:
         """Append a successful offload entry and bump cumulative minutes."""
         with self._mutate() as data:
@@ -203,6 +252,7 @@ class StateStore:
                 "downloaded_at": _utcnow_iso(),
                 "archive_path": archive_path,
                 "device_deleted": bool(device_deleted),
+                "kind": RecordingKind(kind).value,
             }
             data["global"]["last_run"] = _utcnow_iso()
             current = float(data["global"].get("cumulative_audio_minutes") or 0.0)

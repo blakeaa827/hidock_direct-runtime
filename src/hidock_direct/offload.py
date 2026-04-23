@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from .classify import RecordingKind, classify_recording
 from .device import (
     DeviceAdapter,
     DeviceError,
@@ -29,11 +30,15 @@ from .events import (
     DownloadComplete,
     DownloadProgress,
     DownloadStarted,
+    Error,
     EventBus,
     FileDiscovered,
     ScanComplete,
     ScanStarted,
+    Severity,
     TransferAborted,
+    UnknownsDetected,
+    WhispersDetected,
 )
 from .jensen import HTAConverter
 from .state import DeviceKey, StateStore, wav_duration_minutes
@@ -45,6 +50,9 @@ HTA_EXTENSION = ".hda"
 WAV_EXTENSION = ".wav"
 MP3_EXTENSION = ".mp3"
 MP3_SYNC_WORD = b"\xff\xfb"
+# Sibling directory under the archive root for operator-offloaded whispers.
+# Lazily created on first whisper offload; absence is normal.
+WHISPERS_SUBDIR = "whispers"
 
 
 class OffloadError(RuntimeError):
@@ -59,6 +67,17 @@ class OffloadResult:
     size_bytes: int
     duration_minutes: float
     converted_from_hda: bool
+
+
+@dataclass(frozen=True)
+class ScanResult:
+    """Classified scan output. Meetings auto-offload; whispers/unknowns
+    require explicit operator action via the TUI.
+    """
+
+    meetings: List[DeviceFile]
+    whispers: List[DeviceFile]
+    unknowns: List[DeviceFile]
 
 
 def _chunked_sha256_of_file(path: os.PathLike[str] | str, chunk: int = 1 << 20) -> str:
@@ -179,7 +198,14 @@ class Offloader:
         return removed
 
     def scan_new_files(self, device_key: DeviceKey) -> List[DeviceFile]:
-        """Emit ScanStarted/Complete; return files that are new AND size-stable."""
+        """DEPRECATED compatibility wrapper. Returns all stable-new files
+        regardless of classification. Prefer `scan_pending_files` which
+        partitions meetings from whispers/unknowns per PRD §2.3.
+
+        Retained so pipeline-mechanics tests (size-stable, already-processed,
+        collision, HTA conversion) remain anchored on their existing fixtures.
+        The App uses `scan_pending_files` for production routing.
+        """
         self._bus.publish(ScanStarted())
         snapshot_a = self._adapter.list_files()
         self._sleep(SIZE_STABLE_DELAY_SECONDS)
@@ -189,9 +215,7 @@ class Offloader:
         for file in snapshot_a:
             if self._store.is_processed(device_key, file.name):
                 continue
-            if file.size <= 0:
-                continue
-            if file.size > MAX_DEVICE_FILE_SIZE:
+            if file.size <= 0 or file.size > MAX_DEVICE_FILE_SIZE:
                 continue
             size_b = by_name_b.get(file.name)
             if size_b is None or size_b != file.size:
@@ -201,21 +225,111 @@ class Offloader:
         self._bus.publish(ScanComplete(new_file_count=len(stable_new)))
         return stable_new
 
+    def scan_pending_files(self, device_key: DeviceKey) -> ScanResult:
+        """Scan and classify. Meetings get the size-stable check (auto-offload
+        candidates must be settled); whispers/unknowns skip it because the TUI
+        operator sees them in a modal before any download begins -- a growing
+        file that's still being recorded will not be selected in practice.
+
+        Publishes `ScanStarted`, `ScanComplete(new_file_count=len(meetings))`,
+        plus `WhispersDetected` / `UnknownsDetected` when either bucket is
+        non-empty.
+        """
+        self._bus.publish(ScanStarted())
+        snapshot_a = self._adapter.list_files()
+        self._sleep(SIZE_STABLE_DELAY_SECONDS)
+        snapshot_b = self._adapter.list_files()
+        by_name_b = {f.name: f.size for f in snapshot_b}
+
+        meetings: List[DeviceFile] = []
+        whispers: List[DeviceFile] = []
+        unknowns: List[DeviceFile] = []
+        for file in snapshot_a:
+            if self._store.is_processed(device_key, file.name):
+                continue
+            if file.size <= 0 or file.size > MAX_DEVICE_FILE_SIZE:
+                continue
+            kind = classify_recording(file.name)
+            if kind is RecordingKind.MEETING:
+                size_b = by_name_b.get(file.name)
+                if size_b is None or size_b != file.size:
+                    continue
+                meetings.append(file)
+                self._bus.publish(
+                    FileDiscovered(device_filename=file.name, size_bytes=file.size)
+                )
+            elif kind is RecordingKind.WHISPER:
+                whispers.append(file)
+            else:
+                unknowns.append(file)
+
+        self._bus.publish(ScanComplete(new_file_count=len(meetings)))
+        if whispers:
+            self._bus.publish(WhispersDetected(count=len(whispers)))
+        if unknowns:
+            self._bus.publish(
+                UnknownsDetected(
+                    count=len(unknowns),
+                    filenames=[f.name for f in unknowns],
+                )
+            )
+        return ScanResult(meetings=meetings, whispers=whispers, unknowns=unknowns)
+
+    def _effective_archive_dir(self, kind: RecordingKind) -> Path:
+        """Meetings land at the archive root; whispers land under `whispers/`.
+
+        Per PRD §2.4, the whispers sibling is lazily created. Unknowns never
+        reach this path directly — the operator routes them as meeting or
+        whisper via the TUI (`Offloader.offload_one`), which supplies the
+        appropriate `kind`.
+        """
+        if kind is RecordingKind.WHISPER:
+            return self._archive_dir / WHISPERS_SUBDIR
+        return self._archive_dir
+
+    def _ensure_whispers_dir(self) -> None:
+        """Create `<archive>/whispers/`. Publishes an operator-actionable
+        `Error` (PRD §2.7) when the mkdir fails — e.g., archive root on a
+        read-only mount. Caller re-raises so the pipeline aborts cleanly.
+        """
+        target = self._archive_dir / WHISPERS_SUBDIR
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            message = (
+                f"Cannot create whispers archive at {target}: {exc}. "
+                "Check that the archive directory is writable (e.g., it may "
+                "be on a read-only mount or owned by another user)."
+            )
+            self._bus.publish(
+                Error(message=message, severity=Severity.ERROR, context="archive_setup")
+            )
+            raise OffloadError(message) from exc
+
     def offload(
         self,
         *,
         device_key: DeviceKey,
         file: DeviceFile,
         cancel_event: Optional[threading.Event] = None,
+        kind: RecordingKind = RecordingKind.MEETING,
     ) -> OffloadResult:
         """Pull one file. Raises `TransferAborted`-derived errors on cancel/detach,
         `OffloadError` on verify/convert failures. State/filesystem stay clean on failure.
+
+        `kind` controls archive routing (meetings → `<archive>/`, whispers →
+        `<archive>/whispers/`) and the ledger `kind` field. Defaults to
+        MEETING because auto-offload is the common case; explicit-intent
+        callers (TUI whisper selector, unknown prompt) supply the kind.
         """
         device_filename = sanitize_device_filename(file.name)
         if file.size > MAX_DEVICE_FILE_SIZE:
             raise OffloadError(f"Device-reported size exceeds {MAX_DEVICE_FILE_SIZE}-byte ceiling: {file.size}")
 
         self.ensure_dirs()
+        if kind is RecordingKind.WHISPER:
+            self._ensure_whispers_dir()
+        effective_archive_dir = self._effective_archive_dir(kind)
         is_hda = device_filename.lower().endswith(HTA_EXTENSION)
 
         # Staging: download raw bytes to a .partial under .tmp/.
@@ -231,7 +345,7 @@ class Offloader:
         # after the format-detection step below.
         basis_time = file.device_mtime or self._clock()
         target_basename = _archive_basename(file.device_mtime, basis_time)
-        target_path = _unique_archive_path(self._archive_dir, target_basename, basis_time)
+        target_path = _unique_archive_path(effective_archive_dir, target_basename, basis_time)
 
         self._bus.publish(DownloadStarted(device_filename=device_filename, target_path=str(target_path)))
 
@@ -290,7 +404,7 @@ class Offloader:
             if real_ext == MP3_EXTENSION:
                 # MP3-in-.hda-clothing — just fix the extension, no conversion.
                 new_basename = _archive_basename(file.device_mtime, basis_time, ext=MP3_EXTENSION)
-                target_path = _unique_archive_path(self._archive_dir, new_basename, basis_time)
+                target_path = _unique_archive_path(effective_archive_dir, new_basename, basis_time)
             else:
                 # Genuine HTA container — convert to WAV.
                 converter = self._hta or HTAConverter()
@@ -346,9 +460,14 @@ class Offloader:
             archive_path=str(target_path.relative_to(self._archive_dir)),
             device_deleted=False,
             duration_minutes=duration_minutes,
+            kind=kind,
         )
 
-        if self._delete_after_offload:
+        # Device-side deletion only applies to meetings. Whispers and unknown-
+        # routed files stay on the device even after being pulled — the
+        # operator's mental model is "auto-offload is the only destructive
+        # side of this tool."
+        if self._delete_after_offload and kind is RecordingKind.MEETING:
             try:
                 self._adapter.delete_file(device_filename)
                 self._mark_device_deleted(device_key, device_filename)
@@ -380,6 +499,26 @@ class Offloader:
             size_bytes=target_path.stat().st_size,
             duration_minutes=duration_minutes,
             converted_from_hda=converted_from_hda,
+        )
+
+    def offload_one(
+        self,
+        *,
+        device_key: DeviceKey,
+        file: DeviceFile,
+        kind: RecordingKind,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> OffloadResult:
+        """Explicit-intent entry point used by the TUI whisper selector and
+        unknown-router. Identical pipeline to `offload()`; the distinction is
+        that the caller declares the classification rather than inheriting
+        the MEETING default.
+        """
+        return self.offload(
+            device_key=device_key,
+            file=file,
+            cancel_event=cancel_event,
+            kind=kind,
         )
 
     def _mark_device_deleted(self, device_key: DeviceKey, device_filename: str) -> None:
