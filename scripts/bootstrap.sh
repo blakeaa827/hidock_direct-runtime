@@ -16,7 +16,7 @@ set -euo pipefail
 RUNTIME_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$RUNTIME_ROOT"
 
-HOST="$(hostname -s)"
+HOST="$(scutil --get LocalHostName)"
 VENV=".venv-${HOST}"
 
 if ! command -v brew >/dev/null 2>&1; then
