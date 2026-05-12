@@ -79,6 +79,7 @@ def test_list_files_fires_once_on_attach_then_skips_when_count_unchanged(tmp_pat
         adapter=mock, store=store, bus=bus,
         archive_dir=archive, tmp_dir=archive / ".tmp",
         delete_after_offload=False,
+        transcribe_on_offload=False,
         hta_converter=_FakeHTAConverter(),
         sleep=lambda *_a, **_k: None,
     )
@@ -99,16 +100,24 @@ def test_list_files_fires_once_on_attach_then_skips_when_count_unchanged(tmp_pat
         # First scan should have fired exactly one list_files call.
         first_list_calls = mock.list_files_calls
         assert first_list_calls == 1, f"expected 1 list_files on first scan, got {first_list_calls}"
+        first_count_calls = mock.get_file_count_calls
 
-        # Let the worker loop tick several times. Count is unchanged (still 1),
-        # so no additional list_files should fire. get_file_count WILL increase.
-        time.sleep(0.5)
+        # Wait for the worker to poll at least 2 more times. Count is unchanged
+        # (still 1), so no additional list_files should fire. Active-wait on
+        # get_file_count progress instead of a wall-clock sleep so the test
+        # tolerates slow CI / iCloud-synced FS. transcribe_on_offload=False
+        # above keeps the worker out of the diarize_audio pipeline (slow on
+        # iCloud-synced volumes due to .pth re-hiding + import-time I/O).
+        _wait_until(
+            lambda: mock.get_file_count_calls >= first_count_calls + 2,
+            timeout=3.0,
+            msg=f"worker never polled past {first_count_calls + 2} "
+                f"(count_calls={mock.get_file_count_calls})",
+        )
         assert mock.list_files_calls == first_list_calls, (
             f"list_files fired {mock.list_files_calls - first_list_calls} "
             f"extra times while count was unchanged"
         )
-        assert mock.get_file_count_calls > 1, \
-            "get_file_count should poll every tick"
     finally:
         app.stop()
         runner.join(timeout=3.0)
@@ -127,6 +136,7 @@ def test_count_delta_triggers_a_new_list_files(tmp_path: Path):
         adapter=mock, store=store, bus=bus,
         archive_dir=archive, tmp_dir=archive / ".tmp",
         delete_after_offload=False,
+        transcribe_on_offload=False,
         hta_converter=_FakeHTAConverter(),
         sleep=lambda *_a, **_k: None,
     )
