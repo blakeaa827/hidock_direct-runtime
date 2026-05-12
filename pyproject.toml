@@ -11,6 +11,10 @@ dependencies = [
     "pyusb>=1.2",
     "rich>=13.7",
     "python-dotenv>=1.0",
+    # Pure-python audio metadata reader. Used by state.audio_duration_minutes
+    # to read duration from both WAV (HTA-converted from H1 model) and MP3
+    # (P1 model native) headers without an ffmpeg dependency.
+    "mutagen~=1.47",
 ]
 
 [project.optional-dependencies]

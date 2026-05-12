@@ -19,8 +19,9 @@ import json
 import os
 import shutil
 import tempfile
-import wave
 from contextlib import contextmanager
+
+import mutagen
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,23 +50,41 @@ def default_schema() -> Dict[str, Any]:
     }
 
 
-def wav_duration_minutes(path: os.PathLike[str] | str) -> float:
-    """Return the wall-clock duration of a WAV in minutes.
+def audio_duration_minutes(path: os.PathLike[str] | str) -> float:
+    """Return the wall-clock duration of an audio file in minutes.
 
-    Uses the stdlib `wave` module, which reads the RIFF header without
-    loading the entire file. Returns 0.0 if the header is unreadable (callers
+    Handles both WAV (HTA-converted from H1 model) and MP3 (P1 model native)
+    via mutagen, which reads container headers without loading the audio
+    body. Dispatches on file content (mutagen.File factory), not extension,
+    so a mislabeled extension still resolves correctly.
+
+    Returns 0.0 if the header is unreadable or the file is missing (callers
     should prefer that over crashing; we still commit the file to the
-    archive, we just don't increment the cumulative counter).
+    archive, we just don't increment the cumulative counter). OSError /
+    PermissionError propagate — disk and permission failures surface
+    through the offload pipeline's existing error path rather than
+    silently becoming a 0.0 metric.
     """
     try:
-        with wave.open(str(path), "rb") as wav:
-            frames = wav.getnframes()
-            rate = wav.getframerate()
-            if rate <= 0:
-                return 0.0
-            return frames / rate / 60.0
-    except (wave.Error, EOFError, FileNotFoundError):
+        audio = mutagen.File(str(path))
+    except mutagen.MutagenError as exc:
+        # Mutagen wraps everything in MutagenError: missing file =>
+        # MutagenError(FileNotFoundError), permission denied =>
+        # MutagenError(PermissionError), malformed header =>
+        # HeaderNotFoundError(<message>). Unwrap: PermissionError and other
+        # disk-IO errors (OSError except FileNotFoundError) must propagate
+        # so disk/permission failures surface through the offload pipeline's
+        # existing error path rather than silently becoming 0.0.
+        inner = exc.args[0] if exc.args else None
+        if isinstance(inner, OSError) and not isinstance(inner, FileNotFoundError):
+            raise inner
         return 0.0
+    if audio is None or audio.info is None:
+        return 0.0
+    length = getattr(audio.info, "length", 0.0)
+    if not length or length <= 0:
+        return 0.0
+    return float(length) / 60.0
 
 
 @dataclass

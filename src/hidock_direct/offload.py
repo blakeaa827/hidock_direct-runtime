@@ -41,7 +41,7 @@ from .events import (
     WhispersDetected,
 )
 from .jensen import HTAConverter
-from .state import DeviceKey, StateStore, wav_duration_minutes
+from .state import DeviceKey, StateStore, audio_duration_minutes
 
 
 MAX_DEVICE_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB hard ceiling (PRD §7)
@@ -431,11 +431,12 @@ class Offloader:
             self._bus.publish(TransferAborted(device_filename=device_filename, reason=reason))
             raise OffloadError(reason) from exc
 
-        # Derive duration from audio header. wav_duration_minutes handles WAV
-        # only; MP3s return 0.0 (duration is computed from bitrate, not a
-        # simple header read — acceptable for MVP; cumulative minutes will
-        # undercount MP3 sources).
-        duration_minutes = wav_duration_minutes(target_path)
+        # Derive duration from audio header. audio_duration_minutes handles
+        # both WAV (HTA-converted from H1 model) and MP3 (P1 model native)
+        # via mutagen's header-only read. Silent-degrade to 0.0 on malformed
+        # headers or missing files (file still gets archived); OSError /
+        # PermissionError propagate to fail the offload loudly.
+        duration_minutes = audio_duration_minutes(target_path)
 
         self._store.record_processed(
             device_key,

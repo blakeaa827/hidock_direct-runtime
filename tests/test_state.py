@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import wave
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -13,8 +14,8 @@ from hidock_direct.state import (
     DeviceKey,
     SCHEMA_VERSION,
     StateStore,
+    audio_duration_minutes,
     default_schema,
-    wav_duration_minutes,
 )
 
 
@@ -233,14 +234,66 @@ def test_cumulative_minutes(tmp_path: Path) -> None:
         w.setsampwidth(2)
         w.setframerate(16000)
         w.writeframes(b"\x00\x00" * 16000 * 60)  # 60 seconds = 1 minute
-    minutes = wav_duration_minutes(wav_path)
+    minutes = audio_duration_minutes(wav_path)
     assert minutes == pytest.approx(1.0, rel=1e-3)
 
 
 def test_cumulative_minutes_bad_file_returns_zero(tmp_path: Path) -> None:
     bad = tmp_path / "not-a-wav.bin"
     bad.write_bytes(b"\x00" * 256)
-    assert wav_duration_minutes(bad) == 0.0
+    assert audio_duration_minutes(bad) == 0.0
+
+
+def test_audio_duration_mp3_positive(synthetic_mp3: Path) -> None:
+    """MP3 with valid frame header returns positive duration in minutes."""
+    minutes = audio_duration_minutes(synthetic_mp3)
+    # synthetic_mp3 is 2 seconds = 1/30 minute. mutagen reports duration from
+    # frame count + sample rate; allow generous tolerance for encoder priming.
+    assert 0.01 < minutes < 0.1, f"expected ~0.033 minutes, got {minutes}"
+
+
+def test_audio_duration_wav_positive(synthetic_wav: Path) -> None:
+    """WAV with valid header returns positive duration in minutes."""
+    minutes = audio_duration_minutes(synthetic_wav)
+    # synthetic_wav is exactly 1 second = 1/60 minute
+    assert minutes == pytest.approx(1.0 / 60.0, rel=1e-3)
+
+
+def test_audio_duration_missing_file_returns_zero(tmp_path: Path) -> None:
+    """FileNotFoundError on a path that does not exist → silent-degrade to 0.0."""
+    missing = tmp_path / "does-not-exist.mp3"
+    assert audio_duration_minutes(missing) == 0.0
+
+
+def test_audio_duration_malformed_mp3_returns_zero(tmp_path: Path) -> None:
+    """Garbage bytes with .mp3 extension → MutagenError caught → 0.0."""
+    bogus = tmp_path / "bogus.mp3"
+    bogus.write_bytes(b"\xff\xfb" + b"\x00" * 256)  # MPEG sync prefix but invalid frame
+    assert audio_duration_minutes(bogus) == 0.0
+
+
+def test_audio_duration_permission_error_propagates(tmp_path: Path) -> None:
+    """PermissionError on file open → propagates (not in the silent-degrade catch list).
+
+    Per PRD §FR-4, OSError/PermissionError surface loudly so disk/permission
+    issues don't silently become 0.0 cumulative. Mutagen wraps the underlying
+    PermissionError in MutagenError; the implementation must unwrap and
+    re-raise the original PermissionError (and any other OSError except
+    FileNotFoundError).
+    """
+    import os
+    target = tmp_path / "locked.wav"
+    with wave.open(str(target), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000)  # valid 1s WAV
+    os.chmod(target, 0o000)
+    try:
+        with pytest.raises(PermissionError):
+            audio_duration_minutes(target)
+    finally:
+        os.chmod(target, 0o644)  # restore so tmp_path cleanup works
 
 
 def test_register_device_updates_on_second_call(archive_dir: Path) -> None:

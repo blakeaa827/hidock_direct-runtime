@@ -26,8 +26,8 @@ from hidock_direct.device import (
 def make_wav_bytes(*, duration_seconds: float = 1.0, sample_rate: int = 16000) -> bytes:
     """Produce a valid little-endian PCM WAV of the given duration.
 
-    Uses the stdlib `wave` module so the header is canonical — `state.wav_duration_minutes`
-    can read back the exact duration.
+    Uses the stdlib `wave` module so the header is canonical — `state.audio_duration_minutes`
+    can read back the exact duration via mutagen.
     """
     buf = BytesIO()
     with wave.open(buf, "wb") as w:
