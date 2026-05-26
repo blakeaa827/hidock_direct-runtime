@@ -31,8 +31,19 @@ echo "==> Installing dependencies"
 "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null
 "$VENV/bin/pip" install --quiet -e ".[test]"
 
-echo "==> Verifying import"
+DIARIZE_RUNTIME="$(dirname "$RUNTIME_ROOT")/diarize_audio-runtime"
+if [ -d "$DIARIZE_RUNTIME" ]; then
+  echo "==> Installing diarize_audio (sibling runtime)"
+  "$VENV/bin/pip" install --quiet -e "$DIARIZE_RUNTIME"
+else
+  echo "WARN: diarize_audio-runtime not found at $DIARIZE_RUNTIME" >&2
+  echo "      Transcription will be disabled until it is installed." >&2
+fi
+
+echo "==> Verifying imports"
 "$VENV/bin/python3" -c 'import hidock_direct; print(f"ok: hidock_direct {hidock_direct.__version__}")'
+"$VENV/bin/python3" -c 'import diarize_audio; print(f"ok: diarize_audio")' 2>/dev/null \
+  || echo "WARN: diarize_audio not importable (transcription will be skipped)"
 
 echo ""
 echo "Bootstrap complete."
