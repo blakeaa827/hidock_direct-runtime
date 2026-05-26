@@ -47,9 +47,9 @@ def _run_pipeline(audio_path: Path, archive_dir: Path) -> Any:
     """
     from dotenv import load_dotenv
 
-    forge_env = Path.home() / (
-        "Library/Mobile Documents/com~apple~CloudDocs/Claude/"
-        "forge/projects/diarize_audio/secrets/.env"
+    forge_env = (
+        Path(__file__).resolve().parents[2].parent
+        / "forge/projects/diarize_audio/secrets/.env"
     )
     if forge_env.exists():
         load_dotenv(forge_env, override=False)

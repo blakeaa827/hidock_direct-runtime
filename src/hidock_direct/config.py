@@ -23,7 +23,6 @@ from dotenv import dotenv_values
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 FORGE_SECRETS_CANDIDATES = (
     RUNTIME_ROOT.parent / "forge" / "projects" / "hidock_direct" / "secrets" / ".env",
-    Path.home() / "Library" / "Mobile Documents" / "com~apple~CloudDocs" / "Claude" / "forge" / "projects" / "hidock_direct" / "secrets" / ".env",
 )
 
 _TRUE_SET = {"1", "true", "yes", "on"}
