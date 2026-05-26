@@ -1,23 +1,15 @@
 #!/usr/bin/env bash
-# bootstrap.sh — create (or refresh) this machine's venv inside the iCloud repo.
+# bootstrap.sh — create (or refresh) the local venv.
 #
-# The repo is iCloud-synced so source travels between machines, but each machine
-# needs its own venv (different architectures, Python versions, binary wheels).
-# We solve this by naming venvs .venv-<hostname>/.
-#
-# iCloud gotcha: files in a Mobile Documents container are automatically marked
-# UF_HIDDEN, which makes Python's site.py silently skip any .pth file inside the
-# venv's site-packages. Without this script's chflags fix, `pip install -e .`
-# appears to succeed but the package is never importable. We unhide every .pth
-# after install.
+# The repo is Syncthing-synced. Venvs are machine-local and excluded from sync
+# via .syncthing-ignores, so a plain .venv name is used on every machine.
 
 set -euo pipefail
 
 RUNTIME_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$RUNTIME_ROOT"
 
-HOST="$(scutil --get LocalHostName)"
-VENV=".venv-${HOST}"
+VENV=".venv"
 
 if ! command -v brew >/dev/null 2>&1; then
   echo "WARN: Homebrew not found. libusb must be installed another way." >&2
@@ -38,9 +30,6 @@ fi
 echo "==> Installing dependencies"
 "$VENV/bin/pip" install --quiet --upgrade pip >/dev/null
 "$VENV/bin/pip" install --quiet -e ".[test]"
-
-echo "==> Unhiding .pth files (iCloud UF_HIDDEN workaround)"
-find "$VENV/lib" -name "*.pth" -exec chflags nohidden {} +
 
 echo "==> Verifying import"
 "$VENV/bin/python3" -c 'import hidock_direct; print(f"ok: hidock_direct {hidock_direct.__version__}")'

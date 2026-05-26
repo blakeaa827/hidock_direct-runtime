@@ -13,8 +13,7 @@ set -euo pipefail
 RUNTIME_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$RUNTIME_ROOT"
 
-HOST="$(scutil --get LocalHostName)"
-VENV=".venv-${HOST}"
+VENV=".venv"
 
 if [ ! -d "$VENV" ]; then
   echo "No venv at $VENV. Run scripts/bootstrap.sh first." >&2
