@@ -9,15 +9,8 @@ from __future__ import annotations
 import signal
 import sys
 
-# Run BEFORE importing any editable-installed sibling (diarize_audio,
-# blake_commons). iCloud's UF_HIDDEN on __editable__*.pth makes site.py
-# skip them silently; this reinserts the paths into sys.path.
-from . import _pth_bootstrap
-
-_pth_bootstrap.bootstrap()
-
 from .app import App
-from .config import load_config
+from .config import load_config, load_env_file_into_environ
 from .device import JensenDeviceAdapter
 from .events import EventBus, TranscribeSkipped
 from .locks import FileLock, LockHeld
@@ -41,8 +34,11 @@ def _preflight_transcribe(bus: EventBus) -> None:
         msg = (
             "⚠️  TRANSCRIBE_ON_OFFLOAD=true but `diarize_audio` is not importable "
             f"({exc}).\n   Offloads will succeed but will NOT be transcribed.\n"
-            "   Likely cause: iCloud flagged __editable__*.pth UF_HIDDEN.\n"
-            "   Remediation: re-run `pip install -e` or `chflags nohidden` on the .pth files."
+            "   Likely cause: incomplete install — diarize_audio is vendored under\n"
+            "   src/ and ships with the app, so this means the package isn't installed\n"
+            "   in the active interpreter.\n"
+            "   Remediation: re-run ./scripts/bootstrap.sh and launch from the project\n"
+            "   venv (./.venv/bin/python -m hidock_direct)."
         )
         print(msg, file=sys.stderr, flush=True)
         bus.publish(
@@ -54,6 +50,10 @@ def _preflight_transcribe(bus: EventBus) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept for future flags
+    # Load the clone-local .env into the process environment FIRST, so both
+    # hidock's config and the vendored diarize_audio's Config.from_env() (which
+    # reads os.environ for ASSEMBLYAI_API_KEY / DRIVE_ENABLED) see all settings.
+    load_env_file_into_environ()
     try:
         config = load_config()
     except ValueError as exc:

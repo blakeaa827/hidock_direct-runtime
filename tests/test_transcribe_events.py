@@ -63,6 +63,14 @@ def test_unavailable_publishes_skipped_event(monkeypatch, bus_and_events, tmp_pa
     assert len(skipped) == 1, f"expected one TranscribeSkipped, got bus={sink}"
     assert skipped[0].device_filename == "2026Apr17-090039-Rec00.hda"
     assert "diarize_audio" in skipped[0].reason.lower()
+    # FR-D2: colleague-accurate remediation — diarize_audio is vendored now, so
+    # the old iCloud/.pth remediation is misleading. Message must point at the
+    # real fix (re-run bootstrap), not chflags/.pth.
+    reason = skipped[0].reason
+    assert ".pth" not in reason
+    assert "iCloud" not in reason
+    assert "chflags" not in reason
+    assert "bootstrap" in reason
     # And importantly: no Started/Complete were falsely emitted.
     assert not [e for e in sink if isinstance(e, (TranscribeStarted, TranscribeComplete, TranscribeFailed))]
 

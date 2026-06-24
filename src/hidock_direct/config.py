@@ -1,13 +1,18 @@
-"""Configuration loading from environment and the forge secrets `.env`.
+"""Configuration loading from environment and a clone-local `.env`.
 
-Resolution order (first hit wins per variable):
-  1. Existing process environment.
-  2. `$HIDOCK_DIRECT_ENV_FILE` if set.
-  3. `forge/projects/hidock_direct/secrets/.env` discovered relative to this
-     runtime repo (sibling of `diarize_audio-runtime`).
-  4. `./.env` in the runtime root.
+`load_env_file_into_environ()` runs once at startup (called by `__main__`) to
+load the discovered `.env` into `os.environ`, so the vendored `diarize_audio`'s
+`Config.from_env()` sees the same variables (ASSEMBLYAI_API_KEY, DRIVE_ENABLED,
+…). `load_config()` then reads the typed hidock values.
 
-Only the four PRD-defined variables are recognized.
+Env-file discovery order (first existing file wins):
+  1. `$HIDOCK_DIRECT_ENV_FILE` if set.
+  2. `./.env` in the runtime root (clone-local — primary; copy from .env.example).
+  3. `forge/projects/hidock_direct/secrets/.env` (operator-only forge fallback).
+
+Per-variable precedence within `load_config`: real process env > `.env` file >
+default. Only the four hidock variables below are typed here; the AssemblyAI key
+and DRIVE_ENABLED are consumed by the vendored diarize_audio.
 """
 
 from __future__ import annotations
@@ -63,11 +68,33 @@ def _discover_env_file() -> Optional[Path]:
     if explicit:
         p = Path(explicit).expanduser()
         return p if p.is_file() else None
+    # Clone-local `.env` is the primary, documented path (copy from .env.example).
+    local = RUNTIME_ROOT / ".env"
+    if local.is_file():
+        return local
+    # Forge-sibling secrets file — operator-only fallback for the maintainer's
+    # multi-repo layout; absent in a standalone clone.
     for candidate in FORGE_SECRETS_CANDIDATES:
         if candidate.is_file():
             return candidate
-    local = RUNTIME_ROOT / ".env"
-    return local if local.is_file() else None
+    return None
+
+
+def load_env_file_into_environ() -> Optional[Path]:
+    """Load the discovered `.env` into `os.environ` (override=False) once at
+    startup, so BOTH hidock's config AND the vendored `diarize_audio`'s
+    `Config.from_env()` (which reads `os.environ` for `ASSEMBLYAI_API_KEY`,
+    `DRIVE_ENABLED`, etc.) see every variable from the single clone-local file.
+
+    `override=False` preserves precedence: a value already set in the real
+    process environment wins over the file. Returns the loaded path (or None).
+    """
+    env_path = _discover_env_file()
+    if env_path and env_path.is_file():
+        from dotenv import load_dotenv
+
+        load_dotenv(env_path, override=False)
+    return env_path
 
 
 def _resolve(name: str, default: str, env_values: dict, overlay: Optional[dict]) -> str:

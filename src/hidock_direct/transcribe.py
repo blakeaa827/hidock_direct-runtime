@@ -45,15 +45,9 @@ def _run_pipeline(audio_path: Path, archive_dir: Path) -> Any:
     without exercising the real AssemblyAI + Drive stack. Returns the
     `ProcessResult` from diarize_audio.
     """
-    from dotenv import load_dotenv
-
-    forge_env = (
-        Path(__file__).resolve().parents[2].parent
-        / "forge/projects/diarize_audio/secrets/.env"
-    )
-    if forge_env.exists():
-        load_dotenv(forge_env, override=False)
-
+    # The clone-local .env was already loaded into os.environ at startup
+    # (hidock_direct.config.load_env_file_into_environ), so diarize_audio's
+    # Config.from_env() sees ASSEMBLYAI_API_KEY / DRIVE_ENABLED directly.
     from diarize_audio.config import Config
     from diarize_audio.state import State
     from diarize_audio.assemblyai_client import AAIClient
@@ -106,7 +100,7 @@ def transcribe_file(
         bus.publish(
             TranscribeSkipped(
                 device_filename=device_filename,
-                reason="diarize_audio not importable (check .pth visibility / install)",
+                reason="diarize_audio not importable (incomplete install — re-run scripts/bootstrap.sh)",
             )
         )
         log.warning("transcribe skipped: diarize_audio unavailable")

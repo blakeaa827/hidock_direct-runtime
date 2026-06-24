@@ -15,9 +15,21 @@ dependencies = [
     # to read duration from both WAV (HTA-converted from H1 model) and MP3
     # (P1 model native) headers without an ffmpeg dependency.
     "mutagen~=1.47",
+    # Transcription. diarize_audio is VENDORED under src/diarize_audio/ (pinned
+    # in src/diarize_audio/VENDORED_COMMIT, re-synced via scripts/refresh_diarize.sh);
+    # assemblyai is its one non-stdlib runtime dependency, declared here so a base
+    # `pip install` of hidock pulls everything the transcription path needs.
+    "assemblyai>=0.30",
 ]
 
 [project.optional-dependencies]
+# Google Drive upload for the vendored diarize_audio (DRIVE_ENABLED=true).
+# blake-commons is a private git+ssh dependency; the base install transcribes
+# via AssemblyAI to local .md/.aai.json without it. A colleague never installs
+# this. Operators who want Drive run: pip install ".[drive]".
+drive = [
+    "blake-commons",
+]
 test = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
@@ -31,6 +43,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "hidock_direct.jensen" = ["VENDORED_COMMIT", "README.md"]
+"diarize_audio" = ["VENDORED_COMMIT"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -42,6 +55,11 @@ omit = [
     # Vendored third-party code — pinned by commit in jensen/VENDORED_COMMIT.
     # Not ours to own; upstream tests apply.
     "src/hidock_direct/jensen/*",
+    # Vendored diarize_audio — pinned in diarize_audio/VENDORED_COMMIT, owned by
+    # the canonical diarize_audio-runtime repo + its own suite. Already outside
+    # `source` above; listed explicitly so a future `source` broadening can't
+    # silently start counting it.
+    "src/diarize_audio/*",
     # Entry point + TUI rendering — hardware-coupled, exercised by the
     # manual Gate 4 procedure in scripts/manual_verify.sh rather than
     # unit tests.
