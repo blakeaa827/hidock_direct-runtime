@@ -44,7 +44,7 @@ ASSEMBLYAI_API_KEY=<paste your key here>
 ```
 
 That's the only required value. Optionally change `HIDOCK_ARCHIVE_DIR` (where
-recordings + transcripts are saved; defaults to `~/HiDock/archive`). Leave
+recordings + transcripts are saved; defaults to `~/hidock-archive`). Leave
 `DRIVE_ENABLED=false` unless you specifically need Google Drive upload (see
 §6).
 
@@ -52,6 +52,13 @@ recordings + transcripts are saved; defaults to `~/HiDock/archive`). Leave
 
 ```bash
 ./.venv/bin/python -m hidock_direct
+```
+
+**Optional — a one-word launch.** Add a shell alias so you can start it by
+typing `hidock` from any Terminal (adjust the path if you cloned elsewhere):
+
+```bash
+echo 'alias hidock="$HOME/hidock-direct/.venv/bin/python -m hidock_direct"' >> ~/.zprofile && source ~/.zprofile
 ```
 
 Plug in the HiDock over USB. The TUI shows the device connecting, lists

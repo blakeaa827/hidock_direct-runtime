@@ -28,6 +28,14 @@ cp .env.example .env          # then edit .env and paste your ASSEMBLYAI_API_KEY
 
 Plug in the HiDock; recordings offload to `HIDOCK_ARCHIVE_DIR` and transcribe automatically. Artifacts land as `YYYY/MM/YYYY-MM-DD_HHMMSS.{mp3,md,aai.json}`.
 
+For a one-word launch, add a shell alias once (adjust the path to your install dir):
+
+```bash
+echo 'alias hidock="$HOME/hidock-direct/.venv/bin/python -m hidock_direct"' >> ~/.zprofile && source ~/.zprofile
+```
+
+Then just type `hidock` in any Terminal.
+
 ## Configuration
 
 All settings live in a single clone-local `.env` (copy from `.env.example`). hidock loads it into the environment at startup so the vendored `diarize_audio` sees the same values.
@@ -35,7 +43,7 @@ All settings live in a single clone-local `.env` (copy from `.env.example`). hid
 | Variable | Default | Purpose |
 |---|---|---|
 | `ASSEMBLYAI_API_KEY` | *(required)* | AssemblyAI key for transcription |
-| `HIDOCK_ARCHIVE_DIR` | `~/HiDock/archive` | Where audio + transcripts are written |
+| `HIDOCK_ARCHIVE_DIR` | `~/hidock-archive` | Where audio + transcripts are written |
 | `TRANSCRIBE_ON_OFFLOAD` | `true` | Transcribe each recording after offload |
 | `DRIVE_ENABLED` | `false` | Upload transcripts to Google Drive (see below) |
 | `DELETE_FROM_DEVICE_AFTER_OFFLOAD` | `false` | Delete from device after successful archive |

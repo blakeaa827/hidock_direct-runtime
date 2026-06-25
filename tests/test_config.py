@@ -30,7 +30,7 @@ def test_load_config_defaults(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("LOG_LEVEL", raising=False)
     monkeypatch.setenv("HIDOCK_DIRECT_ENV_FILE", str(tmp_path / "missing.env"))
     cfg = load_config()
-    assert cfg.archive_dir == Path.home() / "HiDock" / "archive"
+    assert cfg.archive_dir == Path.home() / "hidock-archive"
     assert cfg.poll_interval_seconds == 10
     assert cfg.delete_from_device_after_offload is False
     assert cfg.log_level == "info"

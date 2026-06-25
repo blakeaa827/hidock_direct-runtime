@@ -118,7 +118,7 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     if env_path and env_path.is_file():
         env_values = {k: v for k, v in dotenv_values(env_path).items() if v is not None}
 
-    archive = _resolve("HIDOCK_ARCHIVE_DIR", "~/HiDock/archive", env_values, overlay)
+    archive = _resolve("HIDOCK_ARCHIVE_DIR", "~/hidock-archive", env_values, overlay)
     poll = _resolve("POLL_INTERVAL_SECONDS", "10", env_values, overlay)
     delete = _resolve("DELETE_FROM_DEVICE_AFTER_OFFLOAD", "false", env_values, overlay)
     transcribe = _resolve("TRANSCRIBE_ON_OFFLOAD", "true", env_values, overlay)

@@ -20,7 +20,7 @@ if [ ! -d "$VENV" ]; then
   exit 1
 fi
 
-ARCHIVE_DIR="${HIDOCK_ARCHIVE_DIR:-$HOME/HiDock/archive}"
+ARCHIVE_DIR="${HIDOCK_ARCHIVE_DIR:-$HOME/hidock-archive}"
 
 confirm() {
   read -r -p "  [?] $1  [enter to continue, ^C to abort] " _
@@ -57,11 +57,11 @@ confirm "After plug, does the TUI header flip to 'Connected' with the model/seri
 
 echo ""
 echo "4. On the HiDock, record a short (~10 second) test message, then stop."
-confirm "Within ~10 seconds, does a new .wav appear in $ARCHIVE_DIR/YYYY/MM/?"
+confirm "Within ~10 seconds, does a new recording (.mp3 on P1, .wav on H1) appear in $ARCHIVE_DIR/YYYY/MM/?"
 
 echo ""
-echo "5. Inspect the newest .wav."
-LATEST="$(find "$ARCHIVE_DIR" -type f -name '*.wav' -print0 2>/dev/null | xargs -0 ls -1t 2>/dev/null | head -1 || true)"
+echo "5. Inspect the newest recording."
+LATEST="$(find "$ARCHIVE_DIR" -type f \( -name '*.mp3' -o -name '*.wav' \) -print0 2>/dev/null | xargs -0 ls -1t 2>/dev/null | head -1 || true)"
 echo "   Newest: ${LATEST:-<none yet>}"
 if [ -n "$LATEST" ]; then
   echo "   Size:   $(stat -f %z "$LATEST") bytes"
