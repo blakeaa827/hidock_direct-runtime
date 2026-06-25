@@ -2,7 +2,7 @@
 
 A foreground macOS TUI that pulls audio recordings off the HiDock device over USB into a local archive **and transcribes them** (speaker-diarized) via AssemblyAI. Transcription is provided by `diarize_audio`, which is **vendored into this repo** (`src/diarize_audio/`) — so a single clone is fully self-contained.
 
-New here? **[docs/SETUP.md](docs/SETUP.md)** is the concise terminal walkthrough. For a polished, click-by-click guide aimed at non-technical teammates (GitHub → Claude Code → AssemblyAI → run), open **[docs/install-guide.html](docs/install-guide.html)** in a browser — it's also the source for the standalone file handed out to the team.
+New here? The **[click-by-click install guide](https://blakeaa827.github.io/hidock_direct-runtime/install-guide.html)** (hosted on GitHub Pages) walks non-technical teammates from a fresh Mac to a working setup — Claude Code → AssemblyAI → run. Prefer the terminal? **[docs/SETUP.md](docs/SETUP.md)** is the concise version. (The guide's source is **[docs/install-guide.html](docs/install-guide.html)**.)
 
 ## Requirements
 
