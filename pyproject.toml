@@ -42,7 +42,7 @@ hidock-direct = "hidock_direct.__main__:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"hidock_direct.jensen" = ["VENDORED_COMMIT", "README.md"]
+"hidock_direct.jensen" = ["VENDORED_COMMIT", "README.md", "LICENSE"]
 "diarize_audio" = ["VENDORED_COMMIT"]
 
 [tool.pytest.ini_options]

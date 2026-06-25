@@ -4,6 +4,13 @@ This directory is a **pinned copy** of the Python modules that implement the
 reverse-engineered "Jensen" USB protocol for the HiDock device, from
 [sgeraldes/hidock-next](https://github.com/sgeraldes/hidock-next).
 
+## License
+
+Upstream is **MIT-licensed** (Copyright © 2025 Sebastian Geraldes). The full
+license text is preserved in [LICENSE](LICENSE), as MIT requires the copyright
+and permission notice to ship with any copy. Our only local change (relative
+imports) does not affect that.
+
 ## Pinned commit
 
 See [VENDORED_COMMIT](VENDORED_COMMIT).
