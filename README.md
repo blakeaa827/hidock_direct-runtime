@@ -54,10 +54,10 @@ Discovery order for the `.env`: `$HIDOCK_DIRECT_ENV_FILE` → `./.env` (clone-lo
 
 ### Google Drive (optional)
 
-Drive upload is **off by default** and needs the private `blake-commons` dependency:
+Drive upload is **off by default** and needs `blake-commons`, a private maintainer-only package:
 
 ```bash
-./.venv/bin/pip install ".[drive]"    # requires SSH access to the blake-commons repo
+./.venv/bin/pip install ".[drive]"    # blake-commons is private; install it separately if you have access
 # then set DRIVE_ENABLED=true in .env
 ```
 

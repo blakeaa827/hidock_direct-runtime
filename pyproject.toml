@@ -24,9 +24,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # Google Drive upload for the vendored diarize_audio (DRIVE_ENABLED=true).
-# blake-commons is a private git+ssh dependency; the base install transcribes
-# via AssemblyAI to local .md/.aai.json without it. A colleague never installs
-# this. Operators who want Drive run: pip install ".[drive]".
+# Requires blake-commons, a private package the maintainer installs separately;
+# the base install transcribes via AssemblyAI to local .md/.aai.json without it.
+# A colleague never installs this — Drive is off by default.
 drive = [
     "blake-commons",
 ]

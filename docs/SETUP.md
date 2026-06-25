@@ -95,11 +95,11 @@ right after it downloads.
 ## 6. Google Drive upload (optional, advanced)
 
 By default transcripts are saved locally only. To additionally upload them to
-Google Drive you need the private `blake-commons` dependency and Google
-credentials:
+Google Drive you need `blake-commons` (a private maintainer-only package) and
+Google credentials:
 
 ```bash
-./.venv/bin/pip install ".[drive]"   # requires SSH access to the blake-commons repo
+./.venv/bin/pip install ".[drive]"   # blake-commons is private; install it separately if you have access
 ```
 
 Then set `DRIVE_ENABLED=true` in `.env`. If `DRIVE_ENABLED=true` but the extra

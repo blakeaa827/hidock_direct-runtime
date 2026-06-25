@@ -317,10 +317,10 @@
       <h1 class="title">HiDock&nbsp;Direct<span class="dim">.</span></h1>
       <p class="lede">Pull recordings straight off your HiDock over USB and turn them into clean, speaker-labeled transcripts. This guide takes you from a fresh Mac to a working setup, one step at a time.</p>
       <div class="meta">
-        <span class="chip"><b>~45 min</b> start to finish</span>
+        <span class="chip"><b>~30 min</b> start to finish</span>
         <span class="chip">Platform: <b>macOS</b></span>
         <span class="chip"><b>Claude Code</b> + <b>AssemblyAI</b></span>
-        <span class="chip"><b>10</b> steps</span>
+        <span class="chip"><b>6</b> steps</span>
       </div>
     </div>
     <div class="signature" aria-hidden="true">
@@ -358,16 +358,12 @@
       <ol>
         <li><a href="#before"><span class="tnum">·</span> Before you start</a></li>
         <li class="gap"></li>
-        <li><a href="#step-1"><span class="tnum">01</span> Create a GitHub account</a></li>
-        <li><a href="#step-2"><span class="tnum">02</span> Get repository access</a></li>
-        <li><a href="#step-3"><span class="tnum">03</span> Install Homebrew, Git &amp; Python</a></li>
-        <li><a href="#step-4"><span class="tnum">04</span> Install Claude Code</a></li>
-        <li><a href="#step-5"><span class="tnum">05</span> Turn on permissions</a></li>
-        <li><a href="#step-6"><span class="tnum">06</span> Set up GitHub SSH</a></li>
-        <li><a href="#step-7"><span class="tnum">07</span> Add your SSH key</a></li>
-        <li><a href="#step-8"><span class="tnum">08</span> Create an AssemblyAI account</a></li>
-        <li><a href="#step-9"><span class="tnum">09</span> Install the app</a></li>
-        <li><a href="#step-10"><span class="tnum">10</span> Run HiDock Direct</a></li>
+        <li><a href="#step-1"><span class="tnum">01</span> Install Homebrew, Git &amp; Python</a></li>
+        <li><a href="#step-2"><span class="tnum">02</span> Install Claude Code</a></li>
+        <li><a href="#step-3"><span class="tnum">03</span> Turn on permissions</a></li>
+        <li><a href="#step-4"><span class="tnum">04</span> Create an AssemblyAI account</a></li>
+        <li><a href="#step-5"><span class="tnum">05</span> Install the app</a></li>
+        <li><a href="#step-6"><span class="tnum">06</span> Run HiDock Direct</a></li>
         <li class="gap"></li>
         <li><a href="#transcripts"><span class="tnum">·</span> Your transcripts</a></li>
         <li><a href="#naming"><span class="tnum">·</span> Naming speakers</a></li>
@@ -402,7 +398,7 @@
         <ul>
           <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A Mac you can install software on.</span> <span class="cd">You will need your computer password once, during Homebrew install.</span></span></li>
           <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">Your HiDock and its USB cable.</span> <span class="cd">Connected to the Mac when you run the app.</span></span></li>
-          <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A personal email address.</span> <span class="cd">For GitHub, so the account stays yours regardless of employer.</span></span></li>
+          <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A personal email address.</span> <span class="cd">For your AssemblyAI sign-up.</span></span></li>
           <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A paid Claude plan.</span> <span class="cd">Claude Code needs Claude Pro (about 20 dollars a month).</span></span></li>
         </ul>
       </div>
@@ -429,32 +425,6 @@
 
         <section id="step-1" class="step">
           <div class="num">01</div>
-          <h3>Create a GitHub account</h3>
-          <p class="lead">GitHub hosts the HiDock Direct code. You need a free account to get access.</p>
-          <ul class="plain">
-            <li>Go to <b>github.com</b> and start the sign-up.</li>
-            <li>Sign in with Google, or use your personal email. <b>Do not use your work email.</b></li>
-            <li>Pick a username and write it down. You can change it later if you want.</li>
-          </ul>
-          <div class="callout tip">
-            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M9 18h6M10 21h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.3 1 2.1h5c0-.8.4-1.6 1-2.1A6 6 0 0012 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
-            <div><p class="ctitle">Skip the Copilot upsell</p><p class="cbody">GitHub will offer Copilot during sign-up. You do not need it for this. Decline it.</p></div>
-          </div>
-        </section>
-
-        <section id="step-2" class="step">
-          <div class="num">02</div>
-          <h3>Get access to the repository</h3>
-          <p class="lead">HiDock Direct lives in a private repository. The owner adds your GitHub username as a collaborator, then you accept the invite.</p>
-          <ul class="plain">
-            <li>Send the repository owner your exact GitHub username.</li>
-            <li>Once they add you, open your GitHub <b>inbox</b> (the icon at the top right, look for the blue dot next to your profile).</li>
-            <li>Open the invitation and click <b>Accept invitation</b>.</li>
-          </ul>
-        </section>
-
-        <section id="step-3" class="step">
-          <div class="num">03</div>
           <h3>Install Homebrew, Git, and Python</h3>
           <p class="lead">Homebrew is a package manager for macOS. You will use it to install Git and Python. Claude Code needs Git to work with local repositories, and HiDock Direct needs Python 3.11 or newer, so set both up before you install Claude Code.</p>
 
@@ -500,8 +470,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </div>
         </section>
 
-        <section id="step-4" class="step">
-          <div class="num">04</div>
+        <section id="step-2" class="step">
+          <div class="num">02</div>
           <h3>Install Claude Code</h3>
           <p class="lead">Claude Code is the assistant that runs the rest of this install for you. It reads the repository's instructions, installs what it needs, and configures your machine.</p>
           <ul class="plain">
@@ -520,8 +490,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </div>
         </section>
 
-        <section id="step-5" class="step">
-          <div class="num">05</div>
+        <section id="step-3" class="step">
+          <div class="num">03</div>
           <h3>Turn on Claude Code's permissions</h3>
           <p class="lead">For Claude Code to do the rest of the setup on its own, it needs permission to act on your computer. Set this up now, right after installing Claude, so every step that follows runs without stopping to approve each command. Quit and reopen Claude, then turn these on so the grants take effect.</p>
           <p>Open Claude's settings (click your name at the bottom left, then <b>Settings</b>). The important switches:</p>
@@ -537,44 +507,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </div>
         </section>
 
-        <section id="step-6" class="step">
-          <div class="num">06</div>
-          <h3>Set up GitHub SSH access</h3>
-          <p class="lead">SSH is how your Mac proves to GitHub that it is you, without typing a password every time. Claude Code sets this up for you.</p>
-          <p>In the Claude Code message box, paste this and press Return:</p>
-          <div class="console" data-where="claude">
-            <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
-            <pre><code>I just set up a new GitHub account. Please set up my local computer for GitHub SSH access for the CLI.</code></pre>
-          </div>
-          <ul class="plain">
-            <li>When Claude asks for a workspace folder, create a <b>new folder named <code class="inline">claude</code></b> and trust it.</li>
-            <li>With permissions already on from Step 5, Claude runs these actions on its own without stopping to ask.</li>
-          </ul>
-          <div class="callout note">
-            <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
-            <div><p class="ctitle">Git is already in place</p><p class="cbody">Because you installed Git in Step 3, Claude Code can work with your local repository without stopping to ask for it.</p></div>
-          </div>
-        </section>
-
-        <section id="step-7" class="step">
-          <div class="num">07</div>
-          <h3>Add your SSH key to GitHub</h3>
-          <p class="lead">Now connect the key Claude generated to your GitHub account. Reopen your SSH conversation in Claude (type <code class="inline">continue</code> if it paused) and find the key it created.</p>
-          <ul class="plain">
-            <li>In Claude Code, find the public key (the line that starts with <code class="inline">ssh-</code>) and click its <b>copy</b> button.</li>
-            <li>In GitHub, go to <b>Settings</b> &rsaquo; <b>SSH and GPG keys</b> &rsaquo; <b>New SSH key</b>.</li>
-            <li>Give it a name (like <code class="inline">My Mac</code>), paste the key, and click <b>Add SSH key</b>.</li>
-          </ul>
-          <p>Back in Claude Code, test the connection:</p>
-          <div class="console" data-where="claude">
-            <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
-            <pre><code>SSH key has been added. Please test it.</code></pre>
-          </div>
-          <p>Once it confirms success, your Mac can talk to GitHub.</p>
-        </section>
-
-        <section id="step-8" class="step">
-          <div class="num">08</div>
+        <section id="step-4" class="step">
+          <div class="num">04</div>
           <h3>Create an AssemblyAI account</h3>
           <p class="lead">AssemblyAI does the transcription. New accounts come with free credits, which is plenty to get everything working before you ever need to add more. Do this right before the install so the key is fresh and the tab is open when Claude asks for it.</p>
           <ul class="plain">
@@ -587,8 +521,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </div>
         </section>
 
-        <section id="step-9" class="step">
-          <div class="num">09</div>
+        <section id="step-5" class="step">
+          <div class="num">05</div>
           <h3>Install the HiDock Direct app</h3>
           <p class="lead">Now Claude installs the app for you, following the instructions in the repository and placing it in a permanent folder in your home directory.</p>
           <ul class="plain">
@@ -607,12 +541,12 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </ul>
           <div class="callout note">
             <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
-            <div><p class="ctitle">What Claude sets up here</p><p class="cbody"><b>libusb</b> (for talking to the device over USB), a Python virtual environment (using the Python you installed in Step 3), and your AssemblyAI key, all wired together so the app can run.</p></div>
+            <div><p class="ctitle">What Claude sets up here</p><p class="cbody"><b>libusb</b> (for talking to the device over USB), a Python virtual environment (using the Python you installed in Step 1), and your AssemblyAI key, all wired together so the app can run.</p></div>
           </div>
         </section>
 
-        <section id="step-10" class="step">
-          <div class="num">10</div>
+        <section id="step-6" class="step">
+          <div class="num">06</div>
           <h3>Run HiDock Direct</h3>
           <p class="lead">Only one copy can talk to the device at a time, so start from a clean slate: have Claude stop anything already running, then launch the app yourself in a fresh Terminal.</p>
           <p>First, in Claude Code, clear any running instances:</p>
@@ -692,7 +626,7 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
 
 <footer>
   <div class="foot-inner">
-    <span><span class="fmark">HiDock Direct</span> · internal install guide</span>
+    <span><span class="fmark">HiDock Direct</span> · install guide</span>
     <span>Built from a recorded walkthrough · macOS</span>
   </div>
 </footer>
