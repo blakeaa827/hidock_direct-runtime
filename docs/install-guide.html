@@ -525,13 +525,10 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           <div class="num">05</div>
           <h3>Install the HiDock Direct app</h3>
           <p class="lead">Now Claude installs the app for you, following the instructions in the repository and placing it in a permanent folder in your home directory.</p>
-          <ul class="plain">
-            <li>Open the HiDock Direct repository on GitHub and copy its <b>URL</b> from the address bar.</li>
-            <li>Paste this prompt into Claude Code, with the repository URL at the end:</li>
-          </ul>
+          <p>Paste this prompt into Claude Code (the repository link is already in it):</p>
           <div class="console" data-where="claude">
             <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
-            <pre><code>Install the app and follow the instructions in the README at this link: [paste the repository URL]. Install it into a folder named hidock-direct in my home directory (~/hidock-direct), not a temporary folder. Then add an alias to my shell profile so I can launch it by typing hidock in any Terminal.</code></pre>
+            <pre><code>Install the app and follow the instructions in the README at this link: https://github.com/blakeaa827/hidock_direct-runtime. Install it into a folder named hidock-direct in my home directory (~/hidock-direct), not a temporary folder. Then add an alias to my shell profile so I can launch it by typing hidock in any Terminal.</code></pre>
           </div>
           <p class="console-note">The <code class="inline">~</code> in <code class="inline">~/hidock-direct</code> is the tilde (Shift plus the key just left of <kbd>1</kbd>). It is shorthand for your home folder.</p>
           <ul class="plain">
