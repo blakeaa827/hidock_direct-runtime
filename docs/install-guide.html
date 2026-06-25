@@ -1,0 +1,758 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HiDock Direct · Install Guide</title>
+<style>
+  :root{
+    --ink:#16181d;
+    --ink-soft:#494d56;
+    --ink-faint:#7d8089;
+    --paper:#f3f2ec;
+    --card:#fbfaf6;
+    --line:#e2dfd4;
+    --line-soft:#ece9df;
+    --teal:#0e7c6b;
+    --teal-bright:#15b39c;
+    --teal-wash:#e4f0ec;
+    --amber:#bd741a;
+    --amber-wash:#f7ecda;
+    --code-bg:#1b1e24;
+    --code-bg-2:#23272f;
+    --code-text:#e9e7df;
+    --code-dim:#9aa0ab;
+    --code-green:#7fd6a8;
+    --code-amber:#e3b06a;
+    --radius:14px;
+    --radius-sm:9px;
+    --maxw:1180px;
+    --mono:"SF Mono","JetBrains Mono","Fira Code",Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","Inter",Roboto,"Helvetica Neue",Arial,sans-serif;
+  }
+
+  *{box-sizing:border-box;}
+  html{scroll-behavior:smooth;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--sans);
+    font-size:17px;
+    line-height:1.65;
+    -webkit-font-smoothing:antialiased;
+    text-rendering:optimizeLegibility;
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto;}
+    *{animation:none!important;transition:none!important;}
+  }
+
+  a{color:var(--teal);text-decoration:none;}
+  a:hover{text-decoration:underline;}
+
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px;}
+
+  /* ---------- Hero ---------- */
+  .hero{
+    border-bottom:1px solid var(--line);
+    background:
+      radial-gradient(120% 90% at 88% -10%, rgba(14,124,107,.10), rgba(14,124,107,0) 60%),
+      linear-gradient(180deg,#f6f5ef 0%, var(--paper) 100%);
+  }
+  .hero-inner{
+    max-width:var(--maxw);margin:0 auto;padding:64px 28px 56px;
+    display:grid;grid-template-columns:minmax(0,1fr) auto;gap:40px;align-items:end;
+  }
+  .eyebrow{
+    font-family:var(--mono);font-size:12.5px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--teal);font-weight:600;margin:0 0 18px;
+    display:inline-flex;align-items:center;gap:10px;
+  }
+  .eyebrow::before{content:"";width:26px;height:2px;background:var(--teal);display:inline-block;}
+  h1.title{
+    font-size:clamp(2.6rem,6vw,4.3rem);line-height:.98;margin:0 0 20px;font-weight:780;
+    letter-spacing:-.02em;
+  }
+  h1.title .dim{color:var(--ink-faint);font-weight:400;}
+  .lede{font-size:1.18rem;line-height:1.55;color:var(--ink-soft);max-width:48ch;margin:0 0 28px;}
+  .meta{display:flex;flex-wrap:wrap;gap:10px;}
+  .chip{
+    font-family:var(--mono);font-size:12.5px;letter-spacing:.02em;
+    background:var(--card);border:1px solid var(--line);border-radius:100px;
+    padding:7px 14px;color:var(--ink-soft);white-space:nowrap;
+  }
+  .chip b{color:var(--ink);font-weight:600;}
+
+  /* waveform → text signature */
+  .signature{align-self:end;padding-bottom:6px;}
+  .signature svg{display:block;width:230px;height:auto;}
+  @media (max-width:860px){
+    .hero-inner{grid-template-columns:1fr;gap:32px;}
+    .signature{order:-1;}
+    .signature svg{width:200px;}
+  }
+
+  /* ---------- Layout ---------- */
+  .layout{
+    display:grid;grid-template-columns:248px minmax(0,1fr);gap:56px;
+    max-width:var(--maxw);margin:0 auto;padding:56px 28px 40px;
+  }
+
+  /* ---------- Sidebar TOC ---------- */
+  .toc-wrap{position:relative;}
+  .toc{position:sticky;top:28px;}
+  .toc h2{
+    font-family:var(--mono);font-size:11.5px;letter-spacing:.2em;text-transform:uppercase;
+    color:var(--ink-faint);margin:0 0 16px;font-weight:600;
+  }
+  .toc ol{list-style:none;margin:0;padding:0;}
+  .toc li{margin:0;}
+  .toc a{
+    display:flex;gap:11px;align-items:baseline;
+    color:var(--ink-soft);font-size:14.5px;line-height:1.35;
+    padding:6px 0 6px 12px;border-left:2px solid var(--line-soft);
+    transition:border-color .15s, color .15s;
+  }
+  .toc a:hover{color:var(--ink);text-decoration:none;border-color:var(--line);}
+  .toc a.active{color:var(--ink);border-color:var(--teal);font-weight:600;}
+  .toc a .tnum{font-family:var(--mono);font-size:11.5px;color:var(--teal);min-width:18px;}
+  .toc .toc-sub a{padding-left:30px;font-size:13.5px;color:var(--ink-faint);}
+  .toc .gap{height:14px;}
+
+  @media (max-width:920px){
+    .layout{grid-template-columns:1fr;gap:0;}
+    .toc-wrap{margin-bottom:8px;}
+    .toc{position:static;border:1px solid var(--line);background:var(--card);
+      border-radius:var(--radius);padding:20px 22px;}
+    .toc ol{columns:2;column-gap:24px;}
+    .toc li{break-inside:avoid;}
+  }
+  @media (max-width:560px){.toc ol{columns:1;}}
+
+  /* ---------- Main content ---------- */
+  main{min-width:0;}
+  section{scroll-margin-top:24px;}
+
+  .section-head{margin:0 0 18px;}
+  .kicker{
+    font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--teal);font-weight:600;display:block;margin-bottom:8px;
+  }
+  h2.sec{font-size:1.85rem;letter-spacing:-.015em;font-weight:720;margin:0;line-height:1.15;}
+  p{margin:0 0 16px;}
+  main > .block + .block{margin-top:44px;}
+  .intro-copy{color:var(--ink-soft);max-width:64ch;}
+
+  /* divider between major regions */
+  .rule{height:1px;background:var(--line);border:0;margin:52px 0;}
+
+  /* ---------- Checklist ---------- */
+  .checklist{
+    background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+    padding:8px 4px;margin:6px 0 0;
+  }
+  .checklist li{
+    list-style:none;display:flex;gap:14px;align-items:flex-start;
+    padding:14px 22px;border-bottom:1px solid var(--line-soft);
+  }
+  .checklist{padding:0;}
+  .checklist ul{margin:0;padding:0;}
+  .checklist li:last-child{border-bottom:0;}
+  .check{
+    flex:0 0 auto;width:22px;height:22px;border-radius:6px;border:1.5px solid var(--teal);
+    display:grid;place-items:center;margin-top:1px;color:var(--teal);
+  }
+  .check svg{width:13px;height:13px;}
+  .checklist .ct{font-weight:600;}
+  .checklist .cd{color:var(--ink-soft);font-size:.95rem;}
+
+  /* ---------- How it fits ---------- */
+  .flow{
+    display:flex;flex-wrap:wrap;align-items:stretch;gap:10px;margin-top:8px;
+  }
+  .flow .node{
+    flex:1 1 150px;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--radius-sm);padding:14px 16px;min-width:140px;
+  }
+  .flow .node .nl{font-family:var(--mono);font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--teal);}
+  .flow .node .nt{font-weight:650;margin-top:3px;}
+  .flow .node .nd{font-size:.86rem;color:var(--ink-soft);line-height:1.4;margin-top:3px;}
+  .flow .arrow{display:grid;place-items:center;color:var(--ink-faint);font-family:var(--mono);font-size:1.2rem;padding:0 2px;}
+  @media (max-width:560px){.flow .arrow{display:none;}.flow .node{flex-basis:100%;}}
+
+  /* ---------- Steps (numbered, on a rail) ---------- */
+  .steps{position:relative;margin-top:8px;}
+  .steps::before{
+    content:"";position:absolute;left:23px;top:26px;bottom:26px;width:2px;
+    background:linear-gradient(180deg,var(--teal) 0%, var(--line) 12% 88%, var(--teal) 100%);
+    opacity:.5;
+  }
+  .step{position:relative;padding:0 0 0 72px;margin:0 0 46px;}
+  .step:last-child{margin-bottom:0;}
+  .num{
+    position:absolute;left:0;top:0;width:48px;height:48px;border-radius:50%;
+    background:var(--ink);color:#fff;font-family:var(--mono);font-weight:600;font-size:1.05rem;
+    display:grid;place-items:center;letter-spacing:.02em;
+    box-shadow:0 0 0 6px var(--paper);
+  }
+  .step h3{font-size:1.32rem;font-weight:700;letter-spacing:-.01em;margin:6px 0 14px;line-height:1.2;}
+  .step p{color:var(--ink-soft);}
+  .step .lead{color:var(--ink);}
+
+  ul.plain{margin:0 0 16px;padding-left:0;list-style:none;}
+  ul.plain li{position:relative;padding-left:24px;margin-bottom:9px;color:var(--ink-soft);}
+  ul.plain li::before{
+    content:"";position:absolute;left:4px;top:.62em;width:7px;height:7px;border-radius:2px;
+    background:var(--teal);transform:rotate(45deg);
+  }
+  ul.plain li b{color:var(--ink);font-weight:600;}
+
+  kbd{
+    font-family:var(--mono);font-size:.82em;background:var(--card);border:1px solid var(--line);
+    border-bottom-width:2px;border-radius:6px;padding:2px 7px;color:var(--ink);white-space:nowrap;
+  }
+  code.inline{
+    font-family:var(--mono);font-size:.86em;background:var(--teal-wash);color:#0a5447;
+    padding:2px 7px;border-radius:6px;
+  }
+
+  /* ---------- Console blocks ---------- */
+  .console{
+    background:var(--code-bg);border-radius:var(--radius-sm);overflow:hidden;
+    margin:16px 0;border:1px solid #2b2f37;
+  }
+  .console-bar{
+    display:flex;align-items:center;justify-content:space-between;
+    padding:9px 12px 9px 14px;background:var(--code-bg-2);border-bottom:1px solid #2b2f37;
+  }
+  .where{
+    font-family:var(--mono);font-size:11px;letter-spacing:.13em;text-transform:uppercase;
+    display:inline-flex;align-items:center;gap:8px;font-weight:600;
+  }
+  .where::before{content:"";width:9px;height:9px;border-radius:50%;}
+  .console[data-where="terminal"] .where{color:#86d8c5;}
+  .console[data-where="terminal"] .where::before{background:var(--code-green);}
+  .console[data-where="claude"] .where{color:#e7bd80;}
+  .console[data-where="claude"] .where::before{background:var(--code-amber);}
+  .copy{
+    font-family:var(--mono);font-size:11px;letter-spacing:.06em;cursor:pointer;
+    background:transparent;color:var(--code-dim);border:1px solid #353a44;border-radius:6px;
+    padding:5px 12px;transition:color .15s,border-color .15s,background .15s;
+  }
+  .copy:hover{color:#fff;border-color:#4a505c;background:#2a2f38;}
+  .copy.copied{color:var(--code-green);border-color:var(--code-green);}
+  .console pre{
+    margin:0;padding:16px 16px;overflow-x:auto;
+    font-family:var(--mono);font-size:14px;line-height:1.6;color:var(--code-text);
+    white-space:pre;
+  }
+  .console[data-where="terminal"] pre code::before{content:"$ ";color:var(--code-green);}
+  .console[data-where="claude"] pre{white-space:pre-wrap;color:#f1efe8;}
+  .console[data-where="claude"] pre code::before{content:"› ";color:var(--code-amber);}
+  .console pre code{font-family:inherit;}
+  .console-note{font-size:.84rem;color:var(--ink-faint);margin:-6px 0 0;padding-left:2px;}
+
+  /* ---------- Callouts ---------- */
+  .callout{
+    border-radius:var(--radius-sm);padding:16px 18px 16px 20px;margin:18px 0;
+    border:1px solid var(--line);border-left-width:4px;background:var(--card);
+    display:flex;gap:14px;align-items:flex-start;
+  }
+  .callout .ico{flex:0 0 auto;width:22px;height:22px;margin-top:1px;}
+  .callout .ctitle{font-weight:700;font-size:.95rem;letter-spacing:.01em;margin:0 0 3px;}
+  .callout .cbody{font-size:.95rem;color:var(--ink-soft);margin:0;line-height:1.55;}
+  .callout .cbody b{color:var(--ink);}
+  .callout p{margin:0;}
+  .callout.note{border-left-color:var(--teal);}
+  .callout.note .ctitle,.callout.note .ico{color:var(--teal);}
+  .callout.warn{border-left-color:var(--amber);background:var(--amber-wash);}
+  .callout.warn .ctitle,.callout.warn .ico{color:var(--amber);}
+  .callout.tip{border-left-color:#5a8db8;}
+  .callout.tip .ctitle,.callout.tip .ico{color:#3f739e;}
+
+  /* ---------- Files table ---------- */
+  .ftable{width:100%;border-collapse:collapse;margin-top:6px;background:var(--card);
+    border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;}
+  .ftable th,.ftable td{text-align:left;padding:14px 18px;border-bottom:1px solid var(--line-soft);vertical-align:top;}
+  .ftable tr:last-child td{border-bottom:0;}
+  .ftable th{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint);font-weight:600;background:#f4f2ea;}
+  .ftable td.ext{font-family:var(--mono);font-weight:600;color:var(--teal);white-space:nowrap;}
+  .ftable td .fd{color:var(--ink-soft);font-size:.95rem;}
+  @media (max-width:560px){
+    .ftable, .ftable tbody, .ftable tr, .ftable td{display:block;width:100%;}
+    .ftable thead{display:none;}
+    .ftable tr{border-bottom:1px solid var(--line);}
+    .ftable tr:last-child{border-bottom:0;}
+    .ftable td{border:0;padding:6px 18px;}
+    .ftable td.ext{padding-top:16px;}
+    .ftable td:last-child{padding-bottom:16px;}
+  }
+
+  /* ---------- Footer ---------- */
+  footer{border-top:1px solid var(--line);margin-top:8px;}
+  .foot-inner{max-width:var(--maxw);margin:0 auto;padding:36px 28px 56px;
+    display:flex;flex-wrap:wrap;gap:14px;justify-content:space-between;align-items:center;
+    font-family:var(--mono);font-size:12.5px;color:var(--ink-faint);letter-spacing:.02em;}
+  .foot-inner .fmark{color:var(--teal);font-weight:600;}
+
+  :focus-visible{outline:2.5px solid var(--teal);outline-offset:3px;border-radius:3px;}
+
+  @media print{
+    .toc-wrap,.signature{display:none;}
+    .layout{display:block;padding:0;}
+    .console{background:#fff;border:1px solid #ccc;color:#000;}
+    .console-bar{background:#f0f0f0;}
+    .console pre{color:#111;}
+    body{font-size:12px;}
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="hero-inner">
+    <div class="hero-text">
+      <span class="eyebrow">Install Guide · macOS</span>
+      <h1 class="title">HiDock&nbsp;Direct<span class="dim">.</span></h1>
+      <p class="lede">Pull recordings straight off your HiDock over USB and turn them into clean, speaker-labeled transcripts. This guide takes you from a fresh Mac to a working setup, one step at a time.</p>
+      <div class="meta">
+        <span class="chip"><b>~45 min</b> start to finish</span>
+        <span class="chip">Platform: <b>macOS</b></span>
+        <span class="chip"><b>Claude Code</b> + <b>AssemblyAI</b></span>
+        <span class="chip"><b>11</b> steps</span>
+      </div>
+    </div>
+    <div class="signature" aria-hidden="true">
+      <!-- waveform becomes text: what the tool does -->
+      <svg viewBox="0 0 230 96" xmlns="http://www.w3.org/2000/svg" role="img">
+        <g stroke="#0e7c6b" stroke-width="3.4" stroke-linecap="round">
+          <line x1="6"  y1="56" x2="6"  y2="40" opacity=".35"/>
+          <line x1="16" y1="62" x2="16" y2="34"/>
+          <line x1="26" y1="70" x2="26" y2="26"/>
+          <line x1="36" y1="58" x2="36" y2="38"/>
+          <line x1="46" y1="74" x2="46" y2="22"/>
+          <line x1="56" y1="66" x2="56" y2="30"/>
+          <line x1="66" y1="52" x2="66" y2="44"/>
+          <line x1="76" y1="68" x2="76" y2="28" opacity=".55"/>
+          <line x1="86" y1="60" x2="86" y2="36" opacity=".35"/>
+        </g>
+        <path d="M104 48 L132 48 M124 41 L132 48 L124 55" fill="none" stroke="#16181d" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+        <g stroke="#16181d" stroke-width="3.4" stroke-linecap="round">
+          <line x1="150" y1="32" x2="224" y2="32"/>
+          <line x1="150" y1="44" x2="214" y2="44"/>
+          <line x1="150" y1="56" x2="224" y2="56"/>
+          <line x1="150" y1="68" x2="198" y2="68" stroke="#0e7c6b"/>
+        </g>
+      </svg>
+    </div>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- ===== Sidebar ===== -->
+  <nav class="toc-wrap" aria-label="Contents">
+    <div class="toc">
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#before"><span class="tnum">·</span> Before you start</a></li>
+        <li class="gap"></li>
+        <li><a href="#step-1"><span class="tnum">01</span> Create a GitHub account</a></li>
+        <li><a href="#step-2"><span class="tnum">02</span> Get repository access</a></li>
+        <li><a href="#step-3"><span class="tnum">03</span> Install Homebrew, Git &amp; Python</a></li>
+        <li><a href="#step-4"><span class="tnum">04</span> Install Claude Code</a></li>
+        <li><a href="#step-5"><span class="tnum">05</span> Create an AssemblyAI account</a></li>
+        <li><a href="#step-6"><span class="tnum">06</span> Set up GitHub SSH</a></li>
+        <li><a href="#step-7"><span class="tnum">07</span> Turn on permissions</a></li>
+        <li><a href="#step-8"><span class="tnum">08</span> Add your SSH key</a></li>
+        <li><a href="#step-9"><span class="tnum">09</span> Install the app</a></li>
+        <li><a href="#step-10"><span class="tnum">10</span> Clear running instances</a></li>
+        <li><a href="#step-11"><span class="tnum">11</span> Run and verify</a></li>
+        <li class="gap"></li>
+        <li><a href="#transcripts"><span class="tnum">·</span> Your transcripts</a></li>
+        <li><a href="#naming"><span class="tnum">·</span> Naming speakers</a></li>
+        <li><a href="#daily"><span class="tnum">·</span> Daily workflow</a></li>
+      </ol>
+    </div>
+  </nav>
+
+  <!-- ===== Main ===== -->
+  <main>
+
+    <!-- Before you start -->
+    <section id="before" class="block">
+      <div class="section-head">
+        <span class="kicker">Read this first</span>
+        <h2 class="sec">Before you start</h2>
+      </div>
+      <p class="intro-copy">HiDock Direct is made of four pieces working together. Your HiDock holds the recordings, the app pulls them off and hands them to AssemblyAI, AssemblyAI returns the transcript, and everything lands in an archive folder on your Mac. Claude Code does the install and setup for you.</p>
+
+      <div class="flow" aria-label="How it fits together">
+        <div class="node"><div class="nl">Device</div><div class="nt">HiDock</div><div class="nd">Records your calls over USB.</div></div>
+        <div class="arrow">→</div>
+        <div class="node"><div class="nl">App</div><div class="nt">HiDock Direct</div><div class="nd">Pulls recordings off the device.</div></div>
+        <div class="arrow">→</div>
+        <div class="node"><div class="nl">Service</div><div class="nt">AssemblyAI</div><div class="nd">Transcribes and labels speakers.</div></div>
+        <div class="arrow">→</div>
+        <div class="node"><div class="nl">Output</div><div class="nt">Archive</div><div class="nd">Transcripts on your Mac.</div></div>
+      </div>
+
+      <h3 style="font-size:1.05rem;margin:34px 0 10px;font-weight:700;">What you need</h3>
+      <div class="checklist">
+        <ul>
+          <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A Mac you can install software on.</span> <span class="cd">You will need your computer password once, during Homebrew install.</span></span></li>
+          <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">Your HiDock and its USB cable.</span> <span class="cd">Connected to the Mac when you run the app.</span></span></li>
+          <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A personal email address.</span> <span class="cd">For GitHub, so the account stays yours regardless of employer.</span></span></li>
+          <li><span class="check"><svg viewBox="0 0 16 16" fill="none"><path d="M3 8.5l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span><span class="ct">A paid Claude plan.</span> <span class="cd">Claude Code needs Claude Pro (about 20 dollars a month).</span></span></li>
+        </ul>
+      </div>
+
+      <div class="callout warn">
+        <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3L12 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.6" r="1.1" fill="currentColor"/></svg>
+        <div>
+          <p class="ctitle">One connection to the device at a time</p>
+          <p class="cbody">The <b>HiNotes.ai web app</b> (the factory software for the device) and HiDock Direct both talk to the device over the <b>same USB connection</b>, and only one can hold it at a time. Before you run HiDock Direct, close the HiNotes.ai browser tab, or log out, so it releases the device. If HiNotes.ai still holds the connection, HiDock Direct cannot read the device.</p>
+        </div>
+      </div>
+    </section>
+
+    <hr class="rule">
+
+    <!-- The steps -->
+    <section class="block" aria-label="Installation steps">
+      <div class="section-head">
+        <span class="kicker">Walkthrough</span>
+        <h2 class="sec">Install, step by step</h2>
+      </div>
+
+      <div class="steps">
+
+        <section id="step-1" class="step">
+          <div class="num">01</div>
+          <h3>Create a GitHub account</h3>
+          <p class="lead">GitHub hosts the HiDock Direct code. You need a free account to get access.</p>
+          <ul class="plain">
+            <li>Go to <b>github.com</b> and start the sign-up.</li>
+            <li>Sign in with Google, or use your personal email. <b>Do not use your work email.</b></li>
+            <li>Pick a username and write it down. You can change it later if you want.</li>
+          </ul>
+          <div class="callout tip">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M9 18h6M10 21h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.3 1 2.1h5c0-.8.4-1.6 1-2.1A6 6 0 0012 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
+            <div><p class="ctitle">Skip the Copilot upsell</p><p class="cbody">GitHub will offer Copilot during sign-up. You do not need it for this. Decline it.</p></div>
+          </div>
+        </section>
+
+        <section id="step-2" class="step">
+          <div class="num">02</div>
+          <h3>Get access to the repository</h3>
+          <p class="lead">HiDock Direct lives in a private repository. The owner adds your GitHub username as a collaborator, then you accept the invite.</p>
+          <ul class="plain">
+            <li>Send the repository owner your exact GitHub username.</li>
+            <li>Once they add you, open your GitHub <b>inbox</b> (the icon at the top right, look for the blue dot next to your profile).</li>
+            <li>Open the invitation and click <b>Accept invitation</b>.</li>
+          </ul>
+        </section>
+
+        <section id="step-3" class="step">
+          <div class="num">03</div>
+          <h3>Install Homebrew, Git, and Python</h3>
+          <p class="lead">Homebrew is a package manager for macOS. You will use it to install Git and Python. Claude Code needs Git to work with local repositories, and HiDock Direct needs Python 3.11 or newer, so set both up before you install Claude Code.</p>
+
+          <p><b>Open Terminal.</b> Press <kbd>⌘</kbd> <kbd>Space</kbd>, type <code class="inline">Terminal</code>, and press Return.</p>
+
+          <p><b>Install Homebrew.</b> Paste this into Terminal and press Return, then enter your Mac password when asked. This is the official one-line installer from brew.sh:</p>
+          <div class="console" data-where="terminal">
+            <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"</code></pre>
+          </div>
+          <p class="console-note">The script it fetches is always the current one, so this command does not go stale.</p>
+
+          <div class="callout note">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
+            <div><p class="ctitle">The password looks like nothing is happening</p><p class="cbody">When you type your Mac password, the characters stay hidden and the cursor does not move. That is normal. Type it and press Return. Then wait for the prompt to come back before continuing.</p></div>
+          </div>
+
+          <p><b>Add Homebrew to your PATH.</b> When the install finishes, Homebrew prints a short <b>Next steps</b> block with two or three commands. Run each of those lines in Terminal, one at a time. They look like this, with your own username in the path:</p>
+          <div class="console" data-where="terminal">
+            <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>echo >> /Users/yourname/.zprofile
+echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> /Users/yourname/.zprofile
+eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
+          </div>
+          <p class="console-note">Use the exact lines Homebrew printed for you. The path and username are specific to your Mac.</p>
+
+          <p><b>Confirm it worked.</b> Open a fresh Terminal window (<kbd>⌘</kbd> <kbd>N</kbd>) and run:</p>
+          <div class="console" data-where="terminal">
+            <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>brew --version</code></pre>
+          </div>
+
+          <p><b>Install Git.</b> Run this, then type <code class="inline">y</code> to proceed:</p>
+          <div class="console" data-where="terminal">
+            <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>brew install git</code></pre>
+          </div>
+
+          <p><b>Install Python.</b> HiDock Direct needs Python 3.11 or newer. Install a current version with Homebrew:</p>
+          <div class="console" data-where="terminal">
+            <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>brew install python@3.12</code></pre>
+          </div>
+        </section>
+
+        <section id="step-4" class="step">
+          <div class="num">04</div>
+          <h3>Install Claude Code</h3>
+          <p class="lead">Claude Code is the assistant that runs the rest of this install for you. It reads the repository's instructions, installs what it needs, and configures your machine.</p>
+          <ul class="plain">
+            <li>Go to Anthropic's Claude Code page (<b>claude.com/claude-code</b>) and click <b>Get started</b>, then <b>Download for Mac</b>.</li>
+            <li>Open the downloaded <code class="inline">.dmg</code> file, then drag <b>Claude</b> into your <b>Applications</b> folder.</li>
+            <li>Open Claude. When macOS warns that it was downloaded from the internet, click <b>Open</b>.</li>
+            <li>Sign in. Pick any role on the setup screen to get past it, then open the <b>Code</b> section.</li>
+          </ul>
+          <div class="callout note">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
+            <div><p class="ctitle">Claude Code needs a paid plan</p><p class="cbody">It will not run on the free tier. Claude Pro is about <b>20 dollars a month</b>, or roughly 17 a month if you pay annually.</p></div>
+          </div>
+          <div class="callout tip">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M9 18h6M10 21h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.3 1 2.1h5c0-.8.4-1.6 1-2.1A6 6 0 0012 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
+            <div><p class="ctitle">Switch the model to Haiku</p><p class="cbody">In the bottom right of the Code view, click the model name (it says <b>Sonnet</b>) and choose <b>Haiku</b>. Haiku uses far fewer credits, which matters on the 20 dollar plan. If the install hits a snag it cannot get past, switch back to <b>Sonnet</b> for that part, then return to Haiku for everyday use.</p></div>
+          </div>
+        </section>
+
+        <section id="step-5" class="step">
+          <div class="num">05</div>
+          <h3>Create an AssemblyAI account</h3>
+          <p class="lead">AssemblyAI does the transcription. New accounts come with free credits, which is plenty to get everything working before you ever need to add more.</p>
+          <ul class="plain">
+            <li>Go to <b>assemblyai.com</b> and click <b>Get started</b>, then sign up.</li>
+            <li>On the dashboard, find your <b>API key</b> at the top.</li>
+          </ul>
+          <div class="callout warn">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3L12 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.6" r="1.1" fill="currentColor"/></svg>
+            <div><p class="ctitle">Leave this tab open</p><p class="cbody">You will copy this API key into Claude Code in Step 9. Do not click around or regenerate it.</p></div>
+          </div>
+        </section>
+
+        <section id="step-6" class="step">
+          <div class="num">06</div>
+          <h3>Set up GitHub SSH access</h3>
+          <p class="lead">SSH is how your Mac proves to GitHub that it is you, without typing a password every time. Claude Code sets this up for you.</p>
+          <p>In the Claude Code message box, paste this and press Return:</p>
+          <div class="console" data-where="claude">
+            <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>I just set up a new GitHub account. Please set up my local computer for GitHub SSH access for the CLI.</code></pre>
+          </div>
+          <ul class="plain">
+            <li>When Claude asks for a workspace folder, create a <b>new folder named <code class="inline">claude</code></b> and trust it.</li>
+            <li>Approve actions as they come up. Choosing <b>Allow once</b> is fine for now.</li>
+          </ul>
+          <div class="callout note">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
+            <div><p class="ctitle">Git is already in place</p><p class="cbody">Because you installed Git in Step 3, Claude Code can work with your local repository without stopping to ask for it.</p></div>
+          </div>
+        </section>
+
+        <section id="step-7" class="step">
+          <div class="num">07</div>
+          <h3>Turn on Claude Code's permissions</h3>
+          <p class="lead">For Claude Code to do the rest of the setup on its own, it needs permission to act on your computer. Quit and reopen Claude, then turn these on so the grants take effect.</p>
+          <p>Open Claude's settings (click your name at the bottom left, then <b>Settings</b>). The important switches:</p>
+          <ul class="plain">
+            <li>Under <b>Desktop app</b> &rsaquo; <b>General</b>: turn on <b>Allow browser actions</b> and <b>Enable computer use</b>. Grant <b>Accessibility</b> and <b>Screen Recording</b> when prompted. Each opens System Settings, where you switch Claude on.</li>
+            <li>Under <b>Capabilities</b>: turn on the options you want, including <b>Generate memory from chat history</b>, <b>Search and reference chats</b>, <b>Load tools when needed</b>, and <b>Switch models</b>.</li>
+            <li>Under <b>Claude Code</b>: turn on <b>Allow bypass permissions mode</b>.</li>
+          </ul>
+          <p><b>Restart Claude again</b> so Screen Recording takes effect.</p>
+          <div class="callout tip">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M9 18h6M10 21h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.3 1 2.1h5c0-.8.4-1.6 1-2.1A6 6 0 0012 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
+            <div><p class="ctitle">Stop approving every action by hand</p><p class="cbody">In the message bar, set the mode to <b>Accept edits</b>, then <b>Bypass permissions</b>. Now Claude can finish the install without stopping to ask each time. The exact menu names can shift between versions, so look for the closest match.</p></div>
+          </div>
+        </section>
+
+        <section id="step-8" class="step">
+          <div class="num">08</div>
+          <h3>Add your SSH key to GitHub</h3>
+          <p class="lead">Now connect the key Claude generated to your GitHub account. Reopen your SSH conversation in Claude (type <code class="inline">continue</code> if it paused) and find the key it created.</p>
+          <ul class="plain">
+            <li>In Claude Code, find the public key (the line that starts with <code class="inline">ssh-</code>) and click its <b>copy</b> button.</li>
+            <li>In GitHub, go to <b>Settings</b> &rsaquo; <b>SSH and GPG keys</b> &rsaquo; <b>New SSH key</b>.</li>
+            <li>Give it a name (like <code class="inline">My Mac</code>), paste the key, and click <b>Add SSH key</b>.</li>
+          </ul>
+          <p>Back in Claude Code, test the connection:</p>
+          <div class="console" data-where="claude">
+            <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>SSH key has been added. Please test it.</code></pre>
+          </div>
+          <p>Once it confirms success, your Mac can talk to GitHub.</p>
+        </section>
+
+        <section id="step-9" class="step">
+          <div class="num">09</div>
+          <h3>Install the HiDock Direct app</h3>
+          <p class="lead">Now Claude installs the app for you, following the instructions in the repository and placing it in a permanent folder in your home directory.</p>
+          <ul class="plain">
+            <li>Open the HiDock Direct repository on GitHub and copy its <b>URL</b> from the address bar.</li>
+            <li>Paste this prompt into Claude Code, with the repository URL at the end:</li>
+          </ul>
+          <div class="console" data-where="claude">
+            <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>Install the app and follow the instructions in the README at this link: [paste the repository URL]. Install it into a folder named hidock-direct in my home directory (~/hidock-direct), not a temporary folder. Then add an alias to my shell profile so I can launch it by typing hidock in any Terminal.</code></pre>
+          </div>
+          <p class="console-note">The <code class="inline">~</code> in <code class="inline">~/hidock-direct</code> is the tilde (Shift plus the key just left of <kbd>1</kbd>). It is shorthand for your home folder.</p>
+          <ul class="plain">
+            <li>When Claude asks for your <b>AssemblyAI API key</b>, switch to the AssemblyAI tab, copy the key, and paste it in.</li>
+            <li>Claude also sets up a short <code class="inline">hidock</code> command, so you can start the app by typing one word.</li>
+            <li>Watch progress by clicking the <b>running task</b> indicator. When it finishes, Claude shows you how to run the app.</li>
+          </ul>
+          <div class="callout note">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
+            <div><p class="ctitle">What Claude sets up here</p><p class="cbody"><b>libusb</b> (for talking to the device over USB), a Python virtual environment (using the Python you installed in Step 3), and your AssemblyAI key, all wired together so the app can run.</p></div>
+          </div>
+        </section>
+
+        <section id="step-10" class="step">
+          <div class="num">10</div>
+          <h3>Clear any running instances</h3>
+          <p class="lead">Only one copy of HiDock Direct should run at a time. If one is already running, stop it first.</p>
+          <ul class="plain">
+            <li>Open a Terminal and type <code class="inline">hidock</code>. If it says another instance is running, press <kbd>⌘</kbd> <kbd>Q</kbd> to quit that window.</li>
+            <li>Then ask Claude to clean up anything left over:</li>
+          </ul>
+          <div class="console" data-where="claude">
+            <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>Kill all instances of HiDock running on my computer.</code></pre>
+          </div>
+        </section>
+
+        <section id="step-11" class="step">
+          <div class="num">11</div>
+          <h3>Run HiDock Direct and verify</h3>
+          <p class="lead">Start the app and let it work. Make sure your HiDock is connected and the HiNotes.ai web app is closed (see the warning at the top).</p>
+          <p>Open a Terminal and run:</p>
+          <div class="console" data-where="terminal">
+            <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+            <pre><code>hidock</code></pre>
+          </div>
+          <p>The app connects to your HiDock, pulls the recordings off it, and sends each one to AssemblyAI to transcribe. It keeps running and watches for new recordings, so leave the window open while you work.</p>
+          <p><b>Find your transcripts:</b></p>
+          <ul class="plain">
+            <li>HiDock Direct saves transcripts to their own archive folder in your <b>home directory</b>, separate from the app folder. Open Finder and go to your home folder (<kbd>⌘</kbd> <kbd>Shift</kbd> <kbd>H</kbd>), then open the <b>hidock-archive</b> folder.</li>
+            <li>Drag the archive folder into your Finder <b>favorites</b> so it is always one click away.</li>
+            <li>Switch the view to <b>List</b> and click the <b>Name</b> column header to sort; click it again so the newest dates sit on top (filenames start with the date). Transcripts are grouped into folders by month.</li>
+          </ul>
+        </section>
+
+      </div>
+    </section>
+
+    <hr class="rule">
+
+    <!-- Transcripts reference -->
+    <section id="transcripts" class="block">
+      <div class="section-head">
+        <span class="kicker">Reference</span>
+        <h2 class="sec">Understanding your transcripts</h2>
+      </div>
+      <p class="intro-copy">Each recording produces three files in the archive. Only the first one matters for daily use.</p>
+      <table class="ftable">
+        <thead><tr><th>File</th><th>What it is</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="ext">.md</td>
+            <td><div class="fd"><b>The transcript.</b> Speaker-labeled text (Speaker 1, Speaker 2, and so on). Open it with <b>TextEdit</b> to read it, or paste it into any AI tool. This is the file you will actually use.</div></td>
+          </tr>
+          <tr>
+            <td class="ext">.mp3</td>
+            <td><div class="fd"><b>The original audio</b> recording, in case you want to listen back.</div></td>
+          </tr>
+          <tr>
+            <td class="ext">.aai.json</td>
+            <td><div class="fd"><b>The raw transcript data</b> AssemblyAI returned. Its presence also tells HiDock Direct the recording is already done, so it does not transcribe it twice. You can ignore it.</div></td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- Naming speakers -->
+    <section id="naming" class="block">
+      <div class="section-head">
+        <span class="kicker">Tip</span>
+        <h2 class="sec">Putting names to speakers</h2>
+      </div>
+      <p class="intro-copy">The transcript labels speakers as Speaker 1, Speaker 2, and so on, not by name. If you want real names, paste the transcript into an AI tool along with the list of people who were on the call (the attendee list from the meeting invite works well) and ask it to match each speaker to a name based on context. It picks up on moments where someone is addressed by name and assigns the rest from there.</p>
+      <div class="callout tip">
+        <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M9 18h6M10 21h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M12 3a6 6 0 00-3.5 10.9c.6.5 1 1.3 1 2.1h5c0-.8.4-1.6 1-2.1A6 6 0 0012 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/></svg>
+        <div><p class="ctitle">You usually do not need names</p><p class="cbody">For pulling out topics, requirements, and what was agreed, what matters is what was said, not who said it. Naming speakers is optional.</p></div>
+      </div>
+    </section>
+
+    <!-- Daily workflow -->
+    <section id="daily" class="block">
+      <div class="section-head">
+        <span class="kicker">Day to day</span>
+        <h2 class="sec">Your daily workflow</h2>
+      </div>
+      <p class="intro-copy">Each morning, connect your HiDock, make sure the HiNotes.ai web app is closed, open a Terminal, and type <code class="inline">hidock</code>. Leave it running. As you take calls through the day, HiDock Direct notices each new recording, pulls it off the device, and transcribes it automatically. Your transcripts collect in the archive folder, ready whenever you need them.</p>
+    </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="foot-inner">
+    <span><span class="fmark">HiDock Direct</span> · internal install guide</span>
+    <span>Built from a recorded walkthrough · macOS</span>
+  </div>
+</footer>
+
+<script>
+  // Copy buttons
+  document.querySelectorAll('.copy').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var block = btn.closest('.console');
+      var pre = block ? block.querySelector('pre') : null;
+      var text = pre ? pre.innerText : '';
+      function done(label, ok){
+        var prev = 'Copy';
+        btn.textContent = label;
+        if(ok){ btn.classList.add('copied'); }
+        setTimeout(function(){ btn.textContent = prev; btn.classList.remove('copied'); }, 1600);
+      }
+      if(navigator.clipboard && navigator.clipboard.writeText){
+        navigator.clipboard.writeText(text).then(function(){ done('Copied', true); })
+          .catch(function(){ done('Press \u2318C', false); });
+      } else {
+        done('Press \u2318C', false);
+      }
+    });
+  });
+
+  // Scroll-spy for the sidebar
+  (function(){
+    var links = Array.prototype.slice.call(document.querySelectorAll('.toc a'));
+    if(!links.length || !('IntersectionObserver' in window)) return;
+    var map = {};
+    links.forEach(function(l){
+      var href = l.getAttribute('href') || '';
+      if(href.charAt(0) === '#'){ map[href.slice(1)] = l; }
+    });
+    var current = null;
+    var obs = new IntersectionObserver(function(entries){
+      entries.forEach(function(e){
+        if(e.isIntersecting){
+          var l = map[e.target.id];
+          if(l && l !== current){
+            links.forEach(function(x){ x.classList.remove('active'); });
+            l.classList.add('active');
+            current = l;
+          }
+        }
+      });
+    }, { rootMargin: '-15% 0px -75% 0px', threshold: 0 });
+    document.querySelectorAll('section[id]').forEach(function(s){ obs.observe(s); });
+  })();
+</script>
+</body>
+</html>
