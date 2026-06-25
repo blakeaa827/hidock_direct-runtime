@@ -4,9 +4,6 @@ Public API:
     Config, State, FileLock, AlreadyLocked, TranscriptionError,
     AAIClient, DriveSync, process_file, PipelineResult,
     render_markdown, run_loop, run_iteration, LoopSummary.
-
-See PRD at:
-    forge/projects/diarize_audio/planning/2026-04-16-diarize-audio-prd.md
 """
 
 from .assemblyai_client import AAIClient, TranscriptionError

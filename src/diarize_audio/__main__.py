@@ -19,16 +19,11 @@ from .worker import run_loop
 
 
 def _load_env() -> None:
-    """Load `.env` from an explicit override, the forge secrets dir
-    (discovered relative to this runtime repo), then the cwd."""
+    """Load `.env` from an explicit override ($DIARIZE_AUDIO_ENV_FILE) or the cwd."""
     candidates: list[Path] = []
     explicit = os.environ.get("DIARIZE_AUDIO_ENV_FILE")
     if explicit:
         candidates.append(Path(explicit).expanduser())
-    candidates.append(
-        Path(__file__).resolve().parents[2].parent
-        / "forge/projects/diarize_audio/secrets/.env"
-    )
     candidates.append(Path.cwd() / ".env")
     for p in candidates:
         if p.exists():

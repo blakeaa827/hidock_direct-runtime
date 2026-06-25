@@ -71,29 +71,23 @@ def test_load_config_invalid_log_level(monkeypatch):
         load_config()
 
 
-# --- FR-C2: env-file discovery prefers the clone-local .env -----------------
+# --- FR-C2: env-file discovery (explicit override, then clone-local .env) ----
 
-def test_discover_prefers_clone_local_over_forge(tmp_path, monkeypatch):
+def test_discover_finds_clone_local(tmp_path, monkeypatch):
     monkeypatch.delenv("HIDOCK_DIRECT_ENV_FILE", raising=False)
     clone = tmp_path / "runtime"
     clone.mkdir()
     (clone / ".env").write_text("HIDOCK_ARCHIVE_DIR=/x\n")
-    forge = tmp_path / "forge.env"
-    forge.write_text("HIDOCK_ARCHIVE_DIR=/y\n")
     monkeypatch.setattr(hconfig, "RUNTIME_ROOT", clone)
-    monkeypatch.setattr(hconfig, "FORGE_SECRETS_CANDIDATES", (forge,))
     assert hconfig._discover_env_file() == clone / ".env"
 
 
-def test_discover_falls_back_to_forge_when_no_clone_local(tmp_path, monkeypatch):
+def test_discover_returns_none_when_no_env(tmp_path, monkeypatch):
     monkeypatch.delenv("HIDOCK_DIRECT_ENV_FILE", raising=False)
     clone = tmp_path / "runtime"
-    clone.mkdir()  # no .env here
-    forge = tmp_path / "forge.env"
-    forge.write_text("HIDOCK_ARCHIVE_DIR=/y\n")
+    clone.mkdir()  # no .env present
     monkeypatch.setattr(hconfig, "RUNTIME_ROOT", clone)
-    monkeypatch.setattr(hconfig, "FORGE_SECRETS_CANDIDATES", (forge,))
-    assert hconfig._discover_env_file() == forge
+    assert hconfig._discover_env_file() is None
 
 
 def test_discover_explicit_env_file_overrides_both(tmp_path, monkeypatch):

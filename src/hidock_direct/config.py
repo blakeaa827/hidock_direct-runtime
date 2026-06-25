@@ -7,8 +7,7 @@ load the discovered `.env` into `os.environ`, so the vendored `diarize_audio`'s
 
 Env-file discovery order (first existing file wins):
   1. `$HIDOCK_DIRECT_ENV_FILE` if set.
-  2. `./.env` in the runtime root (clone-local — primary; copy from .env.example).
-  3. `forge/projects/hidock_direct/secrets/.env` (operator-only forge fallback).
+  2. `./.env` in the runtime root (clone-local; copy from .env.example).
 
 Per-variable precedence within `load_config`: real process env > `.env` file >
 default. Only the four hidock variables below are typed here; the AssemblyAI key
@@ -26,9 +25,6 @@ from dotenv import dotenv_values
 
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
-FORGE_SECRETS_CANDIDATES = (
-    RUNTIME_ROOT.parent / "forge" / "projects" / "hidock_direct" / "secrets" / ".env",
-)
 
 _TRUE_SET = {"1", "true", "yes", "on"}
 
@@ -68,16 +64,9 @@ def _discover_env_file() -> Optional[Path]:
     if explicit:
         p = Path(explicit).expanduser()
         return p if p.is_file() else None
-    # Clone-local `.env` is the primary, documented path (copy from .env.example).
+    # Clone-local `.env` (copy from .env.example).
     local = RUNTIME_ROOT / ".env"
-    if local.is_file():
-        return local
-    # Forge-sibling secrets file — operator-only fallback for the maintainer's
-    # multi-repo layout; absent in a standalone clone.
-    for candidate in FORGE_SECRETS_CANDIDATES:
-        if candidate.is_file():
-            return candidate
-    return None
+    return local if local.is_file() else None
 
 
 def load_env_file_into_environ() -> Optional[Path]:

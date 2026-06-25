@@ -50,7 +50,7 @@ All settings live in a single clone-local `.env` (copy from `.env.example`). hid
 | `POLL_INTERVAL_SECONDS` | `10` | Device re-scan cadence while connected |
 | `LOG_LEVEL` | `info` | One of `debug`, `info`, `warning`, `error` |
 
-Discovery order for the `.env`: `$HIDOCK_DIRECT_ENV_FILE` → `./.env` (clone-local, primary) → a forge-sibling secrets file (maintainer-only fallback).
+Discovery order for the `.env`: `$HIDOCK_DIRECT_ENV_FILE` → `./.env` (clone-local).
 
 ### Google Drive (optional)
 
