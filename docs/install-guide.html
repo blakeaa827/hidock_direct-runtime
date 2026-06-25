@@ -320,7 +320,7 @@
         <span class="chip"><b>~45 min</b> start to finish</span>
         <span class="chip">Platform: <b>macOS</b></span>
         <span class="chip"><b>Claude Code</b> + <b>AssemblyAI</b></span>
-        <span class="chip"><b>11</b> steps</span>
+        <span class="chip"><b>10</b> steps</span>
       </div>
     </div>
     <div class="signature" aria-hidden="true">
@@ -367,8 +367,7 @@
         <li><a href="#step-7"><span class="tnum">07</span> Add your SSH key</a></li>
         <li><a href="#step-8"><span class="tnum">08</span> Create an AssemblyAI account</a></li>
         <li><a href="#step-9"><span class="tnum">09</span> Install the app</a></li>
-        <li><a href="#step-10"><span class="tnum">10</span> Clear running instances</a></li>
-        <li><a href="#step-11"><span class="tnum">11</span> Run and verify</a></li>
+        <li><a href="#step-10"><span class="tnum">10</span> Run HiDock Direct</a></li>
         <li class="gap"></li>
         <li><a href="#transcripts"><span class="tnum">·</span> Your transcripts</a></li>
         <li><a href="#naming"><span class="tnum">·</span> Naming speakers</a></li>
@@ -614,23 +613,14 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
 
         <section id="step-10" class="step">
           <div class="num">10</div>
-          <h3>Clear any running instances</h3>
-          <p class="lead">Only one copy of HiDock Direct should run at a time. If one is already running, stop it first.</p>
-          <ul class="plain">
-            <li>Open a Terminal and type <code class="inline">hidock</code>. If it says another instance is running, press <kbd>⌘</kbd> <kbd>Q</kbd> to quit that window.</li>
-            <li>Then ask Claude to clean up anything left over:</li>
-          </ul>
+          <h3>Run HiDock Direct</h3>
+          <p class="lead">Only one copy can talk to the device at a time, so start from a clean slate: have Claude stop anything already running, then launch the app yourself in a fresh Terminal.</p>
+          <p>First, in Claude Code, clear any running instances:</p>
           <div class="console" data-where="claude">
             <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
             <pre><code>Kill all instances of HiDock running on my computer.</code></pre>
           </div>
-        </section>
-
-        <section id="step-11" class="step">
-          <div class="num">11</div>
-          <h3>Run HiDock Direct and verify</h3>
-          <p class="lead">Start the app and let it work. Make sure your HiDock is connected and the HiNotes.ai web app is closed (see the warning at the top).</p>
-          <p>Open a Terminal and run:</p>
+          <p>Then make sure your HiDock is connected and the HiNotes.ai web app is closed (see the warning at the top). Open a <b>new</b> Terminal and run:</p>
           <div class="console" data-where="terminal">
             <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
             <pre><code>hidock</code></pre>
