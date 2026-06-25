@@ -1,6 +1,6 @@
 # hidock-direct
 
-A foreground macOS TUI that pulls audio recordings off the HiDock device over USB into a local archive **and transcribes them** (speaker-diarized) via AssemblyAI. Transcription is provided by `diarize_audio`, which is **vendored into this repo** (`src/diarize_audio/`) — so a single clone is fully self-contained.
+A foreground macOS TUI that pulls audio recordings off your HiDock device over USB into a local archive **and transcribes them** (speaker-diarized) via AssemblyAI.
 
 New here? The **[click-by-click install guide](https://blakeaa827.github.io/hidock_direct-runtime/install-guide.html)** (hosted on GitHub Pages) walks non-technical teammates from a fresh Mac to a working setup — Claude Code → AssemblyAI → run. Prefer the terminal? **[docs/SETUP.md](docs/SETUP.md)** is the concise version. (The guide's source is **[docs/install-guide.html](docs/install-guide.html)**.)
 
@@ -18,7 +18,7 @@ New here? The **[click-by-click install guide](https://blakeaa827.github.io/hido
 cp .env.example .env          # then edit .env and paste your ASSEMBLYAI_API_KEY
 ```
 
-`bootstrap.sh` picks a Python ≥3.11, installs `libusb` (if Homebrew is present), creates a machine-local `.venv`, and installs the app in editable mode. No Google Drive or private-repo access is required.
+`bootstrap.sh` picks a Python ≥3.11, installs `libusb` (if Homebrew is present), creates a `.venv`, and installs the app.
 
 ## Run
 
@@ -38,30 +38,19 @@ Then just type `hidock` in any Terminal.
 
 ## Configuration
 
-All settings live in a single clone-local `.env` (copy from `.env.example`). hidock loads it into the environment at startup so the vendored `diarize_audio` sees the same values.
+All settings live in a single `.env` file — copy it from `.env.example` and edit.
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ASSEMBLYAI_API_KEY` | *(required)* | AssemblyAI key for transcription |
 | `HIDOCK_ARCHIVE_DIR` | `~/hidock-archive` | Where audio + transcripts are written |
 | `TRANSCRIBE_ON_OFFLOAD` | `true` | Transcribe each recording after offload |
-| `DRIVE_ENABLED` | `false` | Upload transcripts to Google Drive (see below) |
+| `DRIVE_ENABLED` | `false` | Off by default; Google Drive upload needs extra setup |
 | `DELETE_FROM_DEVICE_AFTER_OFFLOAD` | `false` | Delete from device after successful archive |
 | `POLL_INTERVAL_SECONDS` | `10` | Device re-scan cadence while connected |
 | `LOG_LEVEL` | `info` | One of `debug`, `info`, `warning`, `error` |
 
-Discovery order for the `.env`: `$HIDOCK_DIRECT_ENV_FILE` → `./.env` (clone-local).
-
-### Google Drive (optional)
-
-Drive upload is **off by default** and needs `blake-commons`, a private maintainer-only package:
-
-```bash
-./.venv/bin/pip install ".[drive]"    # blake-commons is private; install it separately if you have access
-# then set DRIVE_ENABLED=true in .env
-```
-
-Without it, transcripts are written locally only — no GCP credentials needed.
+Discovery order: `$HIDOCK_DIRECT_ENV_FILE`, then `./.env`.
 
 ## Tests
 
@@ -85,11 +74,11 @@ Unit tests mock the device at the Jensen adapter boundary — no hardware requir
   - `locks.py` — flock helper
   - `device.py` — adapter over the vendored Jensen layer
   - `jensen/` — **vendored** from [sgeraldes/hidock-next](https://github.com/sgeraldes/hidock-next); pin in `jensen/VENDORED_COMMIT`. Re-vendor: `scripts/refresh_jensen.sh`.
-- `src/diarize_audio/` — **vendored** transcription package; pin in `diarize_audio/VENDORED_COMMIT`, owned by the canonical `diarize_audio-runtime` repo. Re-vendor: `scripts/refresh_diarize.sh <commit>`.
+- `src/diarize_audio/` — **vendored** transcription package; pin in `diarize_audio/VENDORED_COMMIT`. Re-vendor: `scripts/refresh_diarize.sh <commit>`.
 - `tests/` — pytest suite + in-memory mock device
 - `scripts/` — `bootstrap.sh`, `refresh_jensen.sh`, `refresh_diarize.sh`, `manual_verify.sh`
 
-The event bus is load-bearing for the phase-2 menu-bar app. Business logic never lives in the TUI.
+Business logic never lives in the TUI — the event bus decouples it.
 
 ## Non-goals (MVP)
 

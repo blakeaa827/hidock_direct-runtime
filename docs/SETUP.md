@@ -44,9 +44,8 @@ ASSEMBLYAI_API_KEY=<paste your key here>
 ```
 
 That's the only required value. Optionally change `HIDOCK_ARCHIVE_DIR` (where
-recordings + transcripts are saved; defaults to `~/hidock-archive`). Leave
-`DRIVE_ENABLED=false` unless you specifically need Google Drive upload (see
-§6).
+recordings + transcripts are saved; defaults to `~/hidock-archive`). Leave the
+rest at their defaults.
 
 ## 4. Run
 
@@ -91,17 +90,3 @@ right after it downloads.
   up — the offload itself still succeeds.)
 - **"need Python >=3.11".** Install a newer Python (`brew install python@3.12`)
   and re-run bootstrap.
-
-## 6. Google Drive upload (optional, advanced)
-
-By default transcripts are saved locally only. To additionally upload them to
-Google Drive you need `blake-commons` (a private maintainer-only package) and
-Google credentials:
-
-```bash
-./.venv/bin/pip install ".[drive]"   # blake-commons is private; install it separately if you have access
-```
-
-Then set `DRIVE_ENABLED=true` in `.env`. If `DRIVE_ENABLED=true` but the extra
-isn't installed, the app fails fast with a message telling you exactly this.
-Most users should leave Drive off.
