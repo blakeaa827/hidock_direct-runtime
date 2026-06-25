@@ -1,8 +1,7 @@
 # HiDock Direct — Setup (from scratch)
 
-This walks a brand-new user from a fresh machine to offloading + transcribing
-their own HiDock recordings. One repo clone; no Google Drive, no private-repo
-access required.
+This walks a brand-new user from a fresh machine to offloading and transcribing
+their own HiDock recordings.
 
 ## 1. Prerequisites
 
