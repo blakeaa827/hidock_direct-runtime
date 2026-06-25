@@ -363,9 +363,9 @@
         <li><a href="#step-3"><span class="tnum">03</span> Install Homebrew, Git &amp; Python</a></li>
         <li><a href="#step-4"><span class="tnum">04</span> Install Claude Code</a></li>
         <li><a href="#step-5"><span class="tnum">05</span> Turn on permissions</a></li>
-        <li><a href="#step-6"><span class="tnum">06</span> Create an AssemblyAI account</a></li>
-        <li><a href="#step-7"><span class="tnum">07</span> Set up GitHub SSH</a></li>
-        <li><a href="#step-8"><span class="tnum">08</span> Add your SSH key</a></li>
+        <li><a href="#step-6"><span class="tnum">06</span> Set up GitHub SSH</a></li>
+        <li><a href="#step-7"><span class="tnum">07</span> Add your SSH key</a></li>
+        <li><a href="#step-8"><span class="tnum">08</span> Create an AssemblyAI account</a></li>
         <li><a href="#step-9"><span class="tnum">09</span> Install the app</a></li>
         <li><a href="#step-10"><span class="tnum">10</span> Clear running instances</a></li>
         <li><a href="#step-11"><span class="tnum">11</span> Run and verify</a></li>
@@ -540,20 +540,6 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
 
         <section id="step-6" class="step">
           <div class="num">06</div>
-          <h3>Create an AssemblyAI account</h3>
-          <p class="lead">AssemblyAI does the transcription. New accounts come with free credits, which is plenty to get everything working before you ever need to add more.</p>
-          <ul class="plain">
-            <li>Go to <b>assemblyai.com</b> and click <b>Get started</b>, then sign up.</li>
-            <li>On the dashboard, find your <b>API key</b> at the top.</li>
-          </ul>
-          <div class="callout warn">
-            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3L12 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.6" r="1.1" fill="currentColor"/></svg>
-            <div><p class="ctitle">Leave this tab open</p><p class="cbody">You will copy this API key into Claude Code in Step 9. Do not click around or regenerate it.</p></div>
-          </div>
-        </section>
-
-        <section id="step-7" class="step">
-          <div class="num">07</div>
           <h3>Set up GitHub SSH access</h3>
           <p class="lead">SSH is how your Mac proves to GitHub that it is you, without typing a password every time. Claude Code sets this up for you.</p>
           <p>In the Claude Code message box, paste this and press Return:</p>
@@ -571,8 +557,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </div>
         </section>
 
-        <section id="step-8" class="step">
-          <div class="num">08</div>
+        <section id="step-7" class="step">
+          <div class="num">07</div>
           <h3>Add your SSH key to GitHub</h3>
           <p class="lead">Now connect the key Claude generated to your GitHub account. Reopen your SSH conversation in Claude (type <code class="inline">continue</code> if it paused) and find the key it created.</p>
           <ul class="plain">
@@ -586,6 +572,20 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
             <pre><code>SSH key has been added. Please test it.</code></pre>
           </div>
           <p>Once it confirms success, your Mac can talk to GitHub.</p>
+        </section>
+
+        <section id="step-8" class="step">
+          <div class="num">08</div>
+          <h3>Create an AssemblyAI account</h3>
+          <p class="lead">AssemblyAI does the transcription. New accounts come with free credits, which is plenty to get everything working before you ever need to add more. Do this right before the install so the key is fresh and the tab is open when Claude asks for it.</p>
+          <ul class="plain">
+            <li>Go to <b>assemblyai.com</b> and click <b>Get started</b>, then sign up.</li>
+            <li>On the dashboard, find your <b>API key</b> at the top.</li>
+          </ul>
+          <div class="callout warn">
+            <svg class="ico" viewBox="0 0 24 24" fill="none"><path d="M12 3l9 16H3L12 3z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><path d="M12 10v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.6" r="1.1" fill="currentColor"/></svg>
+            <div><p class="ctitle">Leave this tab open</p><p class="cbody">You will paste this API key into Claude Code in the next step, during the install. Keep the tab handy and do not regenerate the key.</p></div>
+          </div>
         </section>
 
         <section id="step-9" class="step">
