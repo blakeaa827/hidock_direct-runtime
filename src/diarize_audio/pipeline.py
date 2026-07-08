@@ -59,12 +59,20 @@ def process_file(
     md_path = wav.parent / f"{wav.stem}.md"
 
     # --- AAI ---
+    # Invariant: once mark_in_flight is persisted (above), NO exception path may
+    # leave this entry `in_flight`. TranscriptionError/TimeoutError are the
+    # expected failures; the catch-all is defense in depth so an unanticipated
+    # exception (SDK/transport/anything) still transitions to a terminal `error`
+    # state rather than stranding the file. See
+    # bug_report_aai_exception_leak_strands_in_flight.md.
     try:
         transcript = aai_client.transcribe_file(wav)
     except TranscriptionError as exc:
         return _fail(state, cfg, state_key, str(exc))
     except TimeoutError as exc:
         return _fail(state, cfg, state_key, f"aai timeout: {exc}")
+    except Exception as exc:
+        return _fail(state, cfg, state_key, f"unexpected error during transcription: {exc}")
 
     # Persist raw response (atomic write, 0600)
     try:

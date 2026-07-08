@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import assemblyai as aai
+import httpx
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +70,17 @@ class AAIClient:
     def transcribe_file(self, wav_path: Path) -> dict[str, Any]:
         wav_path = Path(wav_path)
         log.info("aai_submit", extra={"file": wav_path.name})
-        transcript = self._transcriber.transcribe(str(wav_path))
+        # This wrapper's contract is to isolate callers from the SDK: convert
+        # every failure into TranscriptionError. The SDK raises its own
+        # AssemblyAIError family on upload/create 4xx (e.g. credit exhaustion)
+        # and lets httpx transport errors (DNS/TLS/connection) propagate raw —
+        # both must be converted here, or they escape process_file's error
+        # boundary and strand the file `in_flight`. See
+        # bug_report_aai_exception_leak_strands_in_flight.md.
+        try:
+            transcript = self._transcriber.transcribe(str(wav_path))
+        except (aai.types.AssemblyAIError, httpx.HTTPError, OSError) as exc:
+            raise TranscriptionError(f"AssemblyAI request failed: {exc}") from exc
         status = _status_str(transcript.status)
         if status == "error":
             raise TranscriptionError(
