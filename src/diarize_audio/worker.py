@@ -14,9 +14,12 @@ from .state import State
 
 log = logging.getLogger(__name__)
 
-# Approximate AAI list prices (USD/min) as of 2026-04. Used only for visibility,
-# not billing — update when AAI pricing changes.
-_PRICE_PER_MIN = {"best": 0.37 / 60, "nano": 0.12 / 60}
+# Approximate AAI list prices (USD/min) as of 2026-07-30, base async rates
+# excluding add-ons such as speaker diarization (+$0.02/hr). Used only for
+# visibility, not billing — update when AAI pricing changes.
+# "best" sends no model, so it is priced at AAI's current default
+# (universal-3-5-pro, $0.21/hr).
+_PRICE_PER_MIN = {"best": 0.21 / 60, "universal-2": 0.15 / 60}
 
 
 @dataclass

@@ -22,9 +22,17 @@ class TranscriptionError(RuntimeError):
 
 # Map user-facing speech_model names to the AAI `speech_models` list API
 # (the singular `speech_model` field was deprecated server-side in early 2026).
-_SPEECH_MODELS_MAP = {
-    "best": ["universal"],
-    "nano": ["nano"],
+#
+# `None` means "send no speech_models field at all" — AssemblyAI then applies
+# its own current default. That is deliberate: AssemblyAI retires model IDs
+# (`universal` and `nano` both died between 2026-04 and 2026-07) and a list we
+# hardcode here goes stale silently, since only the live API can reject it.
+# Deferring to the vendor's default makes the common path unable to rot.
+# `universal-2` stays selectable as the cheaper/faster escape hatch.
+# See bug_report_aai_retired_speech_model_ids.md (2026-07-30).
+_SPEECH_MODELS_MAP: dict[str, list[str] | None] = {
+    "best": None,
+    "universal-2": ["universal-2"],
 }
 
 
@@ -61,6 +69,8 @@ class AAIClient:
         # Switch off the deprecated `speech_model` field; use `speech_models`
         # list which the API now requires.
         self._config.raw.speech_model = None
+        # None here leaves the field out of the request body entirely (the SDK
+        # serializes with exclude_none), which is what selects AAI's default.
         self._config.raw.speech_models = _SPEECH_MODELS_MAP.get(
             speech_model, _SPEECH_MODELS_MAP["best"]
         )

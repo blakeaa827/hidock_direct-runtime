@@ -16,7 +16,16 @@ class ConfigError(ValueError):
     """Raised for malformed or missing configuration."""
 
 
-_ALLOWED_SPEECH_MODELS = {"best", "nano"}
+_ALLOWED_SPEECH_MODELS = {"best", "universal-2"}
+
+# SPEECH_MODEL values AssemblyAI has retired, mapped to their replacement. A
+# config carrying one of these used to fail per-file with an opaque API 400;
+# it now fails at startup with the replacement named.
+# See bug_report_aai_retired_speech_model_ids.md (2026-07-30).
+_RETIRED_SPEECH_MODELS = {
+    "nano": "universal-2",
+    "universal": "best",
+}
 _ALLOWED_LOG_LEVELS = {"debug", "info", "warning", "error"}
 
 
@@ -70,6 +79,11 @@ class Config:
             raise ConfigError("INBOX_DIRS must name at least one directory")
 
         speech_model = os.environ.get("SPEECH_MODEL", "best").strip().lower()
+        if speech_model in _RETIRED_SPEECH_MODELS:
+            raise ConfigError(
+                f"SPEECH_MODEL={speech_model!r} was retired by AssemblyAI; "
+                f"use {_RETIRED_SPEECH_MODELS[speech_model]!r} instead"
+            )
         if speech_model not in _ALLOWED_SPEECH_MODELS:
             raise ConfigError(
                 f"SPEECH_MODEL must be one of {sorted(_ALLOWED_SPEECH_MODELS)}, got {speech_model!r}"
