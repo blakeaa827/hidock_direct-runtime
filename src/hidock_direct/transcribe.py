@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from .offload import resolve_recorded_at
 from .events import (
     EventBus,
     TranscribeComplete,
@@ -38,7 +40,9 @@ def _check_available() -> bool:
     return _AVAILABLE
 
 
-def _run_pipeline(audio_path: Path, archive_dir: Path) -> Any:
+def _run_pipeline(
+    audio_path: Path, archive_dir: Path, recorded_at: Optional[datetime] = None
+) -> Any:
     """Build the diarize_audio session and run `process_file` against one audio.
 
     Factored out as a standalone function so tests can monkeypatch it
@@ -79,6 +83,11 @@ def _run_pipeline(audio_path: Path, archive_dir: Path) -> Any:
         cfg=cfg,
         aai_client=aai_client,
         drive_sync=drive_sync,
+        # Never let diarize_audio fall back to the file's mtime here: for an
+        # offloaded recording that is recording-end + transfer time, not the
+        # start. Resolve from the device report, or from the basename we minted
+        # from it when re-running without a device.
+        recorded_at=resolve_recorded_at(audio_path, recorded_at),
     )
 
 
@@ -88,6 +97,7 @@ def transcribe_file(
     *,
     bus: EventBus,
     device_filename: str,
+    recorded_at: Optional[datetime] = None,
 ) -> Optional[str]:
     """Run the diarize_audio pipeline on a single file.
 
@@ -95,6 +105,10 @@ def transcribe_file(
     `TranscribeComplete`, or `TranscribeFailed` — plus `TranscribeStarted`
     before any real work. Never raises; transcription failure must not
     kill the offload worker.
+
+    `recorded_at` is the device-reported recording start. Omit it when
+    re-transcribing an archived file with no device attached — the archive
+    basename carries the same value.
     """
     if not _check_available():
         bus.publish(
@@ -109,7 +123,7 @@ def transcribe_file(
     bus.publish(TranscribeStarted(device_filename=device_filename))
 
     try:
-        result = _run_pipeline(audio_path, archive_dir)
+        result = _run_pipeline(audio_path, archive_dir, recorded_at)
     except Exception as exc:
         reason = str(exc) or exc.__class__.__name__
         log.exception("transcribe_file crashed for %s", audio_path.name)

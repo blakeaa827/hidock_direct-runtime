@@ -39,7 +39,18 @@ def process_file(
     cfg: Config,
     aai_client,
     drive_sync,
+    *,
+    recorded_at: datetime | None = None,
 ) -> PipelineResult:
+    """Transcribe one audio file and write its sidecars.
+
+    `recorded_at` is when the RECORDING STARTED. Pass it whenever the caller
+    knows it — a device that reports the time, a filename that encodes it —
+    because the file's mtime does not: for audio copied off a device, mtime is
+    when the copy finished, which is recording-end plus transfer time. Callers
+    that genuinely have no better signal (the standalone inbox watcher) may
+    omit it and inherit the mtime fallback.
+    """
     wav = Path(wav)
     try:
         size = wav.stat().st_size
@@ -86,7 +97,15 @@ def process_file(
 
     # --- Render ---
     try:
-        recorded_at = datetime.fromtimestamp(wav.stat().st_mtime).astimezone()
+        if recorded_at is None:
+            # No caller-supplied recording time — the standalone inbox-watcher
+            # case, where mtime is the only signal available.
+            recorded_at = datetime.fromtimestamp(wav.stat().st_mtime)
+        if recorded_at.tzinfo is None:
+            # Devices report local wall-clock with no zone. Normalize here, at
+            # the single choke point feeding the renderer, so `isoformat()`
+            # cannot silently emit an offset-less frontmatter value.
+            recorded_at = recorded_at.astimezone()
         md_text = render_markdown(
             transcript,
             source_filename=wav.name,

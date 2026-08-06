@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import threading
 import time
@@ -48,6 +49,15 @@ MAX_DEVICE_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2 GB hard ceiling (PRD §7)
 HTA_EXTENSION = ".hda"
 WAV_EXTENSION = ".wav"
 MP3_EXTENSION = ".mp3"
+# Archive naming: `YYYY-MM-DD_HHMMSS`. Minted by `_archive_basename` from the
+# device-reported recording start, read back by `_recorded_at_from_basename`.
+ARCHIVE_BASENAME_FORMAT = "%Y-%m-%d_%H%M%S"
+# The full stem grammar this tool mints: the timestamp, optionally followed by
+# the `-1` / `-2` collision suffix from `_unique_archive_path`. Both forms must
+# parse back to the same recording time.
+ARCHIVE_STEM_PATTERN = re.compile(
+    r"(?P<timestamp>\d{4}-\d{2}-\d{2}_\d{6})(?:-\d+)?"
+)
 MP3_SYNC_WORD = b"\xff\xfb"
 # Sibling directory under the archive root for operator-offloaded whispers.
 # Lazily created on first whisper offload; absence is normal.
@@ -116,7 +126,56 @@ def _archive_basename(device_mtime: Optional[datetime], fallback_mtime: Optional
     when = device_mtime or fallback_mtime
     if when is None:
         when = datetime.now()
-    return f"{when.strftime('%Y-%m-%d_%H%M%S')}{ext}"
+    return f"{when.strftime(ARCHIVE_BASENAME_FORMAT)}{ext}"
+
+
+def _recorded_at_from_basename(archive_path: Path) -> Optional[datetime]:
+    """Read the recording time back out of an archive basename we minted.
+
+    Inverse of `_archive_basename` — deliberately co-located so the two cannot
+    drift apart. Returns None for any name this tool didn't produce (vendor
+    exports, hand-renamed files).
+
+    Handles both shapes this tool mints: the plain `YYYY-MM-DD_HHMMSS` and the
+    `-1` / `-2` collision suffix `_unique_archive_path` appends when two
+    recordings share a second-precision timestamp.
+    """
+    stem = Path(archive_path).stem
+    match = ARCHIVE_STEM_PATTERN.fullmatch(stem)
+    if match is None:
+        return None
+    try:
+        return datetime.strptime(match.group("timestamp"), ARCHIVE_BASENAME_FORMAT)
+    except ValueError:
+        return None
+
+
+def resolve_recorded_at(
+    archive_path: Path, device_mtime: Optional[datetime] = None
+) -> datetime:
+    """Return when the recording STARTED, as a timezone-aware datetime.
+
+    Precedence, best signal first:
+
+    1. `device_mtime` — the device's own report, parsed by the Jensen layer
+       from the recording's on-device filename. Available during offload.
+    2. The archive basename — what `_archive_basename` minted from (1). This is
+       the durable on-disk record, and the only signal left when re-running or
+       recovering an already-archived file with no device attached.
+    3. The file's mtime — last resort, and the value that caused the bug: for
+       an offloaded file it is recording-END plus transfer time, not the start.
+
+    Naive inputs (the device reports local wall-clock with no timezone) are
+    stamped with the local zone, because the renderer emits `isoformat()` and a
+    naive value would silently drop the UTC offset from the frontmatter.
+    """
+    archive_path = Path(archive_path)
+    when = device_mtime
+    if when is None:
+        when = _recorded_at_from_basename(archive_path)
+    if when is None:
+        when = datetime.fromtimestamp(archive_path.stat().st_mtime)
+    return when.astimezone() if when.tzinfo is None else when
 
 
 def _archive_subdir(when: datetime) -> Path:
@@ -477,6 +536,7 @@ class Offloader:
                 self._archive_dir,
                 bus=self._bus,
                 device_filename=device_filename,
+                recorded_at=file.device_mtime,
             )
 
         return OffloadResult(
