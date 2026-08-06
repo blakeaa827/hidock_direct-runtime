@@ -81,7 +81,9 @@ def test_success_publishes_started_then_complete(monkeypatch, bus_and_events, tm
     monkeypatch.setattr(
         transcribe,
         "_run_pipeline",
-        lambda audio_path, archive_dir: _FakeResult(status="done", drive_file_id="DRIVE_XYZ"),
+        lambda audio_path, archive_dir, recorded_at=None: _FakeResult(
+            status="done", drive_file_id="DRIVE_XYZ"
+        ),
     )
 
     audio = tmp_path / "2026-04-17_090039.mp3"
@@ -112,7 +114,7 @@ def test_non_done_status_publishes_failed(monkeypatch, bus_and_events, tmp_path)
     monkeypatch.setattr(
         transcribe,
         "_run_pipeline",
-        lambda audio_path, archive_dir: _FakeResult(status="error"),
+        lambda audio_path, archive_dir, recorded_at=None: _FakeResult(status="error"),
     )
 
     audio = tmp_path / "2026-04-17_090039.mp3"
@@ -139,7 +141,7 @@ def test_pipeline_exception_publishes_failed(monkeypatch, bus_and_events, tmp_pa
     bus, sink = bus_and_events
     monkeypatch.setattr(transcribe, "_check_available", lambda: True)
 
-    def _boom(audio_path, archive_dir):
+    def _boom(audio_path, archive_dir, recorded_at=None):
         raise RuntimeError("upstream AAI quota exhausted")
 
     monkeypatch.setattr(transcribe, "_run_pipeline", _boom)
