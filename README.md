@@ -36,6 +36,22 @@ echo 'alias hidock="$HOME/hidock-direct/.venv/bin/python -m hidock_direct"' >> ~
 
 Then just type `hidock` in any Terminal.
 
+## Repairing timestamps written before August 2026
+
+A transcript's `recorded_at` and its `# ` heading are the time the recording **started**.
+Versions before August 2026 wrote the time the recording finished being copied off the
+device instead — later by at least the recording's duration, and by days if the device sat
+unplugged. If you have transcripts from an earlier version, repair them in place:
+
+```bash
+python3 scripts/backfill_recorded_at.py "$HIDOCK_ARCHIVE_DIR"           # preview only
+python3 scripts/backfill_recorded_at.py "$HIDOCK_ARCHIVE_DIR" --apply   # write changes
+```
+
+The correct time is read from each file's own basename, so nothing is re-submitted to
+AssemblyAI. Only the two timestamp lines change; transcript bodies are untouched, files
+this tool did not name are skipped, and re-running is a no-op. Stdlib only — no venv needed.
+
 ## Configuration
 
 All settings live in a single `.env` file — copy it from `.env.example` and edit.

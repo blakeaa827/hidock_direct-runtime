@@ -366,6 +366,7 @@
         <li><a href="#step-6"><span class="tnum">06</span> Run HiDock Direct</a></li>
         <li class="gap"></li>
         <li><a href="#transcripts"><span class="tnum">·</span> Your transcripts</a></li>
+        <li><a href="#timestamps"><span class="tnum">·</span> Fixing older timestamps</a></li>
         <li><a href="#naming"><span class="tnum">·</span> Naming speakers</a></li>
         <li><a href="#daily"><span class="tnum">·</span> Daily workflow</a></li>
       </ol>
@@ -594,6 +595,39 @@ eval "$(/opt/homebrew/bin/brew shellenv)"</code></pre>
           </tr>
         </tbody>
       </table>
+    </section>
+
+    <!-- Older timestamps -->
+    <section id="timestamps" class="block">
+      <div class="section-head">
+        <span class="kicker">If you installed before August 2026</span>
+        <h2 class="sec">Fixing timestamps on older transcripts</h2>
+      </div>
+      <p class="intro-copy">The date and time at the top of a transcript is when the recording <b>started</b>. Earlier versions of the app wrote down when the recording was <b>copied off the device</b> instead — always later, by at least the length of the recording, and by days if the HiDock sat unplugged before you connected it. A transcript from a Friday evening call could be dated the following Monday.</p>
+      <p>New transcripts are correct. Older ones can be repaired in one pass. Paste this into Claude Code:</p>
+      <div class="console" data-where="claude">
+        <div class="console-bar"><span class="where">Claude Code prompt</span><button class="copy" type="button">Copy</button></div>
+        <pre><code>Update my HiDock Direct install with git pull, then run scripts/backfill_recorded_at.py against my archive folder to repair the timestamps on my older transcripts. Show me the preview first, then apply it.</code></pre>
+      </div>
+      <p>Or do it yourself in a Terminal. First update your copy of the app:</p>
+      <div class="console" data-where="terminal">
+        <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+        <pre><code>cd ~/hidock-direct &amp;&amp; git pull</code></pre>
+      </div>
+      <p>Then preview the repair. This only shows you what would change — nothing is modified:</p>
+      <div class="console" data-where="terminal">
+        <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+        <pre><code>python3 scripts/backfill_recorded_at.py ~/hidock-archive</code></pre>
+      </div>
+      <p>When the preview looks right, run it again with <code class="inline">--apply</code> to make the changes:</p>
+      <div class="console" data-where="terminal">
+        <div class="console-bar"><span class="where">Terminal</span><button class="copy" type="button">Copy</button></div>
+        <pre><code>python3 scripts/backfill_recorded_at.py ~/hidock-archive --apply</code></pre>
+      </div>
+      <div class="callout note">
+        <svg class="ico" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.9"/><path d="M12 11v5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="7.8" r="1.1" fill="currentColor"/></svg>
+        <div><p class="ctitle">What it touches</p><p class="cbody">The correct time comes from each transcript's own filename, which was always right. Only the two timestamp lines change — the transcript text itself is left exactly as it was. Files the app did not create are skipped, and running it twice does nothing the second time.</p></div>
+      </div>
     </section>
 
     <!-- Naming speakers -->
