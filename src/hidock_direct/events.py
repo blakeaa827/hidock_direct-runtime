@@ -115,6 +115,19 @@ class WhispersDetected(Event):
 
 
 @dataclass(frozen=True)
+class RetryCandidatesDetected(Event):
+    """How many archived recordings have a failed transcription.
+
+    Published at startup and after every retry batch so the footer can tell the
+    operator there is something to retry. Without it, `r` is discoverable only
+    by already knowing it exists — a failure is otherwise one line in a
+    ten-entry log deque that scrolls away.
+    """
+
+    count: int
+
+
+@dataclass(frozen=True)
 class UnknownsDetected(Event):
     count: int
     filenames: List[str]

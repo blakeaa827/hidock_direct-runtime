@@ -50,6 +50,7 @@ from .events import (
     TranscribeSkipped,
     TranscribeStarted,
     TransferAborted,
+    RetryCandidatesDetected,
     UnknownsDetected,
     WhispersDetected,
 )
@@ -58,6 +59,7 @@ from .tui_handlers import (
     handle_unknown_prompt,
     handle_whisper_selection,
     keys_active_in_state,
+    retry_key_active_in_state,
 )
 
 
@@ -147,7 +149,9 @@ class KeyboardReader:
 RECENT_LOG_LIMIT = 10
 
 
-def format_pending_footer(whisper_count: int, unknown_count: int) -> str:
+def format_pending_footer(
+    whisper_count: int, unknown_count: int, failed_count: int = 0
+) -> str:
     """Render the whisper/unknown count line for the TUI footer (PRD §2.6).
 
     Pure function -- empty when nothing is pending, otherwise joins the
@@ -161,6 +165,9 @@ def format_pending_footer(whisper_count: int, unknown_count: int) -> str:
     if unknown_count > 0:
         label = "unknown" if unknown_count == 1 else "unknowns"
         parts.append(f"{unknown_count} {label} [press u to review]")
+    if failed_count > 0:
+        label = "transcription" if failed_count == 1 else "transcriptions"
+        parts.append(f"{failed_count} failed {label} [press r to retry]")
     return "   ".join(parts)
 
 
@@ -184,6 +191,7 @@ class TUI:
         app: Optional[_AppHandle] = None,
         pending_whispers_provider=None,
         pending_unknowns_provider=None,
+        retry_candidates_provider=None,
         console: Optional[Console] = None,
         refresh_hz: float = 4.0,
         keyboard: Optional[KeyboardReader] = None,
@@ -192,6 +200,7 @@ class TUI:
         self._app = app
         # Callables returning the current pending lists (names + sizes). Wired
         # to `lambda: app._pending_whispers` in production; tests pass fakes.
+        self._retry_candidates_provider = retry_candidates_provider or (lambda: [])
         self._pending_whispers_provider = pending_whispers_provider or (lambda: [])
         self._pending_unknowns_provider = pending_unknowns_provider or (lambda: [])
         self._console = console or Console()
@@ -205,6 +214,7 @@ class TUI:
         self._session_bytes = 0
         self._whisper_count = 0
         self._unknown_count = 0
+        self._failed_count = 0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -212,6 +222,7 @@ class TUI:
         # is active at a time. Mutated only on the keyboard thread.
         self._whisper_modal: Optional[WhisperSelectionState] = None
         self._unknown_queue: List[str] = []
+        self._retry_confirm = None
 
         self._keyboard = keyboard if keyboard is not None else KeyboardReader(self._on_key)
 
@@ -285,6 +296,8 @@ class TUI:
                     self._log.append(
                         (datetime.now(), f"{event.count} whisper(s) on device — press w to review", Severity.INFO)
                     )
+            elif isinstance(event, RetryCandidatesDetected):
+                self._failed_count = event.count
             elif isinstance(event, UnknownsDetected):
                 self._unknown_count = event.count
                 if event.count > 0:
@@ -294,6 +307,27 @@ class TUI:
             elif isinstance(event, Error):
                 ctx = f" [{event.context}]" if event.context else ""
                 self._log.append((datetime.now(), f"ERROR{ctx}: {event.message}", event.severity))
+
+    def _log_key_ignored(self, message: str) -> None:
+        with self._lock:
+            self._log.append((datetime.now(), message, Severity.WARNING))
+
+    def _open_retry_confirm(self) -> None:
+        """Build the retry confirm from the ledger and show it.
+
+        Runs on the keyboard thread and only reads — the batch itself is started
+        from the confirm handler.
+        """
+        try:
+            candidates = self._retry_candidates_provider()
+        except Exception as exc:  # LedgerUnavailable and anything below it
+            self._log_key_ignored(f"retry unavailable: {exc}")
+            return
+        if not candidates:
+            self._log_key_ignored("no failed transcriptions to retry")
+            return
+        with self._lock:
+            self._retry_confirm = candidates
 
     # -- keyboard input -------------------------------------------------
 
@@ -327,6 +361,21 @@ class TUI:
         display = ch if ch.isprintable() else f"\\x{ord(ch):02x}"
         whisper_count = len(self._pending_whispers_provider())
         unknown_count = len(self._pending_unknowns_provider())
+        # `r` is dispatched ahead of the whisper/unknown gate on purpose: those
+        # bindings need a device on the bus, retry does not, and its primary
+        # state (IDLE_DISCONNECTED) is one the gate below rejects. Routing it
+        # after would log "keys active only in CONNECTED_IDLE" for the one key
+        # that is supposed to work there.
+        if ch == "r":
+            if not retry_key_active_in_state(current_state):
+                self._log_key_ignored(
+                    f"key 'r' ignored: state={current_state} "
+                    f"(retry is unavailable while a transfer is draining)"
+                )
+                return
+            self._open_retry_confirm()
+            return
+
         if not keys_active_in_state(current_state):
             with self._lock:
                 self._log.append((
@@ -542,7 +591,7 @@ class TUI:
     def _render_footer(files: int, bytes_: int, whisper_count: int, unknown_count: int) -> Panel:
         mb = bytes_ / (1024 * 1024)
         lines: list[Text] = [Text(f"Session: pulled {files} files, {mb:.1f} MB total.", style="dim")]
-        pending = format_pending_footer(whisper_count, unknown_count)
+        pending = format_pending_footer(whisper_count, unknown_count, self._failed_count)
         if pending:
             lines.append(Text(pending, style="bold yellow"))
         return Panel(Group(*lines), title="Session", border_style="cyan")

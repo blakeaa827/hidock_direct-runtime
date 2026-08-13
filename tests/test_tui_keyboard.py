@@ -216,3 +216,66 @@ def test_keyboard_reader_no_ops_when_stdin_not_tty():
 def _key():
     from hidock_direct.state import DeviceKey
     return DeviceKey(model="hidock-h1", serial="SN-TEST-1234")
+
+
+def _tui_with_retry(candidates, state="IDLE_DISCONNECTED"):
+    from hidock_direct.tui import TUI
+
+    tui = TUI(bus=EventBus(), retry_candidates_provider=lambda: candidates)
+    tui._state = state
+    return tui
+
+
+def test_r_dispatches_in_idle_disconnected():
+    """Regression for the dispatch-ordering defect: `_on_key` applies
+    keys_active_in_state as an early return before the w/u branches, so routing
+    `r` after it would log 'keys active only in CONNECTED_IDLE' for the one key
+    that is meant to work there."""
+    tui = _tui_with_retry(["c1", "c2"])
+
+    tui._on_key("r")
+
+    assert tui._retry_confirm == ["c1", "c2"], "confirm did not open"
+    joined = " ".join(m for _, m, _ in tui._log)
+    assert "keys active only in CONNECTED_IDLE" not in joined
+
+
+def test_r_is_refused_while_draining_with_its_own_reason():
+    tui = _tui_with_retry(["c1"], state="DRAINING")
+
+    tui._on_key("r")
+
+    assert tui._retry_confirm is None
+    joined = " ".join(m for _, m, _ in tui._log)
+    assert "draining" in joined.lower()
+
+
+def test_r_with_nothing_to_retry_says_so():
+    """FR-14 precedent: a key that appears to do nothing has three
+    indistinguishable causes, so the empty case must be explicit."""
+    tui = _tui_with_retry([])
+
+    tui._on_key("r")
+
+    assert tui._retry_confirm is None
+    assert any("no failed transcriptions" in m for _, m, _ in tui._log)
+
+
+def test_unreadable_ledger_does_not_render_as_no_candidates():
+    """A Drive mount that has not materialized must not read as an all-clear —
+    the exact false negative that made a recovery run report '0 candidates'
+    against the wrong archive on 2026-08-12."""
+    from hidock_direct.retry import LedgerUnavailable
+    from hidock_direct.tui import TUI
+
+    def boom():
+        raise LedgerUnavailable("archive directory not found: /nope")
+
+    tui = TUI(bus=EventBus(), retry_candidates_provider=boom)
+    tui._state = "IDLE_DISCONNECTED"
+
+    tui._on_key("r")
+
+    assert tui._retry_confirm is None
+    joined = " ".join(m for _, m, _ in tui._log)
+    assert "retry unavailable" in joined and "/nope" in joined
