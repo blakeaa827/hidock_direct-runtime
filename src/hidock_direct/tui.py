@@ -496,6 +496,7 @@ class TUI:
             bytes_ = self._session_bytes
             whispers = self._whisper_count
             unknowns = self._unknown_count
+            failed = self._failed_count
             modal = self._whisper_modal
             unknown_queue = list(self._unknown_queue)
 
@@ -512,7 +513,7 @@ class TUI:
             Layout(self._render_header(state, device), name="header", size=3),
             Layout(self._render_transfers(progress_snapshot), name="transfers", ratio=2),
             Layout(center, name="center", ratio=3),
-            Layout(self._render_footer(files, bytes_, whispers, unknowns), name="footer", size=3),
+            Layout(self._render_footer(files, bytes_, whispers, unknowns, failed), name="footer", size=3),
         )
         return layout
 
@@ -588,10 +589,16 @@ class TUI:
         return Panel(table, title="Recent activity", border_style="magenta")
 
     @staticmethod
-    def _render_footer(files: int, bytes_: int, whisper_count: int, unknown_count: int) -> Panel:
+    def _render_footer(
+        files: int, bytes_: int, whisper_count: int, unknown_count: int, failed_count: int
+    ) -> Panel:
+        # Every input arrives as a parameter, snapshotted under the lock by the
+        # caller. `failed_count` is no exception: it is mutated on the event
+        # thread (`_on_event`), so reading it from here would be an
+        # unsynchronized cross-thread read even if `self` were in scope.
         mb = bytes_ / (1024 * 1024)
         lines: list[Text] = [Text(f"Session: pulled {files} files, {mb:.1f} MB total.", style="dim")]
-        pending = format_pending_footer(whisper_count, unknown_count, self._failed_count)
+        pending = format_pending_footer(whisper_count, unknown_count, failed_count)
         if pending:
             lines.append(Text(pending, style="bold yellow"))
         return Panel(Group(*lines), title="Session", border_style="cyan")
