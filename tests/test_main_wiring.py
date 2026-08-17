@@ -40,19 +40,31 @@ def test_every_tui_provider_kwarg_is_supplied_by_main():
     """Structural sweep over the constructor. A provider the TUI accepts but the
     entry point never passes is a feature wired to nothing — which is exactly how
     the retry surface shipped inert. Catches the next one too."""
-    accepted = [
+    # Enumerate-and-classify rather than match a naming convention: keying on a
+    # `_provider` suffix would have missed `retry_runner`, an injection point of
+    # exactly the shape that shipped the feature inert.
+    intentionally_defaulted = {
+        "console": "production uses the real Console; tests inject a StringIO one",
+        "keyboard": "production uses the real KeyboardReader; tests inject a fake",
+    }
+    injectable = [
         name
-        for name in inspect.signature(TUI.__init__).parameters
-        if name.endswith("_provider")
+        for name, param in inspect.signature(TUI.__init__).parameters.items()
+        if param.default is None
     ]
-    assert accepted, "no provider-shaped kwargs found — has TUI.__init__ changed?"
+    assert injectable, "no injectable kwargs found — has TUI.__init__ changed?"
 
     passed = _tui_call_kwargs()
-    missing = [name for name in accepted if name not in passed]
+    missing = [
+        name
+        for name in injectable
+        if name not in passed and name not in intentionally_defaulted
+    ]
 
     assert not missing, (
-        f"TUI accepts {missing} but __main__ never passes them; "
-        f"they will silently fall back to their empty defaults"
+        f"TUI accepts {missing} but __main__ never passes them; they will "
+        f"silently fall back to their inert defaults. Wire them, or add them to "
+        f"intentionally_defaulted with a reason."
     )
 
 

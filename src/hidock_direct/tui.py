@@ -51,6 +51,8 @@ from .events import (
     TranscribeStarted,
     TransferAborted,
     RetryCandidatesDetected,
+    RetryFinished,
+    RetryProgress,
     UnknownsDetected,
     WhispersDetected,
 )
@@ -192,6 +194,7 @@ class TUI:
         pending_whispers_provider=None,
         pending_unknowns_provider=None,
         retry_candidates_provider=None,
+        retry_runner=None,
         console: Optional[Console] = None,
         refresh_hz: float = 4.0,
         keyboard: Optional[KeyboardReader] = None,
@@ -201,6 +204,8 @@ class TUI:
         # Callables returning the current pending lists (names + sizes). Wired
         # to `lambda: app._pending_whispers` in production; tests pass fakes.
         self._retry_candidates_provider = retry_candidates_provider or (lambda: [])
+        # Injected by __main__; None in tests that never start a batch.
+        self._retry_runner = retry_runner
         self._pending_whispers_provider = pending_whispers_provider or (lambda: [])
         self._pending_unknowns_provider = pending_unknowns_provider or (lambda: [])
         self._console = console or Console()
@@ -223,6 +228,10 @@ class TUI:
         self._whisper_modal: Optional[WhisperSelectionState] = None
         self._unknown_queue: List[str] = []
         self._retry_confirm = None
+        # FR-11: the run region. Persistent — deliberately NOT the log,
+        # which holds ten entries and would evict a long run's own summary.
+        self._retry_progress = None
+        self._retry_summary = None
 
         self._keyboard = keyboard if keyboard is not None else KeyboardReader(self._on_key)
 
@@ -298,6 +307,14 @@ class TUI:
                     )
             elif isinstance(event, RetryCandidatesDetected):
                 self._failed_count = event.count
+            elif isinstance(event, RetryProgress):
+                # A new run supersedes the previous run's summary — otherwise the
+                # region shows last run's totals while this one is still going.
+                self._retry_progress = event
+                self._retry_summary = None
+            elif isinstance(event, RetryFinished):
+                self._retry_progress = None
+                self._retry_summary = event
             elif isinstance(event, UnknownsDetected):
                 self._unknown_count = event.count
                 if event.count > 0:
@@ -329,6 +346,86 @@ class TUI:
         with self._lock:
             self._retry_confirm = candidates
 
+    def _handle_retry_confirm_key(self, ch: str) -> None:
+        """`y` / `f` / `esc` on the open confirm (FR-10).
+
+        `f` force-includes what the default set excluded — but only files still
+        on disk, because a missing file cannot be retried by anyone.
+        """
+        with self._lock:
+            candidates = list(self._retry_confirm or [])
+
+        if ch == "\x1b":
+            with self._lock:
+                self._retry_confirm = None
+            self._log_key_ignored("retry cancelled")
+            return
+
+        if ch not in ("y", "f"):
+            self._log_key_ignored(
+                f"key {ch!r} ignored: the retry confirm is open (y / f / esc)"
+            )
+            return
+
+        if ch == "f":
+            selected = [c for c in candidates if c.exists_on_disk]
+        else:
+            selected = [c for c in candidates if c.default_selected]
+
+        with self._lock:
+            self._retry_confirm = None
+
+        if not selected:
+            self._log_key_ignored("nothing to retry: every candidate is missing from the archive")
+            return
+        self._start_retry_batch(selected)
+
+    def _start_retry_batch(self, selected) -> None:
+        """Run the batch off the keyboard thread.
+
+        `run_retry_batch` uploads audio and waits on AssemblyAI; running it
+        inline would freeze every other key for the length of the run —
+        including the `esc` that dismisses the result.
+        """
+        thread = threading.Thread(
+            target=self._run_retry_batch, args=(selected,), name="hidock-retry", daemon=True
+        )
+        thread.start()
+
+    def _run_retry_batch(self, selected) -> None:
+        """The batch itself. Publishes progress and the summary onto the bus."""
+        if self._retry_runner is None:
+            self._log_key_ignored(
+                "retry is not wired to a runner — this build cannot start a batch"
+            )
+            return
+        try:
+            self._retry_runner(selected)
+        except Exception as exc:
+            # Redacted: this message is rendered in the activity log, and the
+            # exception can carry AAI text including an account-scoped upload
+            # URL (FR-12 — "anything rendered", not just the abort reason).
+            from .retry import redact
+
+            self._bus.publish(
+                Error(
+                    message=f"retry batch failed: {redact(str(exc))}",
+                    severity=Severity.ERROR,
+                    context="retry",
+                )
+            )
+        # Refresh the badge from the ledger — the contract `RetryCandidatesDetected`
+        # documents is "at startup and after every retry batch". Without this the
+        # footer keeps advertising the pre-run count, so a batch that fixed
+        # everything still reads as N failed. Runs after a failed batch too: the
+        # count is whatever the ledger now says, which is the point.
+        try:
+            self._bus.publish(
+                RetryCandidatesDetected(count=len(self._retry_candidates_provider()))
+            )
+        except Exception as exc:  # LedgerUnavailable and anything below it
+            self._log_key_ignored(f"retry count not refreshed: {exc}")
+
     # -- keyboard input -------------------------------------------------
 
     def _on_key(self, ch: str) -> None:
@@ -347,12 +444,16 @@ class TUI:
             current_state = self._state
             in_whisper = self._whisper_modal is not None
             in_unknown = bool(self._unknown_queue)
+            in_retry_confirm = self._retry_confirm is not None
 
         if in_whisper:
             self._handle_whisper_modal_key(ch)
             return
         if in_unknown:
             self._handle_unknown_prompt_key(ch)
+            return
+        if in_retry_confirm:
+            self._handle_retry_confirm_key(ch)
             return
         # Top-level key. Log EVERY received keystroke + the reason it was
         # accepted or ignored. Without this, "I pressed `w` and nothing
@@ -366,6 +467,15 @@ class TUI:
         # state (IDLE_DISCONNECTED) is one the gate below rejects. Routing it
         # after would log "keys active only in CONNECTED_IDLE" for the one key
         # that is supposed to work there.
+        if ch == "\x1b":
+            with self._lock:
+                had_region = self._retry_progress is not None or self._retry_summary is not None
+                self._retry_progress = None
+                self._retry_summary = None
+            if had_region:
+                self._log_key_ignored("retry result dismissed")
+            return
+
         if ch == "r":
             if not retry_key_active_in_state(current_state):
                 self._log_key_ignored(
@@ -497,6 +607,9 @@ class TUI:
             whispers = self._whisper_count
             unknowns = self._unknown_count
             failed = self._failed_count
+            retry_confirm = self._retry_confirm
+            retry_progress = self._retry_progress
+            retry_summary = self._retry_summary
             modal = self._whisper_modal
             unknown_queue = list(self._unknown_queue)
 
@@ -505,6 +618,15 @@ class TUI:
             center = self._render_whisper_modal(modal)
         elif unknown_queue:
             center = self._render_unknown_prompt(unknown_queue)
+        elif retry_confirm is not None:
+            center = self._render_retry_confirm(retry_confirm)
+        elif retry_progress is not None or retry_summary is not None:
+            # Stacked, not replaced: the run region must persist without
+            # hiding the activity log it deliberately does not live in.
+            center = Group(
+                self._render_retry_run(retry_progress, retry_summary),
+                self._render_log(log_snapshot),
+            )
         else:
             center = self._render_log(log_snapshot)
 
@@ -548,6 +670,53 @@ class TUI:
             style="dim",
         )
         return Panel(Group(table, hint), title="Whisper selector", border_style="yellow")
+
+    @staticmethod
+    def _render_retry_confirm(candidates) -> Panel:
+        """The confirm the operator reads before spending money (FR-10)."""
+        from .retry import format_retry_confirm, summarize
+
+        lines = format_retry_confirm(summarize(candidates))
+        body = Group(
+            Text(lines[0], style="bold"),
+            *[Text(line) for line in lines[1:-1]],
+            Text(lines[-1], style="bold cyan"),
+        )
+        return Panel(body, title="Retry failed transcriptions", border_style="yellow")
+
+    @staticmethod
+    def _render_retry_run(progress, summary) -> Panel:
+        """Progress and summary, in a region the log cannot evict (FR-11).
+
+        Every rendered fragment of AAI error text goes through `redact` — the
+        exposure is *introduced* by surfacing these errors at all, and the
+        operator screenshots this app against a public repo (FR-12).
+        """
+        from .retry import redact
+
+        rows: list[Text] = []
+        if progress is not None:
+            rows.append(
+                Text(
+                    f"{progress.index}/{progress.total}  {progress.filename}",
+                    style="bold",
+                )
+            )
+            rows.append(Text("transcribing — long files take a few minutes", style="dim"))
+        if summary is not None:
+            rows.append(
+                Text(
+                    f"{summary.succeeded} transcribed   "
+                    f"{summary.re_rendered} re-rendered   "
+                    f"{summary.failed} failed   "
+                    f"{summary.not_attempted} not attempted",
+                    style="bold",
+                )
+            )
+            if summary.aborted_reason:
+                rows.append(Text(f"stopped: {redact(summary.aborted_reason)}", style="yellow"))
+            rows.append(Text("esc to dismiss", style="dim"))
+        return Panel(Group(*rows), title="Retry", border_style="green")
 
     @staticmethod
     def _render_unknown_prompt(queue: List[str]) -> Panel:

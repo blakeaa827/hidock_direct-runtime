@@ -130,6 +130,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         bus=bus,
         poll_interval_seconds=config.poll_interval_seconds,
     )
+    from .retry import run_retry_batch
+
     retry_provider = lambda: load_retry_candidates(config.archive_dir)  # noqa: E731
     tui = TUI(
         bus=bus,
@@ -137,6 +139,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         pending_whispers_provider=lambda: app._pending_whispers,
         pending_unknowns_provider=lambda: app._pending_unknowns,
         retry_candidates_provider=retry_provider,
+        retry_runner=lambda selected: run_retry_batch(
+            selected, config.archive_dir, bus=bus
+        ),
     )
 
     if config.transcribe_on_offload:

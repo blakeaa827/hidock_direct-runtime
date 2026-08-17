@@ -128,6 +128,36 @@ class RetryCandidatesDetected(Event):
 
 
 @dataclass(frozen=True)
+class RetryProgress(Event):
+    """Which file a retry batch is working on (PRD v3 FR-11).
+
+    Rendered in a persistent region rather than the log: a 12-file run emits
+    more events than `RECENT_LOG_LIMIT` holds, so progress written to the log
+    evicts itself. A long file otherwise looks hung — the failure mode that
+    produced the 2026-07-08 "stuck recording" report.
+    """
+
+    index: int
+    total: int
+    filename: str
+
+
+@dataclass(frozen=True)
+class RetryFinished(Event):
+    """Outcome of a retry batch (PRD v3 FR-11).
+
+    Persistent for the same reason as `RetryProgress`: the summary is the one
+    line the operator needs after a run, and the log would scroll it away.
+    """
+
+    succeeded: int
+    re_rendered: int
+    failed: int
+    not_attempted: int
+    aborted_reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class UnknownsDetected(Event):
     count: int
     filenames: List[str]

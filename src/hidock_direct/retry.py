@@ -31,6 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from .events import RetryFinished, RetryProgress
 from .offload import _recorded_at_from_basename
 from .state import audio_duration_minutes
 
@@ -283,6 +284,12 @@ def run_retry_batch(
             outcome.not_attempted += 1
             continue
 
+        # FR-11: progress goes on the bus, not the log — the log holds ten
+        # entries and a 12-file run would evict its own summary.
+        bus.publish(
+            RetryProgress(index=index + 1, total=len(items), filename=cand.path.name)
+        )
+
         transcribe(
             cand.path,
             Path(archive_dir),
@@ -321,6 +328,15 @@ def run_retry_batch(
             log.warning("retry batch aborted", extra={"reason": outcome.aborted_reason})
             break
 
+    bus.publish(
+        RetryFinished(
+            succeeded=outcome.succeeded,
+            re_rendered=outcome.re_rendered,
+            failed=outcome.failed,
+            not_attempted=outcome.not_attempted,
+            aborted_reason=outcome.aborted_reason,
+        )
+    )
     return outcome
 
 
@@ -357,6 +373,49 @@ def redact(text: str) -> str:
     for token in (text or "").split(" "):
         out.append("<upload-url redacted>" if token.startswith(_UPLOAD_URL_PREFIX) else token)
     return " ".join(out)
+
+
+# AssemblyAI's `best` tier, mirroring diarize_audio.worker._PRICE_PER_MIN. The
+# estimate is labelled as one because `best` sends no `speech_models` field, so
+# the rate assumes AAI's current default — the same assumption the retired-model
+# fix (2026-07-30) deliberately took on so the common path cannot rot again.
+_PRICE_PER_MIN_BEST = 0.21 / 60
+
+
+def format_retry_confirm(summary: dict, *, price_per_min: float = _PRICE_PER_MIN_BEST) -> list[str]:
+    """The confirm the operator reads before spending money (PRD v3 FR-10).
+
+    Pure: takes `summarize()`'s output, returns lines. An unreadable duration
+    renders `unknown` rather than `0.0 h` / `$0.00` — a confident zero reads as
+    "this is free", which is the one wrong thing to tell someone about to be
+    billed.
+    """
+    total = summary["total"]
+    noun = "transcription" if total == 1 else "transcriptions"
+    lines = [f"Retry {total} failed {noun}?"]
+
+    to_transcribe = summary["to_transcribe"]
+    if to_transcribe:
+        if summary["duration_known"]:
+            hours = summary["hours"]
+            cost = f"~${hours * 60 * price_per_min:.2f} (estimate)"
+            duration = f"{hours:.1f} h"
+        else:
+            duration = "unknown duration"
+            cost = "cost unknown"
+        lines.append(f"  {to_transcribe} to transcribe   {duration}   {cost}")
+
+    re_render = summary["re_render"]
+    if re_render:
+        lines.append(f"  {re_render} already paid — re-render only, $0")
+
+    excluded = summary["excluded"]
+    if excluded:
+        breakdown = ", ".join(f"{n} {reason}" for reason, n in sorted(excluded.items()))
+        lines.append(f"  {sum(excluded.values())} excluded: {breakdown}   [f to include]")
+
+    lines.append("  [y] start   [f] force-include   [esc] cancel")
+    return lines
 
 
 def summarize(candidates: Iterable[RetryCandidate]) -> dict:
