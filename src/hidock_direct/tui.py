@@ -508,14 +508,31 @@ class TUI:
         else:
             center = self._render_log(log_snapshot)
 
+        # The footer is measured, not given a constant height. Its pending line
+        # joins every fragment into one string that wraps, so the panel is 4, 5
+        # or 6 rows deep depending on terminal width — a constant is correct at
+        # one width and crops the badge at every other. The header is genuinely
+        # fixed (one line, always), so it keeps its size.
+        footer = self._render_footer(files, bytes_, whispers, unknowns, failed)
+
         layout = Layout()
         layout.split_column(
             Layout(self._render_header(state, device), name="header", size=3),
             Layout(self._render_transfers(progress_snapshot), name="transfers", ratio=2),
             Layout(center, name="center", ratio=3),
-            Layout(self._render_footer(files, bytes_, whispers, unknowns, failed), name="footer", size=3),
+            Layout(footer, name="footer", size=self._rendered_height(footer)),
         )
         return layout
+
+    def _rendered_height(self, renderable) -> int:
+        """Rows `renderable` needs at the console it will be drawn on.
+
+        Asking rich rather than computing it: the arithmetic that looks right
+        ("one row per pending fragment") is wrong, because the fragments are
+        joined into a single line whose wrapping depends on width.
+        """
+        options = self._console.options.update(height=None)
+        return len(self._console.render_lines(renderable, options, pad=False))
 
     @staticmethod
     def _render_whisper_modal(state: WhisperSelectionState) -> Panel:

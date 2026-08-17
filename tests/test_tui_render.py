@@ -15,13 +15,21 @@ from __future__ import annotations
 
 import inspect
 import io
+import re
 import threading
+
+import pytest
 
 from rich.console import Console
 from rich.layout import Layout
 
-from hidock_direct.events import EventBus, RetryCandidatesDetected
-from hidock_direct.tui import TUI
+from hidock_direct.events import (
+    EventBus,
+    RetryCandidatesDetected,
+    UnknownsDetected,
+    WhispersDetected,
+)
+from hidock_direct.tui import TUI, format_pending_footer
 from hidock_direct.tui_handlers import WhisperSelectionState
 
 
@@ -38,19 +46,35 @@ def _text_of(renderable, width: int = 100, height: int = 40) -> str:
     return buf.getvalue()
 
 
-def _footer_text_of(layout: Layout) -> str:
-    """Text of the footer panel produced by a full `_render()` pass.
+def _tui_at_width(width: int, height: int = 40) -> tuple[TUI, io.StringIO]:
+    """A TUI whose own console has a known size.
 
-    Reads the panel out of the composed Layout rather than the whole frame, so
-    the assertion exercises the real path (snapshot under lock -> parameter ->
-    formatter -> panel) without depending on the frame's footer pane being tall
-    enough to display it. It is not: the pane is fixed at `size=3`, which fits
-    one content line, so the badge's second line is clipped from the live
-    display. That is a separate, pre-existing defect — it hides the whisper and
-    unknown badges too, and predates the retry work — tracked at
-    `bug_report_footer_pane_clips_the_pending_badge_line.md`.
+    The TUI must measure and render against the SAME console — in production
+    that is the one `Live` draws with. Injecting it here keeps the test faithful
+    and lets each case pick a width, which matters: the pending line wraps, so
+    the footer's height is width-dependent.
     """
-    return _text_of(layout["footer"].renderable)
+    buf = io.StringIO()
+    tui = TUI(bus=EventBus(), console=Console(file=buf, width=width, height=height))
+    return tui, buf
+
+
+def _frame_text(tui: TUI) -> str:
+    """The composed frame as the operator sees it — every pane, cropped as the
+    layout crops it. Assertions about operator-visible strings go through here,
+    never against a panel read out of the Layout: a panel-level assertion cannot
+    see a pane too short to display its own content.
+
+    Box-drawing characters are stripped and whitespace collapsed, so a phrase
+    that wraps across a line boundary ("[press r" / "to retry]" at width 60)
+    still matches. Without that, a narrow-terminal test fails on its own
+    assertion while the frame is perfectly correct.
+    """
+    buf = io.StringIO()
+    console = Console(file=buf, width=tui._console.width, height=tui._console.height)
+    console.print(tui._render())
+    stripped = re.sub(r"[│╭╮╰╯─]", " ", buf.getvalue())
+    return re.sub(r"\s+", " ", stripped)
 
 
 def test_render_produces_a_layout_in_the_default_state():
@@ -88,11 +112,10 @@ def test_footer_shows_the_failed_badge_after_retry_candidates_detected():
     pure formatter and the event handler on either side of the render step, and
     the render step was the broken one. Drive the event, draw the frame, read the
     operator-visible text."""
-    bus = EventBus()
-    tui = TUI(bus=bus)
+    tui, _ = _tui_at_width(100)
 
-    bus.publish(RetryCandidatesDetected(count=3))
-    text = _footer_text_of(tui._render())
+    tui._bus.publish(RetryCandidatesDetected(count=3))
+    text = _frame_text(tui)
 
     assert "3 failed transcriptions" in text
     assert "press r to retry" in text
@@ -101,15 +124,14 @@ def test_footer_shows_the_failed_badge_after_retry_candidates_detected():
 def test_footer_badge_is_singular_for_one_failure_and_absent_for_none():
     """Edge cases either side of the badge: the singular label, and the empty
     case where the footer must still render without a pending line at all."""
-    bus = EventBus()
-    tui = TUI(bus=bus)
+    tui, _ = _tui_at_width(100)
 
-    bus.publish(RetryCandidatesDetected(count=1))
-    text = _footer_text_of(tui._render())
+    tui._bus.publish(RetryCandidatesDetected(count=1))
+    text = _frame_text(tui)
     assert "1 failed transcription " in text, "expected the singular label"
 
-    bus.publish(RetryCandidatesDetected(count=0))
-    text = _footer_text_of(tui._render())
+    tui._bus.publish(RetryCandidatesDetected(count=0))
+    text = _frame_text(tui)
     assert "failed transcription" not in text
     assert "Session: pulled 0 files" in text, "footer must still render when nothing is pending"
 
@@ -181,4 +203,90 @@ def test_render_reads_failed_count_under_the_lock():
     assert tui._probe_reads, "_render never read _failed_count at all"
     assert all(tui._probe_reads), (
         f"_failed_count was read outside the lock: {tui._probe_reads}"
+    )
+
+
+# -- the footer pane must be tall enough to display its own panel -------------
+#
+# Regression tests for `bug_report_footer_pane_clips_the_pending_badge_line.md`.
+# The pane was hardcoded `size=3`; a rich Panel spends two rows on borders, so
+# only one content line survived and every badge was cropped from the display.
+
+
+@pytest.mark.parametrize(
+    "event, fragment",
+    [
+        (WhispersDetected(count=2), "2 whispers on device [press w to pick]"),
+        (UnknownsDetected(count=1, filenames=["mystery.hda"]), "1 unknown [press u to review]"),
+        (RetryCandidatesDetected(count=3), "3 failed transcriptions [press r to retry]"),
+    ],
+    ids=["whispers", "unknowns", "failed"],
+)
+def test_pending_badge_is_visible_in_the_rendered_frame(event, fragment):
+    """Every badge kind, asserted against the displayed frame. The whisper and
+    unknown badges have been cropped since 2026-04-23, so this is not a
+    retry-only regression — all three shipped invisible."""
+    tui, _ = _tui_at_width(140)
+
+    tui._bus.publish(event)
+
+    assert fragment in _frame_text(tui)
+
+
+@pytest.mark.parametrize("whispers", [0, 2], ids=["w0", "w2"])
+@pytest.mark.parametrize("unknowns", [0, 1], ids=["u0", "u1"])
+@pytest.mark.parametrize("failed", [0, 3], ids=["f0", "f3"])
+def test_footer_pane_is_tall_enough_for_every_fragment_combination(whispers, unknowns, failed):
+    """The invariant, across all 8 present/absent combinations: whatever
+    `format_pending_footer` produced must survive into the frame.
+
+    Asserted as an invariant rather than against a literal height so it still
+    holds when a fourth fragment is added — the failure mode that produced this
+    bug was a constant that stopped matching the content."""
+    tui, _ = _tui_at_width(140)
+    tui._bus.publish(WhispersDetected(count=whispers))
+    tui._bus.publish(UnknownsDetected(count=unknowns, filenames=["m.hda"] * unknowns))
+    tui._bus.publish(RetryCandidatesDetected(count=failed))
+
+    text = _frame_text(tui)
+    pending = format_pending_footer(whispers, unknowns, failed)
+
+    assert "Session: pulled 0 files" in text, "the session line must always render"
+    if pending:
+        for fragment in pending.split("   "):
+            assert fragment in text, f"cropped from the frame: {fragment!r}"
+
+
+@pytest.mark.parametrize("width", [60, 80, 100, 140, 200], ids=lambda w: f"w{w}")
+def test_badge_survives_narrow_terminals_where_the_pending_line_wraps(width):
+    """The case both fixed-height proposals get wrong.
+
+    The three fragments are joined into ONE line, so `3 + len(fragments)` is not
+    the height; the real driver is wrapping. That line is 115 characters, so the
+    panel needs 6 rows at width 60, 5 at 80-100 and 4 at 140+. A constant is
+    correct at one width and wrong at the others, which is why the pane is
+    measured against the console it will be drawn on."""
+    tui, _ = _tui_at_width(width)
+    tui._bus.publish(WhispersDetected(count=2))
+    tui._bus.publish(UnknownsDetected(count=1, filenames=["m.hda"]))
+    tui._bus.publish(RetryCandidatesDetected(count=3))
+
+    text = _frame_text(tui)
+
+    # The last fragment is the one a too-short pane drops first.
+    assert "press r to retry" in text
+
+
+def test_footer_pane_does_not_waste_rows_when_nothing_is_pending():
+    """The cost side of measuring: an idle footer must not reserve rows for a
+    badge that is not there. Guards against 'just make it size=5'."""
+    tui, _ = _tui_at_width(140)
+
+    layout = tui._render()
+    panel = layout["footer"].renderable
+    options = tui._console.options.update(height=None)
+    needed = len(tui._console.render_lines(panel, options, pad=False))
+
+    assert layout["footer"].size == needed, (
+        f"footer pane reserves {layout['footer'].size} rows for a {needed}-row panel"
     )
