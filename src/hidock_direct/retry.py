@@ -132,6 +132,48 @@ class LedgerUnavailable(RuntimeError):
     """
 
 
+def load_diarize_state(archive_dir: Path):
+    """The transcription ledger belonging to `archive_dir`.
+
+    Every read of that ledger goes through here — the candidate scan and the
+    post-run entry check alike — so the two cannot drift apart on where it
+    lives.
+
+    The ledger is bound to the archive explicitly rather than read from
+    `INBOX_DIRS`. `transcribe.py` only ever `setdefault`s that variable as a
+    side effect of the first transcription, so at startup — and in any process
+    where the operator has it pointing somewhere else — `Config.from_env()`
+    resolves to a different archive entirely. On this machine that is
+    `~/HiDock/archive`, which holds no ledger, so a from-env read returns an
+    empty one and the operator is told there is nothing to retry. Same shape as
+    the 2026-08-13 recovery run that reported `0 candidates` against the wrong
+    archive.
+
+    Raises `LedgerUnavailable` rather than returning an empty ledger, because an
+    empty ledger is indistinguishable from a clean one at every call site above.
+    """
+    archive_dir = Path(archive_dir)
+    if not archive_dir.is_dir():
+        raise LedgerUnavailable(f"archive directory not found: {archive_dir}")
+    try:
+        from dataclasses import replace
+
+        from diarize_audio.config import Config
+        from diarize_audio.state import State
+
+        cfg = replace(Config.from_env(), inbox_dirs=[archive_dir])
+        state_path = cfg.state_path
+        if not state_path.exists():
+            raise LedgerUnavailable(f"no transcription ledger at {state_path}")
+        return State.load(state_path)
+    except LedgerUnavailable:
+        raise
+    except Exception as exc:  # ImportError, ConfigError, unreadable file
+        raise LedgerUnavailable(
+            f"transcription ledger for {archive_dir} unreadable: {exc}"
+        ) from exc
+
+
 def find_retry_candidates(
     state, archive_dir: Path, *, in_flight_ttl_minutes: int = 60
 ) -> list[RetryCandidate]:
@@ -284,11 +326,7 @@ def run_retry_batch(
 
 def _default_load_entry(archive_dir: Path) -> Callable[[str], dict]:
     def _load(state_key: str) -> dict:
-        from diarize_audio.config import Config
-        from diarize_audio.state import State
-
-        cfg = Config.from_env()
-        return State.load(cfg.state_path).data.get("files", {}).get(state_key, {})
+        return load_diarize_state(archive_dir).data.get("files", {}).get(state_key, {})
 
     return _load
 
