@@ -10,5 +10,10 @@ htmlcov/
 build/
 dist/
 .env
+# Any .env sidecar — backups, per-host variants, editor swap files. The
+# bare `.env` rule missed these, so a timestamped backup holding a live
+# AssemblyAI key sat untracked-but-stageable in a public repo.
+.env.*
+!.env.example
 .DS_Store
 *.swp

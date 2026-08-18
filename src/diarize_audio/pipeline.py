@@ -24,6 +24,10 @@ log = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB
 
+# Sentinel so `max_retries=None` (meaning "don't escalate") is distinguishable
+# from "caller didn't pass it" (meaning "use cfg.max_retries").
+_UNSET = object()
+
 
 @dataclass
 class PipelineResult:
@@ -41,6 +45,8 @@ def process_file(
     drive_sync,
     *,
     recorded_at: datetime | None = None,
+    max_retries: int | None = _UNSET,  # type: ignore[assignment]
+    reuse_existing_transcript: bool = False,
 ) -> PipelineResult:
     """Transcribe one audio file and write its sidecars.
 
@@ -50,16 +56,30 @@ def process_file(
     when the copy finished, which is recording-end plus transfer time. Callers
     that genuinely have no better signal (the standalone inbox watcher) may
     omit it and inherit the mtime fallback.
+
+    `max_retries` overrides `cfg.max_retries` for this call's failure bookkeeping.
+    Pass `None` for an operator-initiated retry: `mark_error` then increments
+    `retry_count` without ever escalating to `error_permanent`, which
+    `should_skip` treats as terminal. The budget exists to stop an *unattended*
+    sweep from looping forever; a human pressing a key is not that failure mode.
+
+    `reuse_existing_transcript` renders from an already-present `.aai.json`
+    instead of submitting again. The AAI response is written before render and
+    kept on render/Drive failure precisely so the retry is free (see the module
+    docstring); without this flag a post-payment failure costs a second
+    transcription of audio already paid for.
     """
     wav = Path(wav)
+    fail_max_retries = cfg.max_retries if max_retries is _UNSET else max_retries
     try:
         size = wav.stat().st_size
     except OSError as exc:
-        return _fail(state, cfg, state_key, f"failed to stat source: {exc}")
+        return _fail(state, cfg, state_key, f"failed to stat source: {exc}", fail_max_retries)
     if size > MAX_UPLOAD_BYTES:
         return _fail(
             state, cfg, state_key,
             f"source file is too large ({size} bytes > {MAX_UPLOAD_BYTES})",
+            fail_max_retries,
         )
 
     state.mark_in_flight(state_key)
@@ -70,30 +90,43 @@ def process_file(
     md_path = wav.parent / f"{wav.stem}.md"
 
     # --- AAI ---
-    # Invariant: once mark_in_flight is persisted (above), NO exception path may
-    # leave this entry `in_flight`. TranscriptionError/TimeoutError are the
-    # expected failures; the catch-all is defense in depth so an unanticipated
-    # exception (SDK/transport/anything) still transitions to a terminal `error`
-    # state rather than stranding the file. See
-    # bug_report_aai_exception_leak_strands_in_flight.md.
-    try:
-        transcript = aai_client.transcribe_file(wav)
-    except TranscriptionError as exc:
-        return _fail(state, cfg, state_key, str(exc))
-    except TimeoutError as exc:
-        return _fail(state, cfg, state_key, f"aai timeout: {exc}")
-    except Exception as exc:
-        return _fail(state, cfg, state_key, f"unexpected error during transcription: {exc}")
+    # `billed` is False only on the reuse path, where the transcript came off
+    # disk: the AAI job was already paid for and counted when it was written, so
+    # the lifetime counters below must not tick again.
+    transcript = _load_cached_transcript(aai_json_path) if reuse_existing_transcript else None
+    billed = transcript is None
+    if transcript is not None:
+        log.info("reusing cached transcript", extra={"key": state_key})
+    else:
+        # Invariant: once mark_in_flight is persisted (above), NO exception path may
+        # leave this entry `in_flight`. TranscriptionError/TimeoutError are the
+        # expected failures; the catch-all is defense in depth so an unanticipated
+        # exception (SDK/transport/anything) still transitions to a terminal `error`
+        # state rather than stranding the file. See
+        # bug_report_aai_exception_leak_strands_in_flight.md.
+        try:
+            transcript = aai_client.transcribe_file(wav)
+        except TranscriptionError as exc:
+            return _fail(state, cfg, state_key, str(exc), fail_max_retries)
+        except TimeoutError as exc:
+            return _fail(state, cfg, state_key, f"aai timeout: {exc}", fail_max_retries)
+        except Exception as exc:
+            return _fail(
+                state, cfg, state_key,
+                f"unexpected error during transcription: {exc}", fail_max_retries,
+            )
 
-    # Persist raw response (atomic write, 0600)
-    try:
-        _atomic_write_bytes(
-            aai_json_path,
-            (json.dumps(transcript, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
-            mode=0o600,
-        )
-    except OSError as exc:
-        return _fail(state, cfg, state_key, f"failed to persist .aai.json: {exc}")
+        # Persist raw response (atomic write, 0600)
+        try:
+            _atomic_write_bytes(
+                aai_json_path,
+                (json.dumps(transcript, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
+                mode=0o600,
+            )
+        except OSError as exc:
+            return _fail(
+                state, cfg, state_key, f"failed to persist .aai.json: {exc}", fail_max_retries,
+            )
 
     # --- Render ---
     try:
@@ -119,12 +152,12 @@ def process_file(
                 md_path.unlink()
             except OSError:
                 pass
-        return _fail(state, cfg, state_key, f"render failed: {exc}")
+        return _fail(state, cfg, state_key, f"render failed: {exc}", fail_max_retries)
 
     try:
         _atomic_write_bytes(md_path, md_text.encode("utf-8"), mode=0o600)
     except OSError as exc:
-        return _fail(state, cfg, state_key, f"failed to persist .md: {exc}")
+        return _fail(state, cfg, state_key, f"failed to persist .md: {exc}", fail_max_retries)
 
     # --- Drive ---
     drive_file_id: str | None = None
@@ -137,7 +170,7 @@ def process_file(
             if cfg.upload_raw_audio_to_drive:
                 drive_sync.upload(wav, year=year, month=month)
         except Exception as exc:
-            return _fail(state, cfg, state_key, f"drive upload failed: {exc}")
+            return _fail(state, cfg, state_key, f"drive upload failed: {exc}", fail_max_retries)
 
     speaker_count = _count_speakers(transcript)
     audio_seconds = float(transcript.get("audio_duration") or 0.0)
@@ -149,7 +182,8 @@ def process_file(
         speaker_count=speaker_count,
         drive_file_id=drive_file_id,
     )
-    state.increment_global(audio_seconds=audio_seconds)
+    if billed:
+        state.increment_global(audio_seconds=audio_seconds)
     state.save()
     log.info("complete", extra={"key": state_key, "aai_id": transcript.get("id")})
     return PipelineResult(status="done", drive_file_id=drive_file_id)
@@ -158,8 +192,31 @@ def process_file(
 # --- helpers ------------------------------------------------------------
 
 
-def _fail(state: State, cfg: Config, key: str, error: str) -> PipelineResult:
-    state.mark_error(key, error, max_retries=cfg.max_retries)
+def _load_cached_transcript(aai_json_path: Path) -> dict | None:
+    """Return the transcript from a previously-written `.aai.json`, or None.
+
+    None means "no usable cache — submit normally". Absent, empty, unreadable and
+    malformed all collapse to that, because the fallback is correct in every case
+    and silently producing nothing would be worse than paying again.
+    """
+    try:
+        raw = aai_json_path.read_text()
+    except OSError:
+        return None
+    if not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _fail(
+    state: State, cfg: Config, key: str, error: str, max_retries: int | None = _UNSET
+) -> PipelineResult:  # type: ignore[assignment]
+    resolved = cfg.max_retries if max_retries is _UNSET else max_retries
+    state.mark_error(key, error, max_retries=resolved)
     state.save()
     log.warning("error", extra={"key": key, "error": error})
     return PipelineResult(status="error", error=error)

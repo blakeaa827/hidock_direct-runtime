@@ -153,3 +153,22 @@ def test_keys_active_in_connected_idle_and_scanning() -> None:
     # SCANNING was relaxed on 2026-04-23 — see keys_active_in_state docstring.
     assert keys_active_in_state("CONNECTED_IDLE") is True
     assert keys_active_in_state("SCANNING") is True
+
+
+def test_retry_key_active_without_a_device() -> None:
+    """`r` must work in IDLE_DISCONNECTED — the state the app sits in when the
+    operator comes back after topping up their AssemblyAI balance. This is why
+    it gets its own predicate instead of widening keys_active_in_state."""
+    from hidock_direct.tui_handlers import retry_key_active_in_state
+
+    assert retry_key_active_in_state("IDLE_DISCONNECTED") is True
+    assert retry_key_active_in_state("CONNECTED_IDLE") is True
+    assert retry_key_active_in_state("SCANNING") is True
+    assert retry_key_active_in_state("DRAINING") is False
+
+
+def test_whisper_unknown_gate_is_unchanged_by_the_retry_binding() -> None:
+    """The device-dependent bindings must NOT have been widened as a side
+    effect of making `r` device-independent."""
+    assert keys_active_in_state("IDLE_DISCONNECTED") is False
+    assert keys_active_in_state("DRAINING") is False

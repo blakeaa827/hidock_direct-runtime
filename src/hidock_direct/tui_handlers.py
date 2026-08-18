@@ -113,3 +113,18 @@ def keys_active_in_state(state: str) -> bool:
     a new operator-initiated transfer on the same adapter.
     """
     return state in ("CONNECTED_IDLE", "SCANNING")
+
+
+def retry_key_active_in_state(state: str) -> bool:
+    """`r` (retry failed transcriptions) works without a device attached.
+
+    Deliberately separate from `keys_active_in_state` rather than widening it:
+    that predicate gates `w`/`u`, which genuinely need the device on the bus.
+    Retry reads the archive and the transcription ledger, so IDLE_DISCONNECTED —
+    the state the app sits in when the operator wanders back after topping up
+    their AssemblyAI balance — is its primary case, not an edge case.
+
+    DRAINING stays excluded: a retry batch should not compete with an active
+    download for the same AssemblyAI quota and the same ledger.
+    """
+    return state in ("IDLE_DISCONNECTED", "CONNECTED_IDLE", "SCANNING")

@@ -12,7 +12,7 @@ import sys
 from .app import App
 from .config import load_config, load_env_file_into_environ
 from .device import JensenDeviceAdapter
-from .events import EventBus, TranscribeSkipped
+from .events import Error, EventBus, RetryCandidatesDetected, Severity, TranscribeSkipped
 from .locks import FileLock, LockHeld
 from .offload import Offloader
 from .state import StateStore
@@ -47,6 +47,44 @@ def _preflight_transcribe(bus: EventBus) -> None:
                 reason="diarize_audio not importable at startup",
             )
         )
+
+
+def load_retry_candidates(archive_dir, *, state=None):
+    """Failed ledger entries under `archive_dir`, for the `r` binding.
+
+    `state` is a test seam; production reads the real transcription ledger.
+    Raises `LedgerUnavailable` when the ledger or the archive cannot be read —
+    callers must surface that, never render it as "nothing to retry".
+    """
+    from pathlib import Path
+
+    from .retry import find_retry_candidates, load_diarize_state
+
+    return find_retry_candidates(
+        load_diarize_state(archive_dir) if state is None else state, Path(archive_dir)
+    )
+
+
+def publish_retry_candidate_count(bus: EventBus, provider) -> None:
+    """Seed the footer badge from the ledger at startup.
+
+    A ledger we could not read is published as an `Error` naming the path — not
+    as a count of zero. "Nothing to retry" has to mean the ledger said so; the
+    2026-08-13 recovery run reported `0 candidates` against the wrong archive
+    and read as a clean bill of health.
+    """
+    try:
+        candidates = provider()
+    except Exception as exc:
+        bus.publish(
+            Error(
+                message=f"retry candidates unavailable: {exc}",
+                severity=Severity.WARNING,
+                context="startup",
+            )
+        )
+        return
+    bus.publish(RetryCandidatesDetected(count=len(candidates)))
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept for future flags
@@ -92,15 +130,26 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         bus=bus,
         poll_interval_seconds=config.poll_interval_seconds,
     )
+    from .retry import run_retry_batch
+
+    retry_provider = lambda: load_retry_candidates(config.archive_dir)  # noqa: E731
     tui = TUI(
         bus=bus,
         app=app,
         pending_whispers_provider=lambda: app._pending_whispers,
         pending_unknowns_provider=lambda: app._pending_unknowns,
+        retry_candidates_provider=retry_provider,
+        retry_runner=lambda selected: run_retry_batch(
+            selected, config.archive_dir, bus=bus
+        ),
     )
 
     if config.transcribe_on_offload:
         _preflight_transcribe(bus)
+
+    # Seed the footer badge before the render thread starts. The TUI subscribes
+    # to the bus in its constructor, so this reaches it even pre-start().
+    publish_retry_candidate_count(bus, retry_provider)
 
     def _shutdown(signum, frame):  # noqa: ARG001
         app.stop()

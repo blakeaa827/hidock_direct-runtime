@@ -74,6 +74,29 @@ right after it downloads.
   ```
 - Press `Ctrl-C` to quit; in-flight work finishes and state is saved.
 
+### Keys
+
+The TUI is interactive. Keys work while it is running; nothing needs to be typed
+into a prompt.
+
+| Key | What it does | Available when |
+|---|---|---|
+| `w` | Pick which **whispers** to pull off the device. Whispers are short voice memos; they are listed rather than offloaded automatically so a long meeting recording never waits behind them. | Device connected |
+| `u` | Route recordings the classifier could not identify as a meeting or a whisper — you choose per file. | Device connected |
+| `r` | **Retry failed transcriptions.** Shows how many failed, roughly what re-running costs, and what it is skipping; then `y` runs it, `f` also includes what was skipped, `esc` cancels. If none of them can be retried — e.g. the audio has since been deleted — it says so and only offers `esc`. | Any time except during a download — no device needed |
+| `Ctrl-C` | Quit. In-flight work finishes and state is saved. | Always |
+
+The footer tells you when there is something to act on — e.g. `2 whispers on
+device [press w to pick]` or `3 failed transcriptions [press r to retry]`. When
+the footer is quiet, there is nothing waiting.
+
+**Why `r` exists.** Transcription costs money, so most people run AssemblyAI with
+a prepaid balance. When that balance runs out mid-run, the recordings still
+download fine but their transcripts fail, and the app records the failure rather
+than losing it. Top the balance up, press `r`, and it re-runs only what failed.
+Recordings whose transcript was already paid for are re-rendered rather than
+re-purchased, so you are not billed twice for the same audio.
+
 ## 5. Troubleshooting
 
 - **"Access denied to device" / device won't connect.** Another app is holding
