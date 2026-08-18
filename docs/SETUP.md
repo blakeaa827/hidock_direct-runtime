@@ -83,7 +83,7 @@ into a prompt.
 |---|---|---|
 | `w` | Pick which **whispers** to pull off the device. Whispers are short voice memos; they are listed rather than offloaded automatically so a long meeting recording never waits behind them. | Device connected |
 | `u` | Route recordings the classifier could not identify as a meeting or a whisper — you choose per file. | Device connected |
-| `r` | **Retry failed transcriptions.** Shows how many failed, roughly what re-running costs, and what it is skipping; then `y` runs it, `f` also includes what was skipped, `esc` cancels. | Any time except during a download — no device needed |
+| `r` | **Retry failed transcriptions.** Shows how many failed, roughly what re-running costs, and what it is skipping; then `y` runs it, `f` also includes what was skipped, `esc` cancels. If none of them can be retried — e.g. the audio has since been deleted — it says so and only offers `esc`. | Any time except during a download — no device needed |
 | `Ctrl-C` | Quit. In-flight work finishes and state is saved. | Always |
 
 The footer tells you when there is something to act on — e.g. `2 whispers on
