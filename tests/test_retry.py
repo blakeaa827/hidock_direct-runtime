@@ -310,7 +310,7 @@ def test_summary_splits_billable_from_free_and_counts_exclusions(tmp_path):
     assert s["selected"] == 2
     assert s["to_transcribe"] == 1
     assert s["re_render"] == 1, "a paid transcript costs nothing to re-render"
-    assert s["excluded"] == {"retrying will not help": 1, "file missing from archive": 1}
+    assert s["excluded"] == {"retrying will not help": 1, "missing from the archive": 1}
 
 
 def test_unreadable_duration_is_reported_as_unknown_not_zero(tmp_path):

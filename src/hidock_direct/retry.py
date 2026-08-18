@@ -117,7 +117,7 @@ class RetryCandidate:
     @property
     def exclusion_reason(self) -> Optional[str]:
         if not self.exists_on_disk:
-            return "file missing from archive"
+            return "missing from the archive"
         if self.status == _STATUS_ERROR_PERMANENT:
             return "retry budget exhausted"
         if self.error_class == CLASS_PERMANENT_DATA:
@@ -392,6 +392,24 @@ def format_retry_confirm(summary: dict, *, price_per_min: float = _PRICE_PER_MIN
     """
     total = summary["total"]
     noun = "transcription" if total == 1 else "transcriptions"
+    excluded = summary["excluded"]
+    breakdown = ", ".join(f"{n} {reason}" for reason, n in sorted(excluded.items()))
+
+    # Nothing the operator can do: every candidate is excluded AND `f` cannot
+    # rescue any of them. State it instead of asking a question whose every
+    # answer is a no-op — `y` and `f` would both select zero and close.
+    #
+    # Reachable only when every candidate's audio is gone: the other two
+    # exclusion reasons both require the file to be on disk, so they are always
+    # forceable and always land in the question form below.
+    if not summary["selected"] and not summary["forceable"]:
+        return [
+            f"{total} failed {noun}, none retryable.",
+            f"  {breakdown}",
+            "  The audio is no longer in the archive, so there is nothing to re-run.",
+            "  [esc] dismiss",
+        ]
+
     lines = [f"Retry {total} failed {noun}?"]
 
     to_transcribe = summary["to_transcribe"]
@@ -409,12 +427,14 @@ def format_retry_confirm(summary: dict, *, price_per_min: float = _PRICE_PER_MIN
     if re_render:
         lines.append(f"  {re_render} already paid — re-render only, $0")
 
-    excluded = summary["excluded"]
     if excluded:
-        breakdown = ", ".join(f"{n} {reason}" for reason, n in sorted(excluded.items()))
-        lines.append(f"  {sum(excluded.values())} excluded: {breakdown}   [f to include]")
+        # The hint is offered only when `f` can actually admit something —
+        # otherwise it promises an inclusion that its own predicate refuses.
+        hint = "   [f to include]" if summary["forceable"] else ""
+        lines.append(f"  {sum(excluded.values())} excluded: {breakdown}{hint}")
 
-    lines.append("  [y] start   [f] force-include   [esc] cancel")
+    keys = "  [y] start   " + ("[f] force-include   " if summary["forceable"] else "") + "[esc] cancel"
+    lines.append(keys)
     return lines
 
 
@@ -429,6 +449,10 @@ def summarize(candidates: Iterable[RetryCandidate]) -> dict:
         reason = c.exclusion_reason
         if reason:
             excluded[reason] = excluded.get(reason, 0) + 1
+    # What `f` would add beyond the default set. A candidate whose audio is
+    # gone cannot be forced by anyone, so it is not counted here — offering
+    # `[f to include]` for it would be an affordance that contradicts itself.
+    forceable = [c for c in items if c.exclusion_reason and c.exists_on_disk]
     hours = sum(c.duration_minutes for c in to_transcribe) / 60.0
     known = [c for c in to_transcribe if c.duration_minutes > 0]
     return {
@@ -439,4 +463,5 @@ def summarize(candidates: Iterable[RetryCandidate]) -> dict:
         "hours": hours,
         "duration_known": len(known) == len(to_transcribe),
         "excluded": excluded,
+        "forceable": len(forceable),
     }

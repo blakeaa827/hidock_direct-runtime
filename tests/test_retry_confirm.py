@@ -79,7 +79,7 @@ def test_confirm_shows_count_hours_cost_and_excluded_breakdown():
     assert "$0.32" in text, "1.5h at the `best` rate of $0.21/h"
     assert "1 already paid" in text and "$0" in text
     assert "2 excluded" in text
-    assert "retrying will not help" in text and "file missing from archive" in text
+    assert "retrying will not help" in text and "missing from the archive" in text
     assert "[y] start" in text and "[f] force-include" in text and "[esc] cancel" in text
 
 
@@ -347,3 +347,104 @@ def test_a_crashing_batch_reports_a_redacted_message():
     assert messages, "a crashing batch must surface an Error"
     assert not any("cdn.assemblyai.com/upload" in m for m in messages)
     assert any("<upload-url redacted>" in m for m in messages)
+
+
+# -- the all-excluded set: the operator's real steady state -------------------
+#
+# Regression tests for bug_report_retry_confirm_is_a_dead_end_when_all_candidates_excluded.md.
+# On the operator's machine every ledger candidate is `file missing from archive`,
+# so the confirm asked a question with no answer and offered `[f to include]` for
+# files that cannot be included.
+
+
+def _all_missing():
+    return [_cand(f"2026/04/{n}.mp3", exists=False, minutes=0.0) for n in "abcdef"]
+
+
+def test_confirm_omits_the_force_include_hint_when_f_cannot_act():
+    """`f` filters on exists_on_disk, and `file missing from archive` is exactly
+    why those entries are excluded — the affordance contradicts itself."""
+    text = " ".join(format_retry_confirm(summarize(_all_missing())))
+
+    assert "[f to include]" not in text
+    assert "[f] force-include" not in text
+
+
+def test_confirm_states_none_retryable_instead_of_asking():
+    """A question with no answer that does anything is worse than a statement."""
+    text = " ".join(format_retry_confirm(summarize(_all_missing())))
+
+    assert "[y] start" not in text, "must not offer to start a batch of nothing"
+    assert "none retryable" in text
+    assert "no longer in the archive" in text
+    assert "[esc]" in text, "the operator still needs a way out"
+
+
+def test_confirm_keeps_the_hint_when_f_can_act():
+    """Guard against over-correcting into never showing it: an excluded
+    candidate that IS on disk is exactly what `f` exists for."""
+    candidates = [
+        _cand("2026/08/a.mp3", error="no spoken audio", minutes=5.0),  # excluded, on disk
+        _cand("2026/08/b.mp3", minutes=60.0),                          # selectable
+    ]
+
+    text = " ".join(format_retry_confirm(summarize(candidates)))
+
+    assert "[f to include]" in text
+    assert "[y] start" in text, "a mixed set still asks the question"
+
+
+def test_excluded_breakdown_reads_correctly_for_one_and_for_many():
+    one = " ".join(format_retry_confirm(summarize(_all_missing()[:1])))
+    many = " ".join(format_retry_confirm(summarize(_all_missing())))
+
+    assert "1 missing from the archive" in one
+    assert "6 missing from the archive" in many
+    assert "file missing from archive" not in many, "singular noun, plural count"
+
+
+def test_pressing_r_with_no_actionable_candidates_still_opens_the_confirm():
+    """Opening is correct — the operator needs to see WHY there is nothing to do.
+    The panel's content is what changes, not whether it appears."""
+    tui = TUI(bus=EventBus(), retry_candidates_provider=_all_missing)
+    tui._state = "IDLE_DISCONNECTED"
+
+    tui._on_key("r")
+
+    assert tui._retry_confirm is not None
+    assert "none retryable" in _text(tui._render())
+
+
+def test_the_operators_real_set_renders_the_statement_not_the_question():
+    """The exact shape from the 2026-08-18 screenshot: 6 candidates, all with
+    their audio deleted."""
+    tui = TUI(bus=EventBus(), retry_candidates_provider=_all_missing)
+    tui._state = "IDLE_DISCONNECTED"
+    tui._on_key("r")
+
+    text = _text(tui._render())
+
+    assert "6 failed transcriptions, none retryable" in text
+    assert "[y] start" not in text and "[f] force-include" not in text
+
+
+def test_hint_is_absent_when_the_only_excluded_candidates_are_missing():
+    """The combination the statement branch hides: something IS retryable, so the
+    confirm asks the question — but the excluded entries are all missing from
+    disk, so `f` would still add nothing and must not be offered.
+
+    Found by mutation: ungating the hint left every other test green, because the
+    all-excluded set returns early before the hint line is ever reached."""
+    candidates = [
+        _cand("2026/08/a.mp3", minutes=60.0),              # selectable
+        _cand("2026/04/b.mp3", exists=False, minutes=0.0),  # excluded, unforceable
+    ]
+    summary = summarize(candidates)
+    assert summary["selected"] == 1 and summary["forceable"] == 0, "fixture precondition"
+
+    text = " ".join(format_retry_confirm(summary))
+
+    assert "[y] start" in text, "the question is still worth asking"
+    assert "1 excluded" in text and "missing from the archive" in text
+    assert "[f to include]" not in text
+    assert "[f] force-include" not in text
