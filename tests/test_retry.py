@@ -358,3 +358,82 @@ def test_transcribe_file_accepts_every_kwarg_the_retry_batch_passes():
     # Binding is the real check: presence in `parameters` would still allow a
     # positional-only parameter that cannot be passed by keyword.
     signature.bind(Path("a.mp3"), Path("/archive"), **{name: None for name in passed})
+
+
+# -- the marker vocabulary must match what AssemblyAI actually says ---------
+#
+# Captured from the live API 2026-08-20 by running the real client with a bogus
+# key: AAI reports a bad key at the upload step, with neither "401" nor
+# "Unauthorized" in the text, so classify_failure returned `transient` and the
+# batch never named the operator-actionable cause. The marker AND the fixture
+# that ratified it were both authored from one guess about what the API emits.
+
+INVALID_KEY_ERROR = (
+    "AssemblyAI request failed: Failed to upload audio file: Invalid API key"
+)
+
+
+def test_invalid_api_key_is_operator_actionable():
+    """Captured response, not an authored proxy. Retrying with the same key
+    fails identically forever, which is what the class means."""
+    assert classify_failure(INVALID_KEY_ERROR) == CLASS_OPERATOR_ACTIONABLE
+
+
+def test_transient_upload_failure_stays_transient():
+    """Guards the over-correction: not every upload failure is a key problem.
+    A dropped connection mid-upload is worth retrying."""
+    assert classify_failure(
+        "AssemblyAI request failed: Failed to upload audio file: "
+        "[Errno 54] Connection reset by peer"
+    ) == CLASS_TRANSIENT
+
+
+def test_bad_key_batch_aborts_naming_the_key(tmp_path):
+    """The abort must say what to fix. Falling through to the generic
+    '2 failures in a row' message is the symptom this bug is about."""
+    root, cands, seen, fake = _runner(tmp_path, ["2026/08/a.mp3", "2026/08/b.mp3"])
+    outcome = run_retry_batch(
+        cands, root, bus=EventBus(), transcribe=fake,
+        load_entry=lambda k: {"status": "error", "error": INVALID_KEY_ERROR},
+    )
+    assert outcome.aborted_reason, "an invalid key must stop the batch"
+    assert "failures in a row" not in outcome.aborted_reason, (
+        "aborted on the consecutive-failure fallback rather than on the key"
+    )
+    assert "ASSEMBLYAI_API_KEY" in outcome.aborted_reason
+    assert len(seen) == 1, "must stop on the first file, not work through the set"
+
+
+def test_every_operator_actionable_marker_has_a_specific_remediation():
+    """Agreement test. The marker vocabulary is implemented twice — once to
+    classify (`_OPERATOR_ACTIONABLE_MARKERS`) and once to choose the message
+    (`_remediation`'s branches). A marker with no branch classifies as
+    actionable and then renders the raw error, which is the generic fallback
+    wearing the actionable label."""
+    from hidock_direct.retry import _OPERATOR_ACTIONABLE_MARKERS, _remediation
+
+    for marker in _OPERATOR_ACTIONABLE_MARKERS:
+        err = f"AssemblyAI request failed: {marker} something"
+        assert classify_failure(err) == CLASS_OPERATOR_ACTIONABLE
+        assert _remediation(err) != redact(err), (
+            f"marker {marker!r} classifies as operator-actionable but "
+            f"_remediation has no branch for it — it falls through to the "
+            f"generic raw-error message"
+        )
+
+
+def test_operator_actionable_markers_record_whether_they_were_observed():
+    """Provenance, per entry. The block claimed 'Verified against the live API'
+    over all five markers; two were authored strings nobody had seen the API
+    emit, and one of those could not be produced at all. An honest annotation
+    is what makes that visible by reading."""
+    src = (Path(__file__).resolve().parent.parent / "src" / "hidock_direct" / "retry.py").read_text()
+    block = src.split("_OPERATOR_ACTIONABLE_MARKERS = (")[1].split(")")[0]
+    entries = [ln for ln in block.splitlines() if ln.strip().startswith('"')]
+    assert entries, "marker block not found"
+    for line in entries:
+        assert "captured" in line or "unobserved" in line, (
+            f"marker line lacks a provenance annotation: {line.strip()!r}. "
+            "Every entry must say whether the text was captured from the live "
+            "API or authored without observation."
+        )

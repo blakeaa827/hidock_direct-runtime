@@ -48,14 +48,34 @@ _STATUS_IN_FLIGHT = "in_flight"
 # `_fail` persists the real AssemblyAI message — `transcribe_file` discards it
 # and publishes only `pipeline status='error'`.
 #
-# Each entry records the text as observed and when. Verified against the live
-# API 2026-07-30 and against production ledger entries 2026-08-12.
+# Provenance is per entry, not per block. An earlier version claimed the whole
+# list was "verified against the live API", which was true of the balance
+# markers and false of the auth ones — and the auth guess was wrong: AAI reports
+# a bad key as "Invalid API key" at the upload step, so a real bad key scored
+# `transient` and the batch never named the cause.
+#
+#   captured   — the text was seen coming out of the API, or read from a
+#                production ledger entry. The date says when.
+#   unobserved — nobody has seen this text, but a named mechanism produces it.
+#                `assemblyai_client.py` stringifies a caught `httpx.HTTPError`
+#                into the ledger, and httpx renders a status error as
+#                "Client error '401 Unauthorized' for url ...", so both tokens
+#                appear whenever the SDK lets one through instead of converting
+#                it. Kept for that reason, not on the theory that it might match.
+#
+# A marker that is neither — no observation and no mechanism — belongs deleted,
+# not annotated. "ConfigError" was one: it is raised by `Config.from_env()` and
+# `DriveSync.default()`, both of which run in `_run_pipeline` BEFORE
+# `process_file` is entered, and only `process_file` writes the ledger. Verified
+# 2026-08-20 by running a retired SPEECH_MODEL end to end: the ledger is never
+# touched, and the operator learns the cause through `LedgerUnavailable`, whose
+# message quotes the ConfigError text.
 _OPERATOR_ACTIONABLE_MARKERS = (
-    "balance is negative",           # 2026-08-11/12, 12 production entries
-    "Please top up",                 # same message, second clause
-    "401",                           # invalid / revoked key
-    "Unauthorized",
-    "ConfigError",                   # retired model ID, caught at startup
+    "balance is negative",  # captured 2026-08-11/12, 12 production entries
+    "Please top up",        # captured, same message, second clause
+    "Invalid API key",      # captured 2026-08-20, live API, bogus key at upload
+    "401",                  # unobserved — reachable via httpx status stringification
+    "Unauthorized",         # unobserved — same mechanism as 401
 )
 
 # Failures the audio itself causes. Retrying re-uploads and fails identically.
@@ -353,10 +373,8 @@ def _remediation(error: str) -> str:
             "AssemblyAI balance is negative — top up at assemblyai.com, then press r again. "
             "Nothing was billed."
         )
-    if "401" in error or "Unauthorized" in error:
+    if "401" in error or "Unauthorized" in error or "Invalid API key" in error:
         return "AssemblyAI rejected the API key — check ASSEMBLYAI_API_KEY in .env."
-    if "ConfigError" in error:
-        return f"Configuration problem: {redact(error)}"
     return redact(error)
 
 
