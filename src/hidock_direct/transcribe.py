@@ -27,6 +27,14 @@ log = logging.getLogger(__name__)
 
 _AVAILABLE: Optional[bool] = None
 
+# Mirrors `diarize_audio.pipeline._UNSET`: `max_retries=None` means "never
+# escalate to error_permanent" and is NOT the same as "the caller didn't pass
+# it" (which means "use cfg.max_retries"). Declared locally rather than imported
+# so that the default is available without importing diarize_audio at module
+# load — this module must stay importable when diarize_audio is not, which is
+# the whole reason `_check_available` exists.
+_UNSET: Any = object()
+
 
 def _check_available() -> bool:
     global _AVAILABLE
@@ -41,7 +49,12 @@ def _check_available() -> bool:
 
 
 def _run_pipeline(
-    audio_path: Path, archive_dir: Path, recorded_at: Optional[datetime] = None
+    audio_path: Path,
+    archive_dir: Path,
+    recorded_at: Optional[datetime] = None,
+    *,
+    max_retries: Any = _UNSET,
+    reuse_existing_transcript: bool = False,
 ) -> Any:
     """Build the diarize_audio session and run `process_file` against one audio.
 
@@ -76,6 +89,13 @@ def _run_pipeline(
         drive_sync = DriveSync.default(cfg.drive_root_folder_name)
 
     state_key = str(audio_path.relative_to(archive_dir))
+
+    # Only forward max_retries when the caller actually supplied it, so the
+    # unattended offload path keeps inheriting cfg.max_retries. Passing our own
+    # sentinel through would be wrong — process_file compares against *its*
+    # sentinel by identity.
+    budget = {} if max_retries is _UNSET else {"max_retries": max_retries}
+
     return process_file(
         wav=audio_path,
         state_key=state_key,
@@ -88,6 +108,8 @@ def _run_pipeline(
         # start. Resolve from the device report, or from the basename we minted
         # from it when re-running without a device.
         recorded_at=resolve_recorded_at(audio_path, recorded_at),
+        reuse_existing_transcript=reuse_existing_transcript,
+        **budget,
     )
 
 
@@ -98,6 +120,8 @@ def transcribe_file(
     bus: EventBus,
     device_filename: str,
     recorded_at: Optional[datetime] = None,
+    max_retries: Any = _UNSET,
+    reuse_existing_transcript: bool = False,
 ) -> Optional[str]:
     """Run the diarize_audio pipeline on a single file.
 
@@ -123,7 +147,13 @@ def transcribe_file(
     bus.publish(TranscribeStarted(device_filename=device_filename))
 
     try:
-        result = _run_pipeline(audio_path, archive_dir, recorded_at)
+        result = _run_pipeline(
+            audio_path,
+            archive_dir,
+            recorded_at,
+            max_retries=max_retries,
+            reuse_existing_transcript=reuse_existing_transcript,
+        )
     except Exception as exc:
         reason = str(exc) or exc.__class__.__name__
         log.exception("transcribe_file crashed for %s", audio_path.name)

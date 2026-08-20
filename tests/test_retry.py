@@ -8,12 +8,14 @@ would bury the files it exists to recover.
 
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from hidock_direct import transcribe as transcribe_mod
 from hidock_direct.events import EventBus
 from hidock_direct.retry import (
     CLASS_OPERATOR_ACTIONABLE,
@@ -26,6 +28,7 @@ from hidock_direct.retry import (
     run_retry_batch,
     summarize,
 )
+from tests.conftest import call_kwargs_in, faithful
 
 BALANCE_ERROR = (
     "AssemblyAI request failed: failed to transcribe url "
@@ -178,7 +181,11 @@ def _runner(tmp_path, entries_after, *, calls=None):
         seen.append((path.name, kw))
         return None
 
-    return root, cands, seen, fake_transcribe
+    # Bound to the real seam's signature. A double that accepts more than
+    # `transcribe_file` does is what let the kwarg mismatch ship green through
+    # 278 tests — `**kw` here silently absorbed `max_retries` and
+    # `reuse_existing_transcript`, which production rejects at the call.
+    return root, cands, seen, faithful(transcribe_mod.transcribe_file, fake_transcribe)
 
 
 def test_operator_retry_never_escalates(tmp_path):
@@ -281,7 +288,9 @@ def test_missing_file_is_skipped_not_attempted(tmp_path):
 
     outcome = run_retry_batch(
         cands, root, bus=EventBus(),
-        transcribe=lambda p, a, **kw: seen.append(p.name),
+        transcribe=faithful(
+            transcribe_mod.transcribe_file, lambda p, a, **kw: seen.append(p.name)
+        ),
         load_entry=lambda k: {"status": "done"},
     )
     assert seen == ["here.mp3"]
@@ -320,3 +329,32 @@ def test_unreadable_duration_is_reported_as_unknown_not_zero(tmp_path):
     s = summarize(find_retry_candidates(_FakeState({"2026/08/a.mp3": _entry()}), root))
     assert s["to_transcribe"] == 1
     assert s["duration_known"] is False
+
+
+# -- the seam's contract ---------------------------------------------------
+#
+# 02584c8 wrote `run_retry_batch` against `process_file`'s contract (which had
+# just gained max_retries + reuse_existing_transcript at diarize 7149f63) but
+# never widened `transcribe_file`, the bridge between them. Every double here
+# was `**kw`-permissive, so nothing in 278 tests bound the real signature and
+# the entire retry execution path shipped dead. Found by the Gate 4 PoL on the
+# first batch that reached a selectable candidate.
+
+
+def test_transcribe_file_accepts_every_kwarg_the_retry_batch_passes():
+    """The production default of the `transcribe` seam must accept what the
+    batch actually passes. Kwargs are read from the call site, not restated, so
+    a future argument is covered without anyone updating this test."""
+    src = Path(__file__).resolve().parent.parent / "src" / "hidock_direct"
+    passed = call_kwargs_in(src / "retry.py", "transcribe")
+
+    signature = inspect.signature(transcribe_mod.transcribe_file)
+    rejected = [name for name in passed if name not in signature.parameters]
+    assert not rejected, (
+        f"run_retry_batch passes {rejected} but transcribe_file accepts "
+        f"{sorted(signature.parameters)} — every batch dies on file 1"
+    )
+
+    # Binding is the real check: presence in `parameters` would still allow a
+    # positional-only parameter that cannot be passed by keyword.
+    signature.bind(Path("a.mp3"), Path("/archive"), **{name: None for name in passed})

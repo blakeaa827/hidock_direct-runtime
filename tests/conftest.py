@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import shutil
 import subprocess
 import wave
@@ -98,3 +100,77 @@ def offloader(archive_dir: Path, mock_device: MockDevice, state_store: StateStor
         delete_after_offload=False,
         sleep=lambda *_a, **_k: None,  # no-op so size-stable check doesn't actually sleep
     )
+
+
+# -- injection-seam contract helpers ---------------------------------------
+#
+# `run_retry_batch` calls its `transcribe` seam with kwargs the production
+# default (`transcribe.transcribe_file`) did not accept, and every double in the
+# suite was `def f(path, archive, **kw)` — strictly more permissive than the real
+# collaborator, so it accepted calls production refused and the whole retry
+# execution path shipped dead. See
+# planning/bug_report_retry_batch_calls_transcribe_file_with_unsupported_kwargs.md.
+#
+# `faithful` makes a double refuse exactly what the real function refuses;
+# `call_kwargs_in` derives the caller's kwarg set from the call site itself, so
+# the contract test can't drift from the code it is checking.
+
+
+def faithful(real, impl):
+    """Wrap a test double so it refuses any call the real function would refuse.
+
+    The double stays free to fake behaviour; it loses only the freedom to accept
+    an argument list production would reject.
+    """
+    signature = inspect.signature(real)
+
+    def _double(*args, **kwargs):
+        signature.bind(*args, **kwargs)
+        return impl(*args, **kwargs)
+
+    _double.__name__ = getattr(impl, "__name__", "faithful_double")
+    return _double
+
+
+def call_sites_of(module_path: Path, callee: str) -> List[tuple]:
+    """Every `<callee>(...)` call in a module as (positional_count, kwarg_names).
+
+    Derived from the source rather than restated, so a new argument at the call
+    site is covered without anyone remembering to update the test.
+    """
+    tree = ast.parse(module_path.read_text())
+    sites = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == callee:
+            sites.append((len(node.args), [kw.arg for kw in node.keywords if kw.arg]))
+    if not sites:
+        raise AssertionError(f"no `{callee}(...)` call found in {module_path.name}")
+    return sites
+
+
+def call_kwargs_in(module_path: Path, callee: str) -> List[str]:
+    """Keyword names passed at every `<callee>(...)` call in a module."""
+    return [name for _, names in call_sites_of(module_path, callee) for name in names]
+
+
+def injection_seams(module_path: Path) -> List[tuple]:
+    """Seams of the shape `name = name or <default>` as (name, default_node).
+
+    The left name must equal the first alternative, which is what distinguishes
+    an injectable collaborator from ordinary value coalescing
+    (`when = device_mtime or fallback_mtime` is not a seam).
+    """
+    tree = ast.parse(module_path.read_text())
+    seams = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target, value = node.targets[0], node.value
+        if not isinstance(target, ast.Name):
+            continue
+        if not (isinstance(value, ast.BoolOp) and isinstance(value.op, ast.Or)):
+            continue
+        first = value.values[0]
+        if isinstance(first, ast.Name) and first.id == target.id:
+            seams.append((target.id, value.values[1]))
+    return seams

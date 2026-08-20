@@ -286,3 +286,52 @@ def test_every_wiring_helper_is_actually_called_by_main():
         f"{orphans} are defined in __main__.py but never reached from main() — "
         f"a wiring helper nothing calls is exactly this bug's shape"
     )
+
+
+def test_every_injection_seam_default_accepts_what_its_call_site_passes():
+    """Third structural sweep: an injectable collaborator's *production default*
+    must accept the arguments its own module passes.
+
+    `run_retry_batch` called its `transcribe` seam with `max_retries` and
+    `reuse_existing_transcript` — both correct against `process_file`, which had
+    gained them for exactly this feature — while the production default,
+    `transcribe_file`, accepted neither. Every double in the suite was
+    `**kw`-permissive, so a double was strictly more forgiving than the real
+    collaborator and 278 tests could not see it. The retry execution path
+    shipped dead and stayed dead through a merge to master.
+
+    Sweeping seams rather than asserting one signature is the point: this covers
+    the seam nobody has written yet.
+    """
+    from hidock_direct import transcribe as transcribe_mod
+    from hidock_direct.retry import _default_load_entry
+    from tests.conftest import call_sites_of, injection_seams
+
+    module = SRC / "retry.py"
+
+    # Enumerate-and-classify, matching the sweeps above: a newly-added seam
+    # fails here until someone states what its production default resolves to,
+    # rather than being silently skipped.
+    resolvers = {
+        "transcribe": lambda: transcribe_mod.transcribe_file,
+        "load_entry": lambda: _default_load_entry(pathlib.Path("/archive")),
+    }
+    found = {name for name, _ in injection_seams(module)}
+    assert found == set(resolvers), (
+        f"injection seams in retry.py changed: {found ^ set(resolvers)}. "
+        "Add the new seam's production default to `resolvers` so its contract "
+        "is checked, or remove the stale entry."
+    )
+
+    for name, resolve in resolvers.items():
+        real = resolve()
+        signature = inspect.signature(real)
+        for positional, kwargs in call_sites_of(module, name):
+            try:
+                signature.bind(*([None] * positional), **{k: None for k in kwargs})
+            except TypeError as exc:
+                raise AssertionError(
+                    f"`{name}(...)` in retry.py passes {kwargs} but its production "
+                    f"default {real.__module__}.{real.__qualname__} accepts "
+                    f"{sorted(signature.parameters)} — {exc}"
+                ) from None
