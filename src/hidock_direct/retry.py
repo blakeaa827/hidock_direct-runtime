@@ -295,68 +295,102 @@ def run_retry_batch(
     transcribe = transcribe or transcribe_mod.transcribe_file
     load_entry = load_entry or _default_load_entry(archive_dir)
 
+    # `list()` stays OUTSIDE the try below: it runs before any RetryProgress, so
+    # if it raises the run region was never entered, and publishing a 0/0/0/0
+    # summary would *create* a region rather than settle one.
     items = list(candidates)
     outcome = RetryOutcome()
     consecutive = 0
+    index = -1
 
-    for index, cand in enumerate(items):
-        if not cand.exists_on_disk:
-            outcome.not_attempted += 1
-            continue
+    try:
+        for index, cand in enumerate(items):
+            if not cand.exists_on_disk:
+                outcome.not_attempted += 1
+                continue
 
-        # FR-11: progress goes on the bus, not the log — the log holds ten
-        # entries and a 12-file run would evict its own summary.
-        bus.publish(
-            RetryProgress(index=index + 1, total=len(items), filename=cand.path.name)
-        )
-
-        transcribe(
-            cand.path,
-            Path(archive_dir),
-            bus=bus,
-            device_filename=cand.path.name,
-            recorded_at=None,
-            max_retries=None,
-            reuse_existing_transcript=cand.has_paid_transcript,
-        )
-
-        entry = load_entry(cand.state_key) or {}
-        if entry.get("status") == "done":
-            consecutive = 0
-            if cand.has_paid_transcript:
-                outcome.re_rendered += 1
-            else:
-                outcome.succeeded += 1
-            continue
-
-        outcome.failed += 1
-        consecutive += 1
-        error = entry.get("error") or ""
-        outcome.failures.append((cand.state_key, error))
-        klass = classify_failure(error)
-
-        if klass == CLASS_OPERATOR_ACTIONABLE:
-            outcome.aborted_reason = _remediation(error)
-        elif consecutive >= consecutive_failure_limit:
-            outcome.aborted_reason = (
-                f"{consecutive} failures in a row — stopping rather than working through "
-                f"the rest. Last error: {redact(error)}"
+            # FR-11: progress goes on the bus, not the log — the log holds ten
+            # entries and a 12-file run would evict its own summary.
+            bus.publish(
+                RetryProgress(index=index + 1, total=len(items), filename=cand.path.name)
             )
 
-        if outcome.aborted_reason:
-            outcome.not_attempted += len(items) - index - 1
-            log.warning("retry batch aborted", extra={"reason": outcome.aborted_reason})
-            break
+            transcribe(
+                cand.path,
+                Path(archive_dir),
+                bus=bus,
+                device_filename=cand.path.name,
+                recorded_at=None,
+                max_retries=None,
+                reuse_existing_transcript=cand.has_paid_transcript,
+            )
 
-    bus.publish(
-        RetryFinished(
-            succeeded=outcome.succeeded,
-            re_rendered=outcome.re_rendered,
-            failed=outcome.failed,
-            not_attempted=outcome.not_attempted,
-            aborted_reason=outcome.aborted_reason,
+            entry = load_entry(cand.state_key) or {}
+            if entry.get("status") == "done":
+                consecutive = 0
+                if cand.has_paid_transcript:
+                    outcome.re_rendered += 1
+                else:
+                    outcome.succeeded += 1
+                continue
+
+            outcome.failed += 1
+            consecutive += 1
+            error = entry.get("error") or ""
+            outcome.failures.append((cand.state_key, error))
+            klass = classify_failure(error)
+
+            if klass == CLASS_OPERATOR_ACTIONABLE:
+                outcome.aborted_reason = _remediation(error)
+            elif consecutive >= consecutive_failure_limit:
+                outcome.aborted_reason = (
+                    f"{consecutive} failures in a row — stopping rather than working through "
+                    f"the rest. Last error: {redact(error)}"
+                )
+
+            if outcome.aborted_reason:
+                outcome.not_attempted += len(items) - index - 1
+                log.warning("retry batch aborted", extra={"reason": outcome.aborted_reason})
+                break
+    except BaseException as exc:
+        # Every raise site in the loop lands here — the transcribe seam, the
+        # ledger read, the classification helpers, the bus itself. The region is
+        # driven by RetryProgress/RetryFinished only, so without this the last
+        # progress frame stays on screen saying "transcribing" forever while the
+        # activity log says the batch failed. BaseException, not Exception: a
+        # KeyboardInterrupt mid-batch strands the region just as thoroughly, and
+        # tui.py's handler catches only Exception.
+        if 0 <= index < len(items):
+            failed_item = items[index]
+            # Counted `failed`, not `not_attempted`: the file WAS attempted, and
+            # audio may have been uploaded and billed before the raise. Calling
+            # it "not attempted" would understate spend to the operator.
+            outcome.failed += 1
+            outcome.failures.append((failed_item.state_key, str(exc)))
+            outcome.not_attempted += len(items) - index - 1
+            outcome.aborted_reason = (
+                f"the batch stopped on {failed_item.path.name}: "
+                f"{redact(str(exc)) or type(exc).__name__}"
+            )
+        else:
+            outcome.aborted_reason = (
+                f"the batch stopped: {redact(str(exc)) or type(exc).__name__}"
+            )
+        log.warning("retry batch raised", extra={"reason": outcome.aborted_reason})
+        # Re-raised, not swallowed: tui.py's handler is what writes the
+        # diagnostic into the activity log. The region says where the batch
+        # stopped; the log says what broke.
+        raise
+    finally:
+        bus.publish(
+            RetryFinished(
+                succeeded=outcome.succeeded,
+                re_rendered=outcome.re_rendered,
+                failed=outcome.failed,
+                not_attempted=outcome.not_attempted,
+                aborted_reason=outcome.aborted_reason,
+            )
         )
-    )
     return outcome
 
 

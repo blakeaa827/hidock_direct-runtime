@@ -437,3 +437,177 @@ def test_operator_actionable_markers_record_whether_they_were_observed():
             "Every entry must say whether the text was captured from the live "
             "API or authored without observation."
         )
+
+
+# -- the batch must settle the run region on every exit ----------------------
+#
+# Regression tests for bug_report_retry_run_region_has_no_terminal_state_on_exception.md.
+# `RetryFinished` had one publisher, the last statement of the happy path, so any
+# raise left the region frozen on its last progress frame — "transcribing — long
+# files take a few minutes" — while the activity log said the batch had failed.
+# The region is the larger, brighter surface, and it invited the operator to wait.
+#
+# The report reproduced this from the transcribe seam. The loop has four raise
+# sites (transcribe, load_entry, the classification helpers, bus.publish); the
+# tests below cover the two that are reachable through injection, and pin the one
+# path that must NOT publish — a raise before the first RetryProgress, where the
+# region was never entered and a summary would create one rather than settle it.
+
+
+def _boom(message="boom"):
+    def raiser(*a, **kw):
+        raise RuntimeError(message)
+
+    return raiser
+
+
+def test_retry_finished_is_published_when_the_runner_raises(tmp_path):
+    """The bug: only RetryProgress reached the bus, so the region never settled."""
+    root, cands, _seen, _fake = _runner(tmp_path, ["2026/08/a.mp3"])
+    published: list = []
+    bus = EventBus()
+    bus.subscribe(published.append)
+
+    with pytest.raises(RuntimeError):
+        run_retry_batch(
+            cands, root, bus=bus,
+            transcribe=faithful(transcribe_mod.transcribe_file, _boom()),
+            load_entry=lambda k: {},
+        )
+
+    names = [type(e).__name__ for e in published]
+    assert "RetryFinished" in names, (
+        f"the region has no terminal event on the exception path: {names}"
+    )
+    assert names[-1] == "RetryFinished", "the summary must be the last word"
+
+
+def test_the_exception_still_propagates_to_the_caller(tmp_path):
+    """Settling the region must not swallow the failure — tui.py's handler is
+    what writes the diagnostic into the activity log, and it only runs if the
+    exception reaches it. The region says where the batch stopped; the log says
+    what broke."""
+    root, cands, _seen, _fake = _runner(tmp_path, ["2026/08/a.mp3"])
+
+    with pytest.raises(RuntimeError, match="ledger vanished"):
+        run_retry_batch(
+            cands, root, bus=EventBus(),
+            transcribe=faithful(transcribe_mod.transcribe_file, _boom("ledger vanished")),
+            load_entry=lambda k: {},
+        )
+
+
+def test_the_crashed_file_is_counted_failed_and_the_rest_not_attempted(tmp_path):
+    """Accounting decided in the bug report: the crashed file was *attempted* —
+    audio may have been uploaded and billed before the raise — so calling it
+    `not_attempted` would understate spend. It counts `failed`; the files after
+    it are `not_attempted`; the totals sum to the batch size on every path."""
+    keys = [f"2026/08/f{i}.mp3" for i in range(3)]
+    root, cands, _seen, _fake = _runner(tmp_path, keys)
+    published: list = []
+    bus = EventBus()
+    bus.subscribe(published.append)
+
+    with pytest.raises(RuntimeError):
+        run_retry_batch(
+            cands, root, bus=bus,
+            transcribe=faithful(transcribe_mod.transcribe_file, _boom()),
+            load_entry=lambda k: {},
+        )
+
+    summary = [e for e in published if type(e).__name__ == "RetryFinished"][-1]
+    assert summary.not_attempted == 2, "the two files never reached must say so"
+    assert summary.failed == 1, "the file that crashed mid-flight may have billed"
+    total = (
+        summary.succeeded + summary.re_rendered + summary.failed + summary.not_attempted
+    )
+    assert total == 3, f"the counts must account for every candidate, got {total}"
+
+
+def test_aborted_reason_is_redacted_on_the_exception_path(tmp_path):
+    """FR-12 covers 'anything rendered', and the region renders aborted_reason.
+    An AAI exception can carry an account-scoped upload URL."""
+    url = "https://cdn.assemblyai.com/upload/9f3c-secret-account-token"
+    root, cands, _seen, _fake = _runner(tmp_path, ["2026/08/a.mp3"])
+    published: list = []
+    bus = EventBus()
+    bus.subscribe(published.append)
+
+    with pytest.raises(RuntimeError):
+        run_retry_batch(
+            cands, root, bus=bus,
+            transcribe=faithful(
+                transcribe_mod.transcribe_file, _boom(f"upload failed for {url}")
+            ),
+            load_entry=lambda k: {},
+        )
+
+    summary = [e for e in published if type(e).__name__ == "RetryFinished"][-1]
+    assert summary.aborted_reason, "the region must state why it stopped"
+    assert "cdn.assemblyai.com/upload" not in summary.aborted_reason
+    assert "<upload-url redacted>" in summary.aborted_reason
+
+
+def test_a_raise_from_the_ledger_read_also_settles_the_region(tmp_path):
+    """Coverage boundary: the report reproduced from the transcribe seam, but the
+    loop reads the ledger too, and a `LedgerUnavailable` there strands the region
+    identically. Fixing only the seam the reporter happened to hit would leave the
+    siblings armed — which is how the kwarg bug and this one arrived together."""
+    root, cands, _seen, fake = _runner(tmp_path, ["2026/08/a.mp3"])
+    published: list = []
+    bus = EventBus()
+    bus.subscribe(published.append)
+
+    def unreadable(state_key):
+        raise LedgerUnavailable("offload_state.json vanished mid-batch")
+
+    with pytest.raises(LedgerUnavailable):
+        run_retry_batch(cands, root, bus=bus, transcribe=fake, load_entry=unreadable)
+
+    assert "RetryFinished" in [type(e).__name__ for e in published], (
+        "a raise from the ledger read leaves the same stuck frame as the seam"
+    )
+
+
+def test_a_raise_before_the_region_is_entered_publishes_nothing(tmp_path):
+    """The other side of the boundary. If the candidate list itself raises, no
+    RetryProgress was ever published and the region was never entered — emitting
+    a 0/0/0/0 summary there would *create* a region rather than settle one, which
+    is a new defect wearing a fix's clothes."""
+    root = _archive(tmp_path, "2026/08/a.mp3")
+    published: list = []
+    bus = EventBus()
+    bus.subscribe(published.append)
+
+    def exploding_candidates():
+        raise RuntimeError("ledger read failed while listing candidates")
+        yield  # pragma: no cover - generator marker
+
+    with pytest.raises(RuntimeError):
+        run_retry_batch(
+            exploding_candidates(), root, bus=bus,
+            transcribe=faithful(transcribe_mod.transcribe_file, lambda p, a, **kw: None),
+            load_entry=lambda k: {"status": "done"},
+        )
+
+    assert published == [], (
+        f"nothing may be published before the region is entered, got {published}"
+    )
+
+
+def test_successful_batch_still_publishes_exactly_one_retry_finished(tmp_path):
+    """The `finally` must not double-publish on the happy path — two summaries
+    would make the region flicker and the second would overwrite the first."""
+    root, cands, _seen, fake = _runner(tmp_path, ["2026/08/a.mp3", "2026/08/b.mp3"])
+    published: list = []
+    bus = EventBus()
+    bus.subscribe(published.append)
+
+    outcome = run_retry_batch(
+        cands, root, bus=bus, transcribe=fake,
+        load_entry=lambda k: {"status": "done"},
+    )
+
+    finished = [e for e in published if type(e).__name__ == "RetryFinished"]
+    assert len(finished) == 1, f"expected exactly one summary, got {len(finished)}"
+    assert finished[0].succeeded == 2 and outcome.aborted_reason is None

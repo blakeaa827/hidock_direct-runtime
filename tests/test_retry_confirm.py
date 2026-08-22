@@ -18,9 +18,11 @@ import time
 import pytest
 from rich.console import Console
 
+from hidock_direct import transcribe as transcribe_mod
 from hidock_direct.events import Error, EventBus, RetryFinished, RetryProgress, Severity
 from hidock_direct.retry import RetryCandidate, format_retry_confirm, summarize
 from hidock_direct.tui import TUI
+from tests.conftest import faithful
 
 
 def _cand(
@@ -448,3 +450,50 @@ def test_hint_is_absent_when_the_only_excluded_candidates_are_missing():
     assert "1 excluded" in text and "missing from the archive" in text
     assert "[f to include]" not in text
     assert "[f] force-include" not in text
+
+
+# -- the region must not still say "transcribing" after a failed batch --------
+#
+# Regression test for bug_report_retry_run_region_has_no_terminal_state_on_exception.md.
+# Rendered through `tui._render()` — the outermost entry point — rather than
+# `_render_retry_run` directly, per the presentation-path Harden: the operator
+# screenshot that reported this bug is what `_render()` produces, and asserting
+# against the helper would reproduce the gap it exists to close.
+
+
+def test_the_run_region_does_not_render_transcribing_after_a_failed_batch(tmp_path):
+    """The operator screenshot: the region held '1/1 … transcribing — long files
+    take a few minutes' indefinitely while the log below it read 'retry batch
+    failed'. The caption invited them to keep waiting for a batch that had died.
+
+    Drives the REAL `run_retry_batch` through the TUI's own runner entry point —
+    publishing `RetryFinished` by hand here would stage the very event the bug is
+    that nobody publishes, and the test would pass against the broken code."""
+    from hidock_direct.retry import run_retry_batch
+
+    bus = EventBus()
+    candidate = _cand("2026-08-18_090247.mp3", minutes=12.0)
+
+    def crashing_seam(*a, **kw):
+        raise TypeError("transcribe_file() got an unexpected keyword argument 'max_retries'")
+
+    def runner(selected):
+        run_retry_batch(
+            selected, tmp_path, bus=bus,
+            transcribe=faithful(transcribe_mod.transcribe_file, crashing_seam),
+            load_entry=lambda k: {},
+        )
+
+    tui = TUI(bus=bus, retry_candidates_provider=lambda: [], retry_runner=runner)
+    tui._run_retry_batch([candidate])
+
+    text = _text(tui._render(), width=200, height=40)
+    assert "transcribing" not in text, (
+        "the region is still showing an in-progress caption for a dead batch"
+    )
+    assert "1 failed" in text, "the region must state the outcome"
+    assert "esc to dismiss" in text, "a terminal region must be dismissible"
+    assert "retry batch failed" in text, (
+        "the log keeps its diagnostic — the region says where it stopped, "
+        "the log says what broke"
+    )
