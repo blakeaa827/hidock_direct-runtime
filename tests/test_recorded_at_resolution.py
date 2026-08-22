@@ -68,12 +68,25 @@ class _FakeAAIClient:
 
 @pytest.fixture
 def transcribing_env(monkeypatch, archive_dir: Path):
-    """Env + client stub so `_run_pipeline` reaches the real renderer."""
+    """Env + client stub so `_run_pipeline` reaches the real renderer.
+
+    INBOX_DIRS points at a decoy rather than at `archive_dir`. `_run_pipeline`
+    binds the archive explicitly now, so pinning the env var to the right answer
+    would assert nothing.
+
+    It does not make this file a detector either — measured, these tests pass
+    against the old `setdefault` mechanism too, because they assert on
+    `recorded_at` resolution rather than ledger location. The decoy just stops the
+    fixture from looking like it still controls something. Ledger-location
+    regressions are caught in `test_main_wiring.py`.
+    """
     import diarize_audio.assemblyai_client as aai_mod
 
+    decoy = archive_dir.parent / "decoy-inbox"
+    decoy.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(aai_mod, "AAIClient", _FakeAAIClient)
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
-    monkeypatch.setenv("INBOX_DIRS", str(archive_dir))
+    monkeypatch.setenv("INBOX_DIRS", str(decoy))
     monkeypatch.setenv("DRIVE_ENABLED", "false")
     return archive_dir
 

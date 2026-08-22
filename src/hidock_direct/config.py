@@ -86,6 +86,43 @@ def load_env_file_into_environ() -> Optional[Path]:
     return env_path
 
 
+def diarize_config_for_archive(archive_dir):
+    """The one rule for "which diarize config belongs to this archive".
+
+    Binds `inbox_dirs` explicitly instead of routing the archive through the
+    process-global `INBOX_DIRS`. Both the transcription writer
+    (`transcribe._run_pipeline`) and the retry reader (`retry.load_diarize_state`)
+    call this, so the answer cannot drift between them — it is one
+    implementation, not two copies kept in agreement by convention.
+
+    Previously the writer used `os.environ.setdefault("INBOX_DIRS", ...)`, which
+    means "point at this archive UNLESS someone already pointed somewhere else"
+    — the inverse of the intent, at exactly the moment it matters. It also made
+    the result depend on call order, because a process-global mutation from a
+    local call is only a no-op the *second* time.
+
+    `.expanduser()` matches what `Config.from_env()` applies to the values it
+    reads (`diarize_audio/config.py:77`); an explicit binding that skipped it
+    would disagree with the env path on a `~`-prefixed archive. Production
+    happens to be safe without it because `load_config` expands
+    `HIDOCK_ARCHIVE_DIR` upstream, but that is safe by accident rather than by
+    construction.
+
+    Note `inbox_dirs` also feeds `pipeline._relpath_for`, which derives the Drive
+    upload's year/month folder — so this binds the *scan root*, not merely the
+    ledger location. That consumer is inert while `DRIVE_ENABLED=false`, and
+    normalizes paths itself, so narrowing the list to the single archive changes
+    nothing observable today.
+    """
+    from dataclasses import replace
+
+    from diarize_audio.config import Config
+
+    return replace(
+        Config.from_env(), inbox_dirs=[Path(archive_dir).expanduser()]
+    )
+
+
 def _resolve(name: str, default: str, env_values: dict, overlay: Optional[dict]) -> str:
     if overlay is not None and name in overlay:
         return str(overlay[name])

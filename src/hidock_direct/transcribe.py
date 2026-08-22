@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from .config import diarize_config_for_archive
 from .offload import resolve_recorded_at
 from .events import (
     EventBus,
@@ -64,15 +65,15 @@ def _run_pipeline(
     """
     # The clone-local .env was already loaded into os.environ at startup
     # (hidock_direct.config.load_env_file_into_environ), so diarize_audio's
-    # Config.from_env() sees ASSEMBLYAI_API_KEY / DRIVE_ENABLED directly.
-    from diarize_audio.config import Config
+    # Config.from_env() sees ASSEMBLYAI_API_KEY / DRIVE_ENABLED directly. The
+    # archive, though, is a per-call argument and is bound explicitly rather
+    # than smuggled through the environment — see diarize_config_for_archive.
     from diarize_audio.state import State
     from diarize_audio.assemblyai_client import AAIClient
     from diarize_audio.drive_sync import DriveSync
     from diarize_audio.pipeline import process_file
 
-    os.environ.setdefault("INBOX_DIRS", str(archive_dir))
-    cfg = Config.from_env()
+    cfg = diarize_config_for_archive(archive_dir)
     cfg.state_dir.mkdir(parents=True, exist_ok=True)
     state = State.load(cfg.state_path)
 

@@ -161,14 +161,18 @@ def load_diarize_state(archive_dir: Path):
     lives.
 
     The ledger is bound to the archive explicitly rather than read from
-    `INBOX_DIRS`. `transcribe.py` only ever `setdefault`s that variable as a
-    side effect of the first transcription, so at startup — and in any process
-    where the operator has it pointing somewhere else — `Config.from_env()`
-    resolves to a different archive entirely. On this machine that is
-    `~/HiDock/archive`, which holds no ledger, so a from-env read returns an
-    empty one and the operator is told there is nothing to retry. Same shape as
-    the 2026-08-13 recovery run that reported `0 candidates` against the wrong
-    archive.
+    `INBOX_DIRS`, via the shared `diarize_config_for_archive` — the same call
+    the transcription writer makes, so the reader and the writer cannot answer
+    "which ledger belongs to this archive" differently.
+
+    That sharing is the fix for a real split. `transcribe.py` used to
+    `setdefault` `INBOX_DIRS` as a side effect of the first transcription, so at
+    startup — and in any process where the operator had it pointing somewhere
+    else — a `Config.from_env()` read here resolved to a different archive
+    entirely. On this machine that is `~/HiDock/archive`, which holds no ledger,
+    so the read returned an empty one and the operator was told there was
+    nothing to retry. Same shape as the 2026-08-13 recovery run that reported
+    `0 candidates` against the wrong archive.
 
     Raises `LedgerUnavailable` rather than returning an empty ledger, because an
     empty ledger is indistinguishable from a clean one at every call site above.
@@ -177,13 +181,11 @@ def load_diarize_state(archive_dir: Path):
     if not archive_dir.is_dir():
         raise LedgerUnavailable(f"archive directory not found: {archive_dir}")
     try:
-        from dataclasses import replace
-
-        from diarize_audio.config import Config
         from diarize_audio.state import State
 
-        cfg = replace(Config.from_env(), inbox_dirs=[archive_dir])
-        state_path = cfg.state_path
+        from .config import diarize_config_for_archive
+
+        state_path = diarize_config_for_archive(archive_dir).state_path
         if not state_path.exists():
             raise LedgerUnavailable(f"no transcription ledger at {state_path}")
         return State.load(state_path)

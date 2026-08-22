@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
 import pathlib
 import re
 
@@ -188,34 +189,174 @@ def test_startup_surfaces_an_unreadable_ledger_instead_of_reporting_zero():
 def test_ledger_path_agrees_between_the_retry_reader_and_the_transcribe_writer(
     tmp_path, monkeypatch
 ):
-    """Convention agreement, asserted by running both implementations.
+    """Convention agreement, asserted by running both real implementations.
 
-    "Which ledger belongs to this archive" is implemented twice: `retry`'s reader
-    binds `inbox_dirs` to the archive explicitly, and `transcribe.py` reaches the
-    same answer by `os.environ.setdefault("INBOX_DIRS", str(archive_dir))` before
-    `Config.from_env()`. They must resolve to the same file. When they disagree,
-    retry reads a ledger nothing writes and reports a confident all-clear — which
-    is exactly what the live PoL caught before this test existed.
+    "Which ledger belongs to this archive" must have ONE answer. This test used
+    to hand-copy the writer's rule inline — `monkeypatch.setenv("INBOX_DIRS",
+    ...)` then `Config.from_env()` — which made it a third implementation rather
+    than an assertion about the second: it would have stayed green if
+    `transcribe.py` changed entirely. It now calls the writer's real code path.
+
+    `INBOX_DIRS` is pointed at a decoy third directory throughout, because the
+    original only ever proved the two agree when the environment is unset or
+    already correct — the two cases where the bug cannot appear.
     """
     archive = tmp_path / "archive"
     (archive / ".state").mkdir(parents=True)
     (archive / ".state" / "transcribe_state.json").write_text(
         '{"schema_version": 1, "files": {}}'
     )
+    decoy = tmp_path / "operators-inbox"
+    decoy.mkdir()
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
-    monkeypatch.delenv("INBOX_DIRS", raising=False)
+    monkeypatch.setenv("INBOX_DIRS", str(decoy))
 
-    # 1. The retry reader, with INBOX_DIRS deliberately unset — the startup case.
+    # 1. The retry reader.
     reader_path = pathlib.Path(load_diarize_state(archive).path)
 
-    # 2. The transcribe writer's rule, applied exactly as transcribe.py applies it.
-    monkeypatch.setenv("INBOX_DIRS", str(archive))
-    from diarize_audio.config import Config
+    # 2. The transcribe writer — the real rule, not a replica of it.
+    from hidock_direct.config import diarize_config_for_archive
 
-    writer_path = Config.from_env().state_path
+    writer_path = diarize_config_for_archive(archive).state_path
 
     assert reader_path == writer_path, (
         f"retry reads {reader_path} but transcription writes {writer_path}"
+    )
+    assert reader_path.parent.parent == archive, (
+        f"both agreed on {reader_path}, which is not under the archive they were "
+        f"given ({archive}) — agreeing on the wrong file is not agreement"
+    )
+
+
+def test_transcribe_ledger_follows_the_archive_it_was_given(tmp_path, monkeypatch):
+    """The bug: `os.environ.setdefault` means "point at this archive UNLESS
+    someone already pointed somewhere else", which inverts the intent at exactly
+    the moment it matters. The audio lands under the archive; the ledger recording
+    its status lands under whatever the operator had exported."""
+    archive = tmp_path / "hidock-archive"
+    archive.mkdir()
+    elsewhere = tmp_path / "operators-inbox"
+    elsewhere.mkdir()
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
+    monkeypatch.setenv("INBOX_DIRS", str(elsewhere))
+
+    from hidock_direct.config import diarize_config_for_archive
+
+    cfg = diarize_config_for_archive(archive)
+
+    assert cfg.state_path.parent.parent == archive, (
+        f"ledger resolved to {cfg.state_path}, which is not under {archive}"
+    )
+    assert elsewhere not in cfg.state_path.parents
+
+
+def test_transcribe_does_not_mutate_the_process_environment(tmp_path, monkeypatch):
+    """The stronger property, and the one that keeps this fixed: not "the value
+    is right" but "there is no process-global side effect at all". A global
+    mutation from a local call makes the result depend on call order, which is
+    why nothing caught the original."""
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    elsewhere = tmp_path / "operators-inbox"
+    elsewhere.mkdir()
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
+    monkeypatch.setenv("INBOX_DIRS", str(elsewhere))
+
+    from hidock_direct.config import diarize_config_for_archive
+
+    before = dict(os.environ)
+    diarize_config_for_archive(archive)
+    after = dict(os.environ)
+
+    changed = {
+        k: (before.get(k), after.get(k))
+        for k in set(before) | set(after)
+        if before.get(k) != after.get(k)
+    }
+    assert not changed, (
+        f"building the config mutated the process environment: {changed}"
+    )
+    assert os.environ["INBOX_DIRS"] == str(elsewhere), (
+        "the operator's own INBOX_DIRS must survive untouched"
+    )
+
+
+def test_the_archive_binding_expands_a_tilde_like_from_env_does(tmp_path, monkeypatch):
+    """`Config.from_env()` applies `.expanduser()` to what it reads
+    (diarize_audio/config.py:77). An explicit binding that skips it disagrees
+    with the env path on `~`-prefixed archives. Production is safe today only
+    because hidock's own config expands upstream — safe by accident, not by
+    construction, and this pins it."""
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
+    monkeypatch.delenv("INBOX_DIRS", raising=False)
+
+    from hidock_direct.config import diarize_config_for_archive
+
+    cfg = diarize_config_for_archive("~/some-archive")
+
+    assert "~" not in str(cfg.state_path), f"tilde survived into {cfg.state_path}"
+    assert cfg.state_path == pathlib.Path("~/some-archive").expanduser() / ".state" / "transcribe_state.json"
+
+
+def test_no_module_in_the_package_mutates_os_environ():
+    """Structural pin on the class, not the instance. The bug report's sweep found
+    exactly one `os.environ` write in the package; this keeps it at zero, so the
+    next one has to be argued for rather than merely added.
+
+    Parsed with `ast`, not grepped. A line scanner reports this module's own
+    docstrings — the first draft of this test failed on `config.py`'s prose
+    explaining the very mutation it had removed.
+
+    Coverage boundary, stated rather than implied: this catches direct syntactic
+    mutation (`os.environ[k] = v`, `.setdefault`, `.update`, `.pop`, `.clear`).
+    It does NOT catch mutation through an alias or a library —
+    `load_env_file_into_environ` writes the clone-local `.env` into the
+    environment via `dotenv.load_dotenv`, and is invisible here. That one is
+    sanctioned anyway: process-wide startup config, not a per-call parameter
+    smuggled through a global.
+    """
+    import hidock_direct
+
+    _MUTATORS = {"setdefault", "update", "pop", "clear", "setitem", "popitem"}
+
+    def _is_os_environ(node) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "environ"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "os"
+        )
+
+    pkg = pathlib.Path(hidock_direct.__file__).parent
+    offenders = []
+    for path in sorted(pkg.rglob("*.py")):
+        if "jensen" in path.parts:
+            continue  # vendored; not ours to constrain
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            hit = None
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _MUTATORS
+                and _is_os_environ(node.func.value)
+            ):
+                hit = f"os.environ.{node.func.attr}(...)"
+            elif isinstance(node, (ast.Assign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for t in targets:
+                    if isinstance(t, ast.Subscript) and _is_os_environ(t.value):
+                        hit = "os.environ[...] = ..."
+            elif isinstance(node, ast.Delete):
+                for t in node.targets:
+                    if isinstance(t, ast.Subscript) and _is_os_environ(t.value):
+                        hit = "del os.environ[...]"
+            if hit:
+                offenders.append(f"{path.relative_to(pkg)}:{node.lineno}: {hit}")
+
+    assert offenders == [], (
+        "process-global environment mutation in the package — pass the value as "
+        "an argument instead:\n  " + "\n  ".join(offenders)
     )
 
 

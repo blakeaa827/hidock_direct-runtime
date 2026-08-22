@@ -188,8 +188,17 @@ def test_pipeline_exception_publishes_failed(monkeypatch, bus_and_events, tmp_pa
 def pipeline_spy(monkeypatch, tmp_path):
     """Capture what reaches diarize's `process_file`, with the stack stubbed.
 
-    INBOX_DIRS is pinned to tmp_path so diarize's state_dir (`inbox_dirs[0]/
-    .state`) resolves inside the test — nothing touches the real archive.
+    INBOX_DIRS points at a decoy. It used to be pinned to `tmp_path` so diarize's
+    `state_dir` resolved inside the test; since the archive is bound explicitly by
+    `diarize_config_for_archive`, that pinning no longer influences anything, and
+    the old docstring claiming it did was simply false.
+
+    Measured, not assumed: these tests pass either way — reverting the fix and
+    re-running this file gives 28 passed — because they stub `process_file` and
+    assert on events, never on where the ledger lands. The decoy is therefore
+    *documentation*, not a detector: it keeps the fixture from asserting the right
+    answer for a reason that stopped existing. The regression detectors for ledger
+    location live in `test_main_wiring.py`.
     """
     import diarize_audio.assemblyai_client as aai_mod
     import diarize_audio.pipeline as pipeline_mod
@@ -205,7 +214,9 @@ def pipeline_spy(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline_mod, "process_file", _spy)
     monkeypatch.setattr(transcribe, "_check_available", lambda: True)
     monkeypatch.setenv("ASSEMBLYAI_API_KEY", "test-key")
-    monkeypatch.setenv("INBOX_DIRS", str(tmp_path))
+    decoy = tmp_path / "decoy-inbox"
+    decoy.mkdir(exist_ok=True)
+    monkeypatch.setenv("INBOX_DIRS", str(decoy))
     monkeypatch.setenv("DRIVE_ENABLED", "false")
     return seen
 
