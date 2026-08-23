@@ -209,8 +209,11 @@ def test_summary_survives_eviction_from_the_ten_entry_log():
     for i in range(20):
         bus.publish(Error(message=f"noise {i}", severity=Severity.INFO))
 
-    # Height 40 = a normal terminal. Below ~25 rows the region pushes the
-    # newest log line off the bottom; filed separately, not ratified here.
+    # Height 40 = a normal terminal. This used to carry a warning that below
+    # ~25 rows the region pushed the newest log line off the bottom — a figure
+    # that was wrong when written and wronger later (the bug report said ~29,
+    # measurement said 32). The log is newest-first now, so the newest line
+    # survives at every height and the number has no reason to exist.
     text = _text(tui._render(), height=40)
     assert "9 transcribed" in text and "2 re-rendered" in text and "1 failed" in text
     assert "noise 19" in text, "the log itself must still render"

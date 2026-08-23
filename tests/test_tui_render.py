@@ -290,3 +290,129 @@ def test_footer_pane_does_not_waste_rows_when_nothing_is_pending():
     assert layout["footer"].size == needed, (
         f"footer pane reserves {layout['footer'].size} rows for a {needed}-row panel"
     )
+
+
+# -- the activity log must not lose its newest line to a short pane ----------
+#
+# Regression tests for bug_report_activity_log_crops_its_newest_line.md.
+# `_render_log` appended oldest-first and rich crops an overflowing renderable
+# from the BOTTOM, so the newest entry was the first one lost while the oldest
+# stayed pinned at the top — and the panel's borders and title still rendered,
+# so the result read as a complete list. The log is where "key ignored: ..."
+# diagnostics land, which exist precisely to explain a refused keystroke.
+
+
+def _fill_log(tui: TUI, n: int = 20) -> None:
+    from hidock_direct.events import Error, Severity
+
+    for i in range(n):
+        tui._bus.publish(Error(message=f"noise {i}", severity=Severity.INFO))
+
+
+def _shown(text: str, n: int = 20) -> list[int]:
+    """Which `noise N` entries survived into the frame.
+
+    The negative lookahead matters: a bare `"noise 1" in text` also matches
+    inside "noise 19", which silently inflates the oldest-entry reading. That
+    error was made while measuring this bug and corrected by re-measuring.
+    """
+    return [i for i in range(n) if re.search(rf"noise {i}(?!\d)", text)]
+
+
+@pytest.mark.parametrize("height", [20, 24, 25, 30])
+def test_newest_log_entry_survives_a_short_pane(height):
+    """Measured before the fix: at 20 the newest visible was `noise 16`, at 24
+    it was `noise 18`. The oldest survived at every height, which is exactly
+    backwards — the oldest is what should be lost."""
+    tui, _ = _tui_at_width(100, height=height)
+    _fill_log(tui)
+
+    shown = _shown(_frame_text(tui))
+
+    assert 19 in shown, (
+        f"at height {height} the newest entry is missing; visible: {shown}"
+    )
+
+
+@pytest.mark.parametrize("height", [20, 24, 25, 30])
+def test_newest_log_entry_survives_when_the_retry_region_is_showing(height):
+    """The retry run region shares the centre pane, so it shifts the threshold.
+    It moved again on 2026-08-22 when the region gained its abort-reason line —
+    measured 32 rows, against `~29` in the bug report and `~25` in an FR-11 test
+    comment. Three disagreeing figures for one threshold is the argument for
+    testing the property at several heights instead of naming a number."""
+    from hidock_direct.events import RetryFinished
+
+    tui, _ = _tui_at_width(100, height=height)
+    tui._bus.publish(
+        RetryFinished(
+            succeeded=1, re_rendered=0, failed=1, not_attempted=0,
+            aborted_reason="the batch stopped on x.mp3: connection reset",
+        )
+    )
+    _fill_log(tui)
+
+    shown = _shown(_frame_text(tui))
+
+    assert 19 in shown, (
+        f"at height {height} with the retry region the newest entry is missing; "
+        f"visible: {shown}"
+    )
+
+
+def test_log_renders_newest_first():
+    """Pin the ordering. Whichever way it points, a future change must not flip
+    it back silently — the flip is invisible on a tall terminal, which is how
+    this shipped."""
+    tui, _ = _tui_at_width(100, height=40)
+    _fill_log(tui)
+
+    text = _frame_text(tui)
+    newest_at = text.index("noise 19")
+    oldest_at = text.index("noise 10")
+
+    assert newest_at < oldest_at, (
+        "the log renders oldest-first; the newest entry must come first so that "
+        "a short pane drops the oldest rather than the newest"
+    )
+
+
+@pytest.mark.parametrize("height", [16, 20, 24, 30])
+def test_a_cropped_log_is_distinguishable_from_a_short_one(height):
+    """The degrade made visible. A cropped panel and a genuinely short one look
+    identical — same borders, same title, no gap — so the operator cannot tell
+    that the app is withholding lines.
+
+    The count lives in the panel TITLE, which renders on the top border and so
+    survives cropping at every height. It reports what is HELD, not what was
+    dropped: the number dropped depends on the pane height, and that is not
+    knowable here — predicting it was measured wrong on 27 of 30 height/region
+    combinations, so a `... N earlier` marker would have stated a false count.
+    Held-vs-visible is exact, needs no arithmetic, and answers the same question.
+    """
+    tui, _ = _tui_at_width(100, height=height)
+    _fill_log(tui)
+
+    text = _frame_text(tui)
+    held = re.search(r"Recent activity \((\d+) held\)", text)
+
+    assert held, f"the log panel does not report how many entries it holds: {text[:200]}"
+    assert int(held.group(1)) == 10, "the deque holds RECENT_LOG_LIMIT entries"
+    visible = len(_shown(text))
+    if visible < 10:
+        assert int(held.group(1)) > visible, (
+            "the panel claims to hold no more than it shows, but it is cropped"
+        )
+
+
+def test_the_held_count_equals_what_is_shown_when_nothing_is_cropped():
+    """The control. Without this, a title that always said `10 held` would pass
+    the cropping test while telling the operator nothing."""
+    tui, _ = _tui_at_width(100, height=40)
+    _fill_log(tui, n=4)
+
+    text = _frame_text(tui)
+    held = re.search(r"Recent activity \((\d+) held\)", text)
+
+    assert held and int(held.group(1)) == 4, "the title must track the real count"
+    assert len(_shown(text, n=4)) == 4, "a tall pane crops nothing"

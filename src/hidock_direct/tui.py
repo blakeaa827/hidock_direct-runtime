@@ -762,17 +762,42 @@ class TUI:
 
     @staticmethod
     def _render_log(log: list[tuple[datetime, str, Severity]]) -> Panel:
+        """Newest first, and the panel says how many entries it holds.
+
+        Both properties exist because this pane can be shorter than its content
+        and `rich` crops an overflowing renderable from the BOTTOM. Rendered
+        oldest-first — the conventional order for a scrolling feed — the newest
+        entry was the first one lost, while the oldest stayed pinned at the top.
+        That convention assumes the viewport follows the tail; this viewport is a
+        fixed pane that does not scroll. Reversing costs a change in reading
+        order and is correct at every height with no arithmetic, which matters:
+        predicting the pane's row budget was measured wrong on 27 of 30
+        height/region combinations.
+
+        The held-count goes in the TITLE because a title renders on the top
+        border and therefore survives cropping at every height — verified down to
+        a 16-row terminal, where no log rows render at all and the count is the
+        only thing left. It reports what is HELD rather than how many were
+        dropped: the number dropped depends on the pane height, which is not
+        knowable from here, so a `... N earlier` marker would have stated a false
+        count. Held-versus-visible is exact and answers the same question — it is
+        what makes a cropped list distinguishable from a genuinely short one.
+        """
         table = Table.grid(expand=True)
         table.add_column("time", style="dim", no_wrap=True)
         table.add_column("msg")
-        for when, msg, sev in log:
+        for when, msg, sev in reversed(log):
             color = {
                 Severity.INFO: "white",
                 Severity.WARNING: "yellow",
                 Severity.ERROR: "red",
             }.get(sev, "white")
             table.add_row(when.strftime("%H:%M:%S"), Text(msg, style=color))
-        return Panel(table, title="Recent activity", border_style="magenta")
+        return Panel(
+            table,
+            title=f"Recent activity ({len(log)} held)",
+            border_style="magenta",
+        )
 
     @staticmethod
     def _render_footer(
