@@ -343,7 +343,7 @@ def run_retry_batch(
             klass = classify_failure(error)
 
             if klass == CLASS_OPERATOR_ACTIONABLE:
-                outcome.aborted_reason = _remediation(error)
+                outcome.aborted_reason = remediation(error)
             elif consecutive >= consecutive_failure_limit:
                 outcome.aborted_reason = (
                     f"{consecutive} failures in a row — stopping rather than working through "
@@ -403,12 +403,22 @@ def _default_load_entry(archive_dir: Path) -> Callable[[str], dict]:
     return _load
 
 
-def _remediation(error: str) -> str:
+# What the operator should do next after topping up. Surface-specific: the
+# retry path wants `r`, and a live session wants a restart. Parameterised so
+# the MARKER VOCABULARY below stays a single implementation — two copies of
+# "which failure is this" is the state that produced the 2026-08-20 bug.
+RETRY_NEXT_ACTION = "then press r again. Nothing was billed."
+
+
+def remediation(error: str, *, next_action: str = RETRY_NEXT_ACTION) -> str:
+    """Turn a vendor failure string into the operator's next move.
+
+    Public because the live-transcription bridge shares it. Only the balance
+    branch takes `next_action`; the key branch names a fix that is the same
+    wherever the failure surfaces.
+    """
     if "balance is negative" in error or "Please top up" in error:
-        return (
-            "AssemblyAI balance is negative — top up at assemblyai.com, then press r again. "
-            "Nothing was billed."
-        )
+        return f"AssemblyAI balance is negative — top up at assemblyai.com, {next_action}"
     if "401" in error or "Unauthorized" in error or "Invalid API key" in error:
         return "AssemblyAI rejected the API key — check ASSEMBLYAI_API_KEY in .env."
     return redact(error)

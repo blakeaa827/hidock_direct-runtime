@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from threading import RLock
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .classify import RecordingKind
 
@@ -172,6 +172,78 @@ class WhisperOffloadRequested(Event):
 class UnknownRouted(Event):
     device_filename: str
     as_kind: RecordingKind
+
+
+class LiveChannel(str, Enum):
+    """Which physical end of the call a live turn came from.
+
+    Deliberately has NO `UNKNOWN` member. The device hands us the two ends as
+    separate buffers, so the channel is a fact we hold before transcription
+    starts — it is never inferred from content and therefore can never be
+    undetermined. The SDK's own multi-channel coordinator sums both ends to
+    mono and re-derives attribution from an energy-ratio VAD, whose word-level
+    channel may come back "unknown"; that is exactly the certainty this enum
+    refuses to give up. See `live_transcription_prd.md` §2.
+    """
+
+    NEAR = "near"   # the operator
+    FAR = "far"     # everyone else
+
+
+@dataclass(frozen=True)
+class LiveTranscriptionStarted(Event):
+    """A live session opened. Published once, before any turn."""
+
+    channels: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LiveTurn(Event):
+    """One transcribed turn from one channel.
+
+    `speaker` is the PROVIDER's label (`"A"`, `"B"`, …) or None — never a
+    display name. Mapping a label to a person is the surface's job, applied at
+    render time, so that a later `LiveSpeakerRevision` reassigns lines between
+    labels without invalidating the operator's typed-in names.
+
+    `turn_order` is per-channel: the two sessions number their turns
+    independently, so the identity of a turn is the (channel, turn_order) pair.
+    """
+
+    channel: LiveChannel
+    text: str
+    speaker: Optional[str]
+    turn_order: int
+    is_final: bool
+
+
+@dataclass(frozen=True)
+class LiveSpeakerRevision(Event):
+    """The provider re-clustered and changed an earlier turn's speaker label.
+
+    Carries `channel` because `turn_order` alone does not identify a turn —
+    both sessions count from zero. Only the far channel can produce these (the
+    near channel requests no diarization at all), but naming the channel keeps
+    the identity complete rather than relying on that invariant holding.
+    """
+
+    channel: LiveChannel
+    turn_order: int
+    speaker: Optional[str]
+
+
+@dataclass(frozen=True)
+class LiveTranscriptionStopped(Event):
+    """A live session closed, with the provider's own billed duration.
+
+    The seconds are `Optional` because `TerminationEvent.audio_duration_seconds`
+    is optional upstream. None means "the provider did not tell us" — a metered
+    feature that reports 0.0 when it does not know would understate a real bill.
+    """
+
+    near_seconds: Optional[float]
+    far_seconds: Optional[float]
+    reason: str
 
 
 @dataclass(frozen=True)

@@ -407,17 +407,17 @@ def test_bad_key_batch_aborts_naming_the_key(tmp_path):
 def test_every_operator_actionable_marker_has_a_specific_remediation():
     """Agreement test. The marker vocabulary is implemented twice — once to
     classify (`_OPERATOR_ACTIONABLE_MARKERS`) and once to choose the message
-    (`_remediation`'s branches). A marker with no branch classifies as
+    (`remediation`'s branches). A marker with no branch classifies as
     actionable and then renders the raw error, which is the generic fallback
     wearing the actionable label."""
-    from hidock_direct.retry import _OPERATOR_ACTIONABLE_MARKERS, _remediation
+    from hidock_direct.retry import _OPERATOR_ACTIONABLE_MARKERS, remediation
 
     for marker in _OPERATOR_ACTIONABLE_MARKERS:
         err = f"AssemblyAI request failed: {marker} something"
         assert classify_failure(err) == CLASS_OPERATOR_ACTIONABLE
-        assert _remediation(err) != redact(err), (
+        assert remediation(err) != redact(err), (
             f"marker {marker!r} classifies as operator-actionable but "
-            f"_remediation has no branch for it — it falls through to the "
+            f"remediation has no branch for it — it falls through to the "
             f"generic raw-error message"
         )
 

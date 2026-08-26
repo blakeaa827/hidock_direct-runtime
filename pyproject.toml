@@ -19,7 +19,18 @@ dependencies = [
     # in src/diarize_audio/VENDORED_COMMIT, re-synced via scripts/refresh_diarize.sh);
     # assemblyai is its one non-stdlib runtime dependency, declared here so a base
     # `pip install` of hidock pulls everything the transcription path needs.
-    "assemblyai>=0.30",
+    #
+    # BOUNDED IN BOTH DIRECTIONS, and the floor is load-bearing rather than
+    # decorative. The previous `>=0.30` was not merely loose, it was wrong:
+    # `assemblyai.streaming.v3` does not exist at 0.30, so a resolver honouring
+    # that floor produces an install where live transcription cannot import.
+    # 0.64.21 is the version this suite runs against.
+    #
+    # The ceiling excludes 1.0.0, which is published and unreviewed. This is a
+    # public clone-and-run app: an unbounded major means a stranger's fresh
+    # `pip install` silently picks up an API we have never executed. Raise it
+    # deliberately, against the streaming surface in live_transcribe.py.
+    "assemblyai>=0.64.21,<1",
 ]
 
 [project.optional-dependencies]
