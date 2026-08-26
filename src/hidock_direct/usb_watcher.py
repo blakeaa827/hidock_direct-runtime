@@ -22,6 +22,7 @@ from .jensen import ALL_VENDOR_IDS, HIDOCK_PRODUCT_IDS
 
 AttachCallback = Callable[[int, int], None]  # (vid, pid)
 DetachCallback = Callable[[int, int], None]  # (vid, pid)
+DegradedCallback = Callable[[], None]  # attached-but-unreachable; no ids to report
 
 
 class USBWatcherProtocol(Protocol):
@@ -29,6 +30,7 @@ class USBWatcherProtocol(Protocol):
     def stop(self) -> None: ...
     def on_attach(self, fn: AttachCallback) -> None: ...
     def on_detach(self, fn: DetachCallback) -> None: ...
+    def on_degraded(self, fn: DegradedCallback) -> None: ...
 
 
 class PollingUSBWatcher:
@@ -45,14 +47,21 @@ class PollingUSBWatcher:
         product_ids: Iterable[int] = tuple(HIDOCK_PRODUCT_IDS),
         poll_interval_seconds: float = 1.0,
         enumerate_fn: Optional[Callable[[], List[Tuple[int, int]]]] = None,
+        enumerate_all_fn: Optional[Callable[[], List[Tuple[int, int]]]] = None,
     ):
         self._vendor_ids = set(vendor_ids)
         self._product_ids = set(product_ids)
         self._poll_interval = max(0.1, poll_interval_seconds)
         self._enumerate = enumerate_fn or self._default_enumerate
+        # Separate, UNFILTERED enumeration. Kept distinct from `_enumerate` on
+        # purpose: the audio identity must never enter the attach snapshot, or
+        # we would emit an attach for a device Jensen cannot speak to.
+        self._enumerate_all = enumerate_all_fn
         self._attach_handlers: List[AttachCallback] = []
         self._detach_handlers: List[DetachCallback] = []
+        self._degraded_handlers: List[DegradedCallback] = []
         self._present: Set[Tuple[int, int]] = set()
+        self._degraded_reported = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -61,6 +70,15 @@ class PollingUSBWatcher:
 
     def on_detach(self, fn: DetachCallback) -> None:
         self._detach_handlers.append(fn)
+
+    def on_degraded(self, fn: DegradedCallback) -> None:
+        """Register a handler for 'attached but unreachable' (half-enumerated).
+
+        Fired once per entry into the state, not once per poll — the condition
+        persists until the operator power-cycles, and re-firing every tick would
+        flood the activity log.
+        """
+        self._degraded_handlers.append(fn)
 
     def start(self) -> None:
         if self._thread is not None:
@@ -88,7 +106,37 @@ class PollingUSBWatcher:
                 self._fire(self._attach_handlers, vid, pid)
             for vid, pid in detached:
                 self._fire(self._detach_handlers, vid, pid)
+            self._check_degraded(snapshot)
             self._stop.wait(self._poll_interval)
+
+    def _check_degraded(self, snapshot: Set[Tuple[int, int]]) -> None:
+        """Distinguish 'nothing attached' from 'attached but unreachable'.
+
+        An empty Jensen snapshot is ambiguous: the device may be absent, or it
+        may be half-enumerated (audio identity up, Jensen identity down). The
+        second case is invisible to every other path in the app and is the
+        reason this check exists.
+        """
+        if snapshot:
+            self._degraded_reported = False  # re-arm for the next occurrence
+            return
+        try:
+            from .device import Presence, probe_presence  # lazy: avoids import cycle
+
+            presence = probe_presence(self._enumerate_all)
+        except Exception:
+            return
+        if presence is not Presence.HALF_ENUMERATED:
+            self._degraded_reported = False
+            return
+        if self._degraded_reported:
+            return
+        self._degraded_reported = True
+        for fn in list(self._degraded_handlers):
+            try:
+                fn()
+            except BaseException:
+                pass
 
     def _matches(self, pair: Tuple[int, int]) -> bool:
         vid, pid = pair

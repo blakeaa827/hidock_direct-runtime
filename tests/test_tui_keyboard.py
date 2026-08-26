@@ -39,6 +39,7 @@ class _FakeWatcher:
     def start(self): self.started = True
     def stop(self): pass
     def on_attach(self, fn): self._attach.append(fn)
+    def on_degraded(self, fn): self._degraded = getattr(self, "_degraded", []) + [fn]
     def on_detach(self, fn): pass
     def fire_attach(self, vid=0x10D6, pid=0xAF0C):
         for fn in self._attach: fn(vid, pid)

@@ -157,6 +157,7 @@ class App:
 
         self._watcher.on_attach(self._on_attach)
         self._watcher.on_detach(self._on_detach)
+        self._watcher.on_degraded(self._on_degraded)
         self._watcher.start()
         # Force an initial IdleWaiting publish even though `_state` already
         # holds IDLE_DISCONNECTED — subscribers (TUI) use this as the first
@@ -200,6 +201,25 @@ class App:
         self._cancel_transfer.clear()
         self._detach_signal.clear()
         self._attach_signal.set()
+
+    def _on_degraded(self) -> None:
+        """The P1 is on the bus as an audio device but its data interface is not.
+
+        Without this the app publishes nothing at all in this state: the Jensen
+        snapshot is empty, so no attach fires and `_translate_connect_error` is
+        never reached. The operator sees a dead app while macOS shows the P1 as
+        their active microphone. Name the remedy explicitly — a replug does NOT
+        clear this; the device needs a power cycle.
+        """
+        self._bus.publish(Error(
+            message=(
+                "HiDock detected as an audio device, but its data interface is "
+                "not responding — offload and transcription are unavailable. "
+                "Power cycle the device (a replug is not sufficient)."
+            ),
+            severity=Severity.WARNING,
+            context="presence",
+        ))
 
     def _on_detach(self, vid: int, pid: int) -> None:  # noqa: ARG002
         self._cancel_transfer.set()

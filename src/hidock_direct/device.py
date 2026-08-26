@@ -12,6 +12,7 @@ import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from typing import Callable, List, Optional, Protocol
 
 from .jensen import (
@@ -24,6 +25,70 @@ from .jensen import (
 
 
 SAFE_DEVICE_FILENAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+# The P1 is TWO independent USB devices behind an internal hub (0x2109:0x2122):
+#
+#   0x10D6:0xB00E  vendor-specific (class 255)  -- Jensen control + realtime
+#   0x1395:0x005D  audio (class 1) + HID (3)    -- UAC mic / speaker
+#
+# They enumerate independently, so the device can be physically attached and
+# working as the system microphone while the Jensen interface is absent.
+# ALL_VENDOR_IDS answers "is Jensen reachable?" — it is NOT a presence oracle.
+#
+# Deliberately declared HERE and not appended to ALL_VENDOR_IDS: that constant
+# lives in the vendored `jensen/constants.py`, which `scripts/refresh_jensen.sh`
+# overwrites wholesale, and pointing the Jensen connect path at a device it
+# cannot speak to would turn a clean "not present" into a confusing open failure.
+# Matched on vendor ID ONLY so a future P1 revision with a different audio
+# product ID still registers as present.
+HIDOCK_AUDIO_VENDOR_IDS: tuple[int, ...] = (0x1395,)
+
+
+class Presence(str, Enum):
+    """What the USB bus says about the HiDock, as distinct from reachability."""
+
+    READY = "ready"
+    """Jensen interface enumerated — the app can talk to the device."""
+
+    HALF_ENUMERATED = "half_enumerated"
+    """Audio identity present, Jensen absent. The device is physically attached
+    and may be serving as the system mic, but is unreachable. Recovery is a
+    power cycle — a replug is not sufficient."""
+
+    ABSENT = "absent"
+    """No HiDock on the bus at all."""
+
+
+def _enumerate_all_usb() -> List[tuple[int, int]]:
+    """Every (vid, pid) on the bus — unfiltered, unlike `enumerate_attached`."""
+    try:
+        import usb.core  # lazy: keeps this module importable without pyusb
+    except ImportError:
+        return []
+    pairs: List[tuple[int, int]] = []
+    for dev in usb.core.find(find_all=True) or []:
+        try:
+            pairs.append((int(dev.idVendor), int(dev.idProduct)))
+        except (AttributeError, ValueError):
+            continue
+    return pairs
+
+
+def probe_presence(
+    enumerate_all_fn: Optional[Callable[[], List[tuple[int, int]]]] = None,
+) -> Presence:
+    """Classify HiDock presence into reachable / attached-but-unreachable / absent.
+
+    `enumerate_attached()` answers reachability and collapses the middle case
+    into "nothing there" — which is the bug this exists to fix.
+    """
+    pairs = (enumerate_all_fn or _enumerate_all_usb)()
+    if any(vid in ALL_VENDOR_IDS for vid, _pid in pairs):
+        return Presence.READY
+    if any(vid in HIDOCK_AUDIO_VENDOR_IDS for vid, _pid in pairs):
+        return Presence.HALF_ENUMERATED
+    return Presence.ABSENT
 
 
 class DeviceError(RuntimeError):

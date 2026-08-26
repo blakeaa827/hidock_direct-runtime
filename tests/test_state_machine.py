@@ -49,6 +49,9 @@ class FakeWatcher:
     def on_detach(self, fn: DetachCallback) -> None:
         self._detach.append(fn)
 
+    def on_degraded(self, fn) -> None:
+        self._degraded = getattr(self, "_degraded", []) + [fn]
+
     def fire_attach(self, vid: int = 0x10D6, pid: int = 0xAF0C) -> None:
         for fn in self._attach:
             fn(vid, pid)
