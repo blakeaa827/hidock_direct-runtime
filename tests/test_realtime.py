@@ -96,6 +96,8 @@ def payload(near: List[int], far: List[int], header: bytes = b"\x00\x00\x00\x00"
 def session(jensen: FakeJensen, **kw) -> RealtimeSession:
     kw.setdefault("settle_seconds", 0.0)
     kw.setdefault("sleep", lambda _s: None)
+    kw.setdefault("idle_timeout_seconds", 0.05)
+    kw.setdefault("poll_interval_seconds", 0.0)
     return RealtimeSession(FakeAdapter(jensen), **kw)
 
 
@@ -326,17 +328,35 @@ def test_none_response_is_transient_then_terminates():
 
 
 def test_large_backlog_is_drained_in_one_pass():
-    """FR-2.4: no fixed sleep while data is available."""
-    slept: List[float] = []
+    """FR-2.4: no fixed sleep WHILE DATA IS AVAILABLE.
+
+    A fixed 100 ms interval between reads dropped ~50% of samples in probe runs
+    against the real device. Idle polling may sleep -- that is what bounds a hot
+    spin once the device has nothing buffered -- so the invariant is about
+    sleeping *between frames*, not about sleeping at all.
+    """
+    events: List[str] = []
     j = FakeJensen(transfers=[payload([i], [i]) for i in range(1, 21)] + [b""])
-    s = RealtimeSession(FakeAdapter(j), settle_seconds=0.0, sleep=slept.append)
+    s = RealtimeSession(
+        FakeAdapter(j),
+        settle_seconds=0.0,
+        sleep=lambda v: events.append("sleep") if v > 0 else None,
+        idle_timeout_seconds=0.05,
+        poll_interval_seconds=0.01,
+    )
     s.start()
     try:
-        frames = list(s.frames())
+        frames = []
+        for f in s.frames():
+            frames.append(f)
+            events.append("frame")
     finally:
         s.stop()
     assert len(frames) == 20
-    assert not [v for v in slept if v > 0], f"slept while data was available: {slept}"
+    last_frame = len(events) - 1 - events[::-1].index("frame")
+    assert "sleep" not in events[:last_frame], (
+        f"slept while data was still available: {events[:last_frame]}"
+    )
 
 
 def test_usb_error_terminates_and_names_the_power_cycle_remedy():

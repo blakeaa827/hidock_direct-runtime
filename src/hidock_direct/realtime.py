@@ -118,12 +118,16 @@ class RealtimeSession:
         *,
         settle_seconds: float = 1.0,
         max_consecutive_misses: int = 5,
+        idle_timeout_seconds: float = 10.0,
+        poll_interval_seconds: float = 0.02,
         sleep: Callable[[float], None] = time.sleep,
         usb_errors: Optional[Sequence[type]] = None,
     ):
         self._adapter = adapter
         self._settle = max(0.0, settle_seconds)
         self._max_misses = max(1, max_consecutive_misses)
+        self._idle_timeout = max(0.0, idle_timeout_seconds)
+        self._poll_interval = max(0.0, poll_interval_seconds)
         self._sleep = sleep
         self._usb_errors = tuple(usb_errors) if usb_errors is not None else _default_usb_errors()
         self._active = False
@@ -184,16 +188,24 @@ class RealtimeSession:
         data is available — a fixed 100 ms interval dropped ~50% of samples in
         probe runs against the real device, which emits ~10 chunks/sec.
 
-        Ends normally on a run of empty responses (the device has nothing to
-        send). Raises `RealtimeUnavailable` on a run of *failed* responses —
-        no reply at all, or payloads that are not frame-aligned. Those are
-        different conditions and are deliberately not collapsed.
+        An empty response means "no audio buffered YET", not "the device is
+        done" — the device needs a moment after start() before the first chunk
+        lands, and a conversational pause still produces silence samples rather
+        than empty replies. So emptiness is bounded by WALL CLOCK
+        (`idle_timeout_seconds`), never by a poll count: at bus speed five empty
+        polls elapse in microseconds, which terminated the stream before the
+        real device had produced anything. (Gate 4, 2026-08-26: the count-based
+        version captured 0 bytes while every unit test passed.)
+
+        Raises `RealtimeUnavailable` on a run of *failed* responses — no reply
+        at all, or payloads that are not frame-aligned. Those are a different
+        condition from silence and are deliberately not collapsed with it.
         """
         if not self._active:
             raise RealtimeUnavailable("session is not active; call start() first")
 
-        empty_streak = 0
         error_streak = 0
+        last_data_at = time.monotonic()
 
         while True:
             try:
@@ -206,7 +218,6 @@ class RealtimeSession:
 
             if response is None:
                 error_streak += 1
-                empty_streak = 0
                 if error_streak > self._max_misses:
                     raise RealtimeUnavailable(
                         f"device stopped responding after {error_streak} attempts"
@@ -214,11 +225,15 @@ class RealtimeSession:
                 continue
 
             if len(response) <= _HEADER_BYTES:
-                # A valid answer meaning "nothing available" -- not a failure.
-                empty_streak += 1
+                # A valid answer meaning "nothing buffered yet" -- not a failure,
+                # and not evidence the stream has ended. Bounded by wall clock.
                 error_streak = 0
-                if empty_streak > self._max_misses:
+                if self._idle_timeout and (
+                    time.monotonic() - last_data_at > self._idle_timeout
+                ):
                     return
+                if self._poll_interval:
+                    self._sleep(self._poll_interval)
                 continue
 
             # The leading 4 bytes are a header whose meaning is UNKNOWN:
@@ -228,7 +243,6 @@ class RealtimeSession:
             split = _deinterleave(response[_HEADER_BYTES:])
             if split is None:
                 error_streak += 1
-                empty_streak = 0
                 log.warning(
                     "realtime payload not frame-aligned (%d audio bytes); dropping",
                     len(response) - _HEADER_BYTES,
@@ -239,8 +253,8 @@ class RealtimeSession:
                     )
                 continue
 
-            empty_streak = 0
             error_streak = 0
+            last_data_at = time.monotonic()
             near, far = split
             self._seq += 1
             yield Frame(near=near, far=far, seq=self._seq)
