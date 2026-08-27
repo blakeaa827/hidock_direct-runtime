@@ -93,9 +93,25 @@ class _ChannelSession:
         self._on_event = on_event
         client.on(StreamingEvents.Begin, self._handle_begin)
         client.on(StreamingEvents.Turn, self._handle_turn)
-        client.on(StreamingEvents.SpeakerRevision, self._handle_revision)
         client.on(StreamingEvents.Termination, self._handle_termination)
         client.on(StreamingEvents.Error, self._handle_error)
+        # Optional, and NOT a formality: `SpeakerRevision` was added to the
+        # streaming enum after 0.64.3, which is a version this project has
+        # actually been run against (see
+        # bug_report_assemblyai_sdk_dependency_unbounded — 0.64.3 / 0.64.21 /
+        # 0.64.32 across three machines). Subscribing unconditionally raised
+        # `AttributeError` here, at session construction, on the older SDK.
+        # That killed the whole live session for the sake of an enrichment
+        # event, and reported it as an unreadable type error rather than
+        # "your SDK is too old" — observed live 2026-08-27.
+        #
+        # Degrade instead: everything except far-channel re-clustering works
+        # identically. `_missing_revision_support` is surfaced by the caller so
+        # this is visible rather than silent.
+        revision_event = getattr(StreamingEvents, "SpeakerRevision", None)
+        if revision_event is not None:
+            client.on(revision_event, self._handle_revision)
+        self.revisions_supported = revision_event is not None
 
     # -- provider callbacks ----------------------------------------------
 
@@ -230,6 +246,24 @@ class LiveTranscriber:
         self._bus.publish(LiveTranscriptionStarted(
             channels=tuple(c.value for c in _ORDER),
         ))
+
+        if any(not s.revisions_supported for s in opened):
+            # Observable, not silent. The session is fully usable — only the
+            # provider's after-the-fact speaker re-clustering is missing — but
+            # the operator must be told, because names they assign will not be
+            # retroactively corrected and they would otherwise never know why.
+            import assemblyai
+            self._bus.publish(Error(
+                message=(
+                    f"Live transcription is running, but this AssemblyAI SDK "
+                    f"({assemblyai.__version__}) is too old for speaker revisions — "
+                    f"names will not be corrected if the provider re-clusters. "
+                    f"Fix: ./scripts/bootstrap.sh, or "
+                    f"pip install -U 'assemblyai>=0.64.21,<1' in the venv you launch from."
+                ),
+                severity=Severity.WARNING,
+                context="live",
+            ))
 
     def stop(self, reason: str = "stopped") -> None:
         """Idempotent. Terminates BOTH sessions even if one fails to close."""

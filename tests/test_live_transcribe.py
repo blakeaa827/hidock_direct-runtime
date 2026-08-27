@@ -661,3 +661,42 @@ def test_the_module_never_touches_the_ledger_or_the_archive():
     }
     for banned in ("open", "Path"):
         assert banned not in called, f"live_transcribe must not call {banned}()"
+
+
+def test_an_sdk_without_speaker_revisions_degrades_visibly_instead_of_dying():
+    """Observed live 2026-08-27: the whole session died at construction.
+
+    `StreamingEvents.SpeakerRevision` postdates 0.64.3, a version this project
+    has really been run against. Subscribing unconditionally raised
+    AttributeError inside `_ChannelSession.__init__`, so a missing ENRICHMENT
+    event killed the entire live session — and reported it as
+    `type object 'StreamingEvents' has no attribute 'SpeakerRevision'`, which
+    tells the operator nothing about the actual remedy.
+
+    MUTATION: drop the `getattr(..., None)` guard in `_ChannelSession.__init__`
+    and subscribe unconditionally — this test raises AttributeError.
+    """
+    import hidock_direct.live_transcribe as module
+
+    class OldEnum:
+        Begin = StreamingEvents.Begin
+        Turn = StreamingEvents.Turn
+        Termination = StreamingEvents.Termination
+        Error = StreamingEvents.Error
+        # No SpeakerRevision — exactly the 0.64.3 surface.
+
+    h = Harness()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(module, "StreamingEvents", OldEnum)
+        with h.transcriber:
+            h.far.emit(StreamingEvents.Turn, turn("still transcribing"))
+
+    # The session ran.
+    assert [t.text for t in h.of(LiveTurn)] == ["still transcribing"]
+
+    # And the operator was told, in terms they can act on.
+    warnings = [e for e in h.of(Error) if e.severity is Severity.WARNING]
+    assert warnings, "the degraded branch was silent"
+    said = warnings[0].message
+    assert "assemblyai" in said.lower()
+    assert "bootstrap.sh" in said or "pip install" in said
