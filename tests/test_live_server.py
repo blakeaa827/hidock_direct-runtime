@@ -4292,3 +4292,42 @@ def test_an_unplug_is_reported_to_the_operator_in_their_own_language(
     # The claim is released either way — a translated message that stranded the
     # device claim would be a nicer sentence about a worse bug.
     assert harness.resumes == 1
+
+
+def test_every_element_with_an_explicit_display_can_still_be_hidden():
+    """The `hidden` attribute is only as strong as the UA stylesheet.
+
+    `[hidden] { display: none }` comes from the user-agent sheet, so ANY author
+    rule with an explicit `display` outranks it. `#live-indicator` sets
+    `display: inline-flex`, so `indicator.hidden = true` set the attribute and
+    changed nothing on screen — the operator saw
+    "LIVE — audio is streaming to AssemblyAI" next to "Session ended"
+    (2026-08-27). FR-2.5 calls that indicator a security control; an indicator
+    that cannot turn off is one the operator learns to stop reading, which
+    costs the signal exactly when it matters.
+
+    Structural rather than element-specific: any FUTURE element that sets a
+    display and is toggled with `hidden` inherits the same trap, so this pins
+    the override that saves all of them.
+
+    MUTATION: delete the `[hidden] { display: none !important; }` rule, or drop
+    its `!important`, and this test fails.
+    """
+    import re
+
+    from hidock_direct.live_server import PAGE
+
+    css = PAGE
+    override = re.search(r"\[hidden\]\s*\{[^}]*display\s*:\s*none\s*!important", css)
+    assert override, (
+        "no `[hidden] { display: none !important }` rule — an element with an "
+        "explicit `display` cannot be hidden by the `hidden` attribute"
+    )
+
+    # And the specific element that caught it must still declare its display,
+    # so this test keeps meaning something rather than passing because the
+    # conflict was removed.
+    assert re.search(r"#live-indicator\s*\{[^}]*display\s*:", css), (
+        "#live-indicator no longer sets a display; re-point this test at "
+        "whatever element now needs the override, or drop it"
+    )

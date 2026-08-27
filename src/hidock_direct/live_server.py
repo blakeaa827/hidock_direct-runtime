@@ -202,6 +202,18 @@ PAGE = """<!doctype html>
     display: flex; align-items: center; gap: 1rem; padding: .6rem 1rem;
     border-bottom: 1px solid #2b2f36; background: #191c21;
   }
+  /* The `hidden` ATTRIBUTE only works through the UA stylesheet's
+     `[hidden] { display: none }`, which ANY author rule with an explicit
+     `display` outranks — an id selector trivially so. `#live-indicator` sets
+     `display: inline-flex`, so `indicator.hidden = true` set the attribute and
+     changed nothing: the session ended and the page still read
+     "LIVE — audio is streaming to AssemblyAI" beside "Session ended".
+     Observed by the operator 2026-08-27.
+
+     Global and `!important` on purpose. Scoping it to #live-indicator would fix
+     the element that happens to have been caught and leave the next one to be
+     found the same way — by someone reading a screenshot. */
+  [hidden] { display: none !important; }
   #live-indicator {
     font-weight: 600; letter-spacing: .02em; color: #ff5f56;
     display: inline-flex; align-items: center; gap: .45rem;
