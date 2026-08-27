@@ -13,8 +13,11 @@ from .app import App
 from .config import load_config, load_env_file_into_environ
 from .device import JensenDeviceAdapter
 from .events import Error, EventBus, RetryCandidatesDetected, Severity, TranscribeSkipped
+from .live_server import LiveSessionController, LiveSurface, launch_app_window
+from .live_transcribe import LiveTranscriber
 from .locks import FileLock, LockHeld
 from .offload import Offloader
+from .realtime import RealtimeSession
 from .state import StateStore
 from .tui import TUI
 from .usb_watcher import PollingUSBWatcher
@@ -133,6 +136,28 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
     from .retry import run_retry_batch
 
     retry_provider = lambda: load_retry_candidates(config.archive_dir)  # noqa: E731
+    # The live-transcription stack (PRD live_surface_prd.md FR-5.1). Every seam
+    # the controller accepts is supplied here with the REAL collaborator, not
+    # left to a default: `ad98cbc` shipped the retry surface fully tested and
+    # completely unreachable because this file supplied no provider, and a
+    # permissive default that only the test suite ever fills is that bug wearing
+    # a kwarg. `busy_predicate` reads `app.device_busy` live rather than
+    # snapshotting it — the offload worker and live capture share one Jensen
+    # endpoint (FR-6.1..6.3), so the answer must be current at the keypress.
+    live = LiveSessionController(
+        bus=bus,
+        adapter=adapter,
+        api_key=config.assemblyai_api_key,
+        operator_name=config.operator_name,
+        max_speakers=config.live_max_speakers,
+        suspend_polling=app.suspend_device_polling,
+        resume_polling=app.resume_device_polling,
+        busy_predicate=lambda: app.device_busy,
+        surface_factory=LiveSurface,
+        capture_factory=RealtimeSession,
+        transcriber_factory=LiveTranscriber,
+        launch_browser=launch_app_window,
+    )
     tui = TUI(
         bus=bus,
         app=app,
@@ -142,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         retry_runner=lambda selected: run_retry_batch(
             selected, config.archive_dir, bus=bus
         ),
+        live_controller=live,
     )
 
     if config.transcribe_on_offload:
@@ -151,8 +177,34 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
     # to the bus in its constructor, so this reaches it even pre-start().
     publish_retry_candidate_count(bus, retry_provider)
 
+    shutting_down = False
+
     def _shutdown(signum, frame):  # noqa: ARG001
-        app.stop()
+        # Signals are delivered on the main thread, so a second ^C arriving
+        # while this handler is still unwinding re-enters it right here. Latch
+        # before doing any work: the second pass would otherwise re-drive a
+        # device teardown the first pass is still in the middle of.
+        nonlocal shutting_down
+        if shutting_down:
+            return
+        shutting_down = True
+        # ORDER IS LOAD-BEARING, and it is the opposite of the order the exit
+        # path reads in. `app.stop()` disconnects the adapter, and
+        # `JensenDeviceAdapter.disconnect()` drops `_jensen` — after that the
+        # live session has no transport left to send the realtime STOP opcode
+        # on, and the HiDock stays in streaming mode until it is power-cycled.
+        # So the live session stops FIRST, while the claim it is streaming
+        # over is still open (FR-1.6, FR-6.3).
+        #
+        # Safe to call from a signal handler: `stop()` returns immediately when
+        # no session is running, and its wait on the pump thread is capped at
+        # 5s, so the handler is bounded rather than blocking indefinitely.
+        try:
+            live.stop(reason="app shutting down")
+        finally:
+            # Unconditional: a live teardown that failed must still end the
+            # app, and this is the only call that releases `app.run()`.
+            app.stop()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -161,8 +213,28 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
     try:
         app.run()
     finally:
-        tui.stop()
-        lock.release()
+        # Defence in depth, for the paths that do NOT go through `_shutdown`:
+        # `app.run()` returning on its own, or raising. A live session outlives
+        # `app.run()` on its own thread, so those paths would otherwise leave a
+        # metered third-party stream and a suspended offload worker to be torn
+        # down by process death rather than by the code that owns them
+        # (FR-1.6, FR-6.3).
+        #
+        # On the signal path this is already a no-op — `_shutdown` stopped the
+        # session before anything disconnected the adapter, so `is_live` is
+        # False here. That is the correct outcome and not a missed teardown: by
+        # this point `app.stop()` has dropped the Jensen handle, so a stop
+        # attempted from here could no longer reach the device at all.
+        #
+        # Nested so a raise here can never skip `lock.release()` — a stranded
+        # lock file makes the NEXT launch fail, which is a worse failure than
+        # the one being handled.
+        try:
+            if live.is_live:
+                live.stop(reason="app shutting down")
+        finally:
+            tui.stop()
+            lock.release()
     return 0
 
 

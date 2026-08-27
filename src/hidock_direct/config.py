@@ -10,14 +10,19 @@ Env-file discovery order (first existing file wins):
   2. `./.env` in the runtime root (clone-local; copy from .env.example).
 
 Per-variable precedence within `load_config`: real process env > `.env` file >
-default. Only the four hidock variables below are typed here; the AssemblyAI key
-and DRIVE_ENABLED are consumed by the vendored diarize_audio.
+default. DRIVE_ENABLED and the rest of the transcription pipeline's settings are
+consumed by the vendored diarize_audio straight from `os.environ`.
+ASSEMBLYAI_API_KEY is read in *both* places: diarize_audio still takes it from
+`os.environ` on the offload path, and it is typed here as well so the live
+transcription bridge can be handed a value at composition time instead of
+reading a process global at use time — the shape that produced the INBOX_DIRS
+defect (see `diarize_config_for_archive` below).
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -37,6 +42,13 @@ class Config:
     transcribe_on_offload: bool
     log_level: str
     source: str  # "env" or "<path>" — for diagnostics
+    operator_name: str  # HIDOCK_OPERATOR_NAME — the live surface's near-channel identity
+    live_max_speakers: int  # HIDOCK_LIVE_MAX_SPEAKERS — far-channel diarization ceiling
+    # Never in the repr: `Config` is printed in diagnostics, and a live key
+    # reached a session transcript that way on 2026-08-22. No field carries a
+    # dataclass default — `load_config` is the single place a default is
+    # resolved, so the two cannot drift.
+    assemblyai_api_key: str = field(repr=False)
 
     @property
     def state_dir(self) -> Path:
@@ -149,6 +161,14 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     delete = _resolve("DELETE_FROM_DEVICE_AFTER_OFFLOAD", "false", env_values, overlay)
     transcribe = _resolve("TRANSCRIBE_ON_OFFLOAD", "true", env_values, overlay)
     log = _resolve("LOG_LEVEL", "info", env_values, overlay).lower()
+    # An exported-but-empty variable is "unset" for FR-4.2's purposes: a blank
+    # operator name would attribute the operator's own lines to nobody, which
+    # reads as a rendering fault rather than as a default. "Me" is neutral and
+    # true for every user of a public clone — never the maintainer's name, and
+    # never derived from the OS account, which is frequently a handle.
+    operator = _resolve("HIDOCK_OPERATOR_NAME", "Me", env_values, overlay).strip() or "Me"
+    speakers = _resolve("HIDOCK_LIVE_MAX_SPEAKERS", "6", env_values, overlay)
+    api_key = _resolve("ASSEMBLYAI_API_KEY", "", env_values, overlay)
 
     try:
         poll_int = int(poll)
@@ -156,6 +176,19 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
         raise ValueError(f"POLL_INTERVAL_SECONDS must be an integer, got {poll!r}") from exc
     if poll_int <= 0:
         raise ValueError(f"POLL_INTERVAL_SECONDS must be > 0, got {poll_int}")
+
+    # Same shape as POLL_INTERVAL_SECONDS: a typo is a loud startup failure
+    # naming the variable, not a silent fallback to the default (which the
+    # operator would never learn about) and not a TypeError from inside a paid
+    # live session.
+    try:
+        speakers_int = int(speakers)
+    except ValueError as exc:
+        raise ValueError(
+            f"HIDOCK_LIVE_MAX_SPEAKERS must be an integer, got {speakers!r}"
+        ) from exc
+    if speakers_int <= 0:
+        raise ValueError(f"HIDOCK_LIVE_MAX_SPEAKERS must be > 0, got {speakers_int}")
 
     delete_bool = str(delete).strip().lower() in _TRUE_SET
     transcribe_bool = str(transcribe).strip().lower() in _TRUE_SET
@@ -169,4 +202,7 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
         transcribe_on_offload=transcribe_bool,
         log_level=log,
         source=str(env_path) if env_path else "env",
+        operator_name=operator,
+        live_max_speakers=speakers_int,
+        assemblyai_api_key=api_key,
     )

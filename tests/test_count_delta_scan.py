@@ -7,10 +7,18 @@ The expensive scan (`list_files`, ~27s on a full P1) must fire exactly:
 On polls where count is unchanged, the worker must stay in CONNECTED_IDLE
 and NOT call `list_files`. This is the core architectural win that keeps
 the TUI's `w`/`u` keys responsive on large devices.
+
+Polling is NOT unconditional-while-connected. Since the live-surface PRD's
+FR-6.1 the condition is "polling runs while connected **and no live session
+holds the device**": a live `RealtimeSession` issues Jensen commands on the
+same USB endpoint this worker polls, so exactly one consumer drives the
+device at a time. `test_a_suspended_worker_issues_no_jensen_commands_but_
+keeps_looping` below pins that second conjunct in both directions.
 """
 
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 from datetime import datetime
@@ -169,6 +177,100 @@ def test_count_delta_triggers_a_new_list_files(tmp_path: Path):
         )
         assert mock.list_files_calls > baseline_list_calls, \
             "count delta should have triggered a new list_files"
+    finally:
+        app.stop()
+        runner.join(timeout=3.0)
+
+
+def test_a_suspended_worker_issues_no_jensen_commands_but_keeps_looping(tmp_path: Path):
+    """FR-6.1 (live-surface PRD §6.4 migrate-fixture). The two tests above pin
+    *what* the poll costs; this one pins *when* it is allowed to run at all.
+
+    A live transcription session claims the Jensen endpoint, so a suspended
+    worker must issue zero device commands -- not merely skip the expensive
+    `list_files`, but not even the cheap `get_file_count`, because two threads
+    interleaving request/response pairs on one endpoint corrupts both.
+
+    The loop itself must stay alive: suspension is not a shutdown. A worker
+    that stopped iterating would never see the detach signal, and would never
+    resume when the session ended. Loop liveness is measured through the
+    injected sleep -- the one per-iteration side effect the worker makes
+    observable -- so "silent device" and "stopped worker" cannot be confused.
+    """
+    files = [MockFile(name="20260414-100000-Rec1.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 10, 0, 0))]
+    mock = _CountingDevice(files=files)
+    archive = tmp_path / "arch"
+    (archive / ".state").mkdir(parents=True, exist_ok=True)
+    (archive / ".tmp").mkdir(parents=True, exist_ok=True)
+    bus = EventBus()
+    store = StateStore(archive / ".state" / "offload_state.json")
+    watcher = _FakeWatcher()
+    offloader = Offloader(
+        adapter=mock, store=store, bus=bus,
+        archive_dir=archive, tmp_dir=archive / ".tmp",
+        delete_after_offload=False,
+        transcribe_on_offload=False,
+        hta_converter=_FakeHTAConverter(),
+        sleep=lambda *_a, **_k: None,
+    )
+    # poll_interval_seconds=1 makes the worker call `sleep` exactly once per
+    # iteration; the fake returns instantly, so this counts loop passes
+    # without slowing the test.
+    sleeps = itertools.count()
+    ticks = {"n": 0}
+
+    def _counting_sleep(*_a, **_k):
+        ticks["n"] = next(sleeps)
+
+    app = App(
+        adapter=mock, watcher=watcher, offloader=offloader, store=store, bus=bus,
+        poll_interval_seconds=1, sleep=_counting_sleep,
+    )
+    runner = threading.Thread(target=app.run, daemon=True)
+    runner.start()
+    try:
+        _wait_until(lambda: watcher.started, msg="watcher never started")
+        watcher.fire_attach()
+        _wait_until(
+            lambda: store.is_processed(_key(), "20260414-100000-Rec1.hda"),
+            timeout=5.0, msg="first scan never completed",
+        )
+
+        app.suspend_device_polling()
+
+        # Let any poll that was already in flight when the flag was set run to
+        # completion, so the baseline below cannot absorb a pre-suspension call
+        # and report it as a post-suspension one.
+        settle = ticks["n"]
+        _wait_until(lambda: ticks["n"] >= settle + 2, msg="worker stopped looping on suspend")
+
+        quiet_counts = mock.get_file_count_calls
+        quiet_lists = mock.list_files_calls
+        observed = ticks["n"]
+        _wait_until(
+            lambda: ticks["n"] >= observed + 3,
+            msg="worker stopped looping while suspended -- suspension is not a shutdown",
+        )
+
+        assert mock.get_file_count_calls == quiet_counts, (
+            f"a suspended worker issued {mock.get_file_count_calls - quiet_counts} "
+            f"get_file_count command(s) while a live session held the device"
+        )
+        assert mock.list_files_calls == quiet_lists, (
+            f"a suspended worker issued {mock.list_files_calls - quiet_lists} "
+            f"list_files command(s) while a live session held the device"
+        )
+        assert app.state is AppState.CONNECTED_IDLE, (
+            f"suspension moved the state machine to {app.state}; the device is "
+            f"present and healthy, merely claimed elsewhere"
+        )
+
+        # ...and the device is polled again the moment the session releases it.
+        app.resume_device_polling()
+        _wait_until(
+            lambda: mock.get_file_count_calls > quiet_counts,
+            msg="polling never resumed after the live session released the device",
+        )
     finally:
         app.stop()
         runner.join(timeout=3.0)

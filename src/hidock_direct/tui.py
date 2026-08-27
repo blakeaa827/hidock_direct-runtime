@@ -7,8 +7,10 @@ in-flight downloads, recent log, session counters), and renders via
 Keyboard input: when stdin is a TTY, a `KeyboardReader` thread puts the
 terminal in cbreak mode and dispatches single keypresses to the TUI. Keys
 open the whisper selector modal (`w`) or the unknown-file prompt (`u`),
-both of which call into `App.offload_whisper` / `App.route_unknown`. When
-stdin is NOT a TTY (tests, piped input), the reader no-ops silently.
+both of which call into `App.offload_whisper` / `App.route_unknown`; `r`
+opens the retry confirm and `l` toggles the live-transcription session
+through the injected controller. When stdin is NOT a TTY (tests, piped
+input), the reader no-ops silently.
 """
 
 from __future__ import annotations
@@ -195,6 +197,7 @@ class TUI:
         pending_unknowns_provider=None,
         retry_candidates_provider=None,
         retry_runner=None,
+        live_controller=None,
         console: Optional[Console] = None,
         refresh_hz: float = 4.0,
         keyboard: Optional[KeyboardReader] = None,
@@ -206,6 +209,11 @@ class TUI:
         self._retry_candidates_provider = retry_candidates_provider or (lambda: [])
         # Injected by __main__; None in tests that never start a batch.
         self._retry_runner = retry_runner
+        # The live-transcription session controller (`l`). Injected by __main__;
+        # None only in tests that never press `l`. A None here in a real build is
+        # the `ad98cbc` shape — a surface built, tested, and reachable from no
+        # keystroke — so `_on_key` says so out loud rather than no-opping.
+        self._live_controller = live_controller
         self._pending_whispers_provider = pending_whispers_provider or (lambda: [])
         self._pending_unknowns_provider = pending_unknowns_provider or (lambda: [])
         self._console = console or Console()
@@ -438,7 +446,8 @@ class TUI:
             `handle_unknown_prompt`, then advance to the next unknown or close.
           - Else at top level → `w` opens whisper selector, `u` opens unknown
             prompt. Both ignored unless `keys_active_in_state(self._state)`
-            passes per PRD §2.6.
+            passes per PRD §2.6. `r` (retry) and `l` (live session) are
+            dispatched ahead of that gate — see below.
         """
         with self._lock:
             current_state = self._state
@@ -484,6 +493,25 @@ class TUI:
                 )
                 return
             self._open_retry_confirm()
+            return
+
+        # `l` is dispatched ahead of the whisper/unknown gate for the same reason
+        # `r` is, plus one of its own: the live session's refusal condition is
+        # FR-6.2 ("a transfer is in flight"), and the controller owns that
+        # message because only it can name the offload. Routing `l` after the
+        # gate would answer "keys active only in CONNECTED_IDLE" for exactly the
+        # states — DRAINING, SCANNING — where the operator most needs the real
+        # reason. `toggle()` is contracted never to raise: a refusal reaches the
+        # operator as an `Error` on the bus, because an exception on the
+        # keyboard thread is swallowed by `KeyboardReader._run`.
+        if ch == "l":
+            if self._live_controller is None:
+                self._log_key_ignored(
+                    "key 'l' ignored: this build has no live-session controller "
+                    "wired — live transcription is unreachable"
+                )
+                return
+            self._live_controller.toggle()
             return
 
         if not keys_active_in_state(current_state):

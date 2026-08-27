@@ -415,3 +415,103 @@ def test_missing_pyusb_yields_no_usb_error_types_and_says_so(monkeypatch, caplog
     assert any("pyusb" in r.message for r in caplog.records), (
         "degraded branch returned () with no operator-visible signal"
     )
+
+
+def test_stop_ends_an_in_flight_frames_generator_promptly():
+    """`stop()` on another thread must stop the stream, not merely mark it.
+
+    `_active` used to be read only at the ENTRY to `frames()`, so a generator
+    already running never saw the flag clear and kept issuing CMD 34 until the
+    wall-clock idle timeout. The live surface joins its pump for 5s while this
+    module's idle timeout defaults to 10s, so the device claim was released
+    while capture was still driving the endpoint — deterministically, on every
+    ordinary stop, not as a race.
+
+    MUTATION: delete the `if not self._active: return` guard at the top of
+    `frames()`'s while-loop and this test hangs on the un-ending generator.
+    """
+    payload = interleave([1] * 4, [2] * 4)
+    jensen = FakeJensen(transfers=[payload] * 500)
+    adapter = FakeAdapter(jensen)
+
+    session = RealtimeSession(adapter, settle_seconds=0, idle_timeout_seconds=10.0)
+    session.start()
+
+    drained = []
+    for frame in session.frames():
+        drained.append(frame)
+        if len(drained) == 3:
+            session.stop()          # what `__exit__` does, from the caller's side
+
+    # Without the guard this loop only ends when the 10s idle timeout expires,
+    # which needs the fake to run dry — 500 chunks say it would not.
+    assert len(drained) == 3, "frames() kept pulling from the device after stop()"
+    assert not session._active
+
+
+def test_a_stop_arriving_during_start_is_not_silently_dropped():
+    """`stop()` used to no-op while `_active` was still False.
+
+    The live surface stops from the keyboard thread while `start()` may still
+    be mid-handshake, so this is ordinary, not exotic. Dropping the intent left
+    the device IN realtime mode with nobody to take it out — which needs a
+    power cycle, not a replug.
+
+    The stop is fired from inside the START control call, which is exactly
+    where the real race lands. (Firing it *before* start() is a different
+    thing: `stop()` on a never-started session is a documented no-op, and the
+    flag is deliberately scoped to one start attempt so a session object stays
+    restartable — see test_settle_interval_is_enforced_between_sessions.)
+
+    MUTATION: move `self._stop_requested = True` below the `if not
+    self._active: return` guard in `stop()` and this test fails.
+    """
+    jensen = FakeJensen(transfers=[])
+    adapter = FakeAdapter(jensen)
+    session = RealtimeSession(adapter, settle_seconds=0)
+
+    real_send = jensen._send_and_receive
+
+    def send(cmd, body=b"", timeout_ms=5000):
+        result = real_send(cmd, body, timeout_ms)
+        if cmd == CMD_CONTROL and bytes(body) == START_BODY:
+            session.stop()          # lands mid-handshake, from "another thread"
+        return result
+
+    jensen._send_and_receive = send
+
+    with pytest.raises(RealtimeUnavailable, match="cancelled"):
+        session.start()
+
+    controls = [body for cmd, body in jensen.sent if cmd == CMD_CONTROL]
+    assert START_BODY in controls, "the handshake did happen"
+    assert STOP_BODY in controls, "the device was NOT left in realtime mode"
+    assert not session._active
+
+
+def test_settle_pacing_survives_a_fresh_session_object(monkeypatch):
+    """The settle interval is a fact about the DEVICE, not about an instance.
+
+    Every consumer builds a new `RealtimeSession` per session — the live
+    surface does exactly that on each `l` press — so per-instance state made
+    this guard read None on every restart that has ever happened.
+
+    MUTATION: change `_await_settle`/`_mark_stopped` back to reading and
+    writing a per-instance `self._last_stop_at` and this test fails.
+    """
+    import hidock_direct.realtime as rt
+
+    monkeypatch.setattr(rt, "_last_stop_at_process", None)
+    slept: List[float] = []
+
+    first = RealtimeSession(FakeAdapter(FakeJensen()), settle_seconds=5.0,
+                            sleep=slept.append)
+    first.start()
+    first.stop()
+
+    # A brand-new object, exactly as the controller builds one.
+    second = RealtimeSession(FakeAdapter(FakeJensen()), settle_seconds=5.0,
+                             sleep=slept.append)
+    second.start()
+
+    assert slept and slept[-1] > 0, "the restart was not paced at all"

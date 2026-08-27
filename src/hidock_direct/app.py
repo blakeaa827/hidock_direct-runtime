@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 from .classify import RecordingKind
 from .device import DeviceAdapter, DeviceError, DeviceNotConnected, TransferAborted
@@ -136,6 +137,25 @@ class App:
         # (or on first-after-attach, signalled by `None`). Leaves the app
         # in CONNECTED_IDLE continuously, keeping `w`/`u` keys responsive.
         self._last_known_count: Optional[int] = None
+        # Device mutual exclusion with a live transcription session. An Event,
+        # not a counter -- see `suspend_device_polling` for why the difference
+        # is load-bearing. Set from the live controller's thread and read from
+        # the worker thread, which is what an Event is for.
+        self._polling_suspended = threading.Event()
+        # In-flight Jensen command tracking. `_polling_suspended` stops the
+        # *next* command from being issued; it says nothing about one already
+        # on the wire. `get_file_count` is issued from CONNECTED_IDLE, before
+        # the transition to SCANNING, so the state machine alone reports the
+        # endpoint as free for that command's whole duration.
+        #
+        # A depth counter behind a Condition, not an Event: commands are issued
+        # from two threads (the worker loop, and the TUI thread via
+        # `_offload_pending`), so a single flag cleared by whichever finishes
+        # first would declare the endpoint free while the other still holds it.
+        # Every increment is paired with a decrement in a `finally`, so the
+        # counter cannot drift the way an unbalanced suspend/resume pair would.
+        self._device_command_cv = threading.Condition()
+        self._device_command_depth = 0
 
     @property
     def state(self) -> AppState:
@@ -194,6 +214,125 @@ class App:
                 self._adapter.disconnect()
             except DeviceError:
                 pass
+
+    # -- device mutual exclusion (live transcription) -------------------
+
+    @contextmanager
+    def _device_command(self) -> Iterator[None]:
+        """Mark the Jensen endpoint as held for the duration of one adapter call.
+
+        Wraps every command this app issues to the device, from either thread,
+        so `device_busy` covers commands that are on the wire *now* and not only
+        the states that imply a long-running one. The decrement is in a
+        `finally`: a raising command still releases the endpoint, otherwise one
+        `DeviceError` would report the device as permanently busy and refuse
+        every live session for the life of the process.
+        """
+        with self._device_command_cv:
+            self._device_command_depth += 1
+        try:
+            yield
+        finally:
+            with self._device_command_cv:
+                self._device_command_depth -= 1
+                if self._device_command_depth <= 0:
+                    self._device_command_depth = 0
+                    self._device_command_cv.notify_all()
+
+    def suspend_device_polling(self, timeout: float = 5.0) -> bool:
+        """Stop issuing Jensen commands from the worker loop for the duration
+        of a live transcription session (live-surface PRD FR-6.1).
+
+        `_run_scan_and_drain` calls `adapter.get_file_count()` and a live
+        `RealtimeSession` issues CMD 33/34 through `adapter._jensen` -- the
+        same USB endpoint on the same device. Two threads issuing Jensen
+        commands concurrently interleave request/response pairs, so exactly
+        one consumer drives the device at a time.
+
+        A flag, not a nesting counter. Suspend and resume are each called from
+        more than one path (session start, session stop, the capture pump's
+        `finally`), and an unbalanced pair on a counter leaves the worker
+        suspended for the life of the process -- a failure whose only symptom
+        is the *absence* of offloads, which is the hardest kind to notice.
+        Both directions are therefore idempotent by construction. (The
+        `_device_command_depth` counter below is a different quantity -- one
+        in-flight command, always released in a `finally` -- and does not make
+        the suspension itself re-entrant.)
+
+        The loop itself keeps running: attach/detach handling, shutdown, and
+        the state machine are untouched. Only the device poll is skipped.
+
+        Setting the flag is not sufficient on its own. The flag is read at the
+        top of `_run_scan_and_drain`, so it stops the *next* command; a command
+        already on the wire -- typically the `get_file_count` issued from
+        CONNECTED_IDLE -- runs to completion regardless. Fire-and-forget
+        suspension therefore still permits CMD 32 START to interleave with an
+        outstanding poll on the same endpoint. So this sets the flag first (no
+        new command can start) and then waits for the in-flight one to drain.
+
+        The wait is bounded, never indefinite: pressing `l` must not hang the
+        operator's UI behind a transfer that could take minutes. On timeout the
+        suspension still stands -- releasing it would be strictly worse -- and
+        the operator is told on the bus, because a silent overlap surfaces later
+        as an unexplained capture failure.
+
+        Returns True when the endpoint was confirmed idle before returning,
+        False when the bounded wait expired (suspended either way).
+        """
+        self._polling_suspended.set()
+        with self._device_command_cv:
+            drained = self._device_command_cv.wait_for(
+                lambda: self._device_command_depth == 0, timeout=timeout
+            )
+        if not drained:
+            self._bus.publish(Error(
+                message=(
+                    "Live session claimed the HiDock while a device command was "
+                    f"still in flight (waited {timeout:g}s). Offload polling is "
+                    "suspended, but the first moments of live capture may "
+                    "interleave with that command. If capture fails to start, "
+                    "stop the live session, let the transfer finish, and start "
+                    "it again."
+                ),
+                severity=Severity.WARNING,
+                context="live_session",
+            ))
+        return drained
+
+    def resume_device_polling(self) -> None:
+        """Release the FR-6.1 suspension. Idempotent, and safe when nothing was
+        ever suspended: the live controller calls this from a `finally` that
+        also runs when the session failed *before* suspending (FR-6.3), so a
+        guard that raised there would invert the guarantee it protects.
+        """
+        self._polling_suspended.clear()
+
+    @property
+    def device_busy(self) -> bool:
+        """True while this worker is holding the Jensen endpoint (FR-6.2).
+
+        SCANNING runs `list_files` (~27 s on a 1201-file P1) and DRAINING
+        streams a file off the device; both own the endpoint for their whole
+        duration, so a live session started in either would interleave with an
+        in-flight transfer. CONNECTED_IDLE holds nothing *between* polls and
+        IDLE_DISCONNECTED has no device at all -- refusing there would make
+        live transcription unusable in the app's normal state.
+
+        The state alone is not the whole predicate. `get_file_count` is issued
+        from CONNECTED_IDLE, before the transition to SCANNING, and the single-
+        file `_offload_pending` path (the `w`/`u` keys) streams from the TUI
+        thread without transitioning at all. Both hold the endpoint in a state
+        this table calls free, so the in-flight command depth is read too --
+        it is what makes "between polls" mean between and not during.
+
+        A property rather than a stored flag, because the live controller holds
+        `lambda: app.device_busy`: a value captured at wiring time would report
+        the state at launch, forever.
+        """
+        if self.state in (AppState.SCANNING, AppState.DRAINING):
+            return True
+        with self._device_command_cv:
+            return self._device_command_depth > 0
 
     # -- watcher callbacks ---------------------------------------------
 
@@ -272,7 +411,8 @@ class App:
 
     def _handle_attach(self) -> None:
         try:
-            info = self._adapter.connect()
+            with self._device_command():
+                info = self._adapter.connect()
         except (DeviceError, ConnectionError) as exc:
             self._bus.publish(Error(
                 message=_translate_connect_error(str(exc)),
@@ -312,18 +452,45 @@ class App:
         )
 
     def _offload_pending(self, device_filename: str, *, bucket: list, kind: RecordingKind, failure_context: str) -> bool:
+        # FR-5.5 / FR-6.1, the other direction. `_run_scan_and_drain` already
+        # refuses to poll while a live session holds the endpoint, but this is
+        # the app's second consumer of it: the `w` and `u` keys stream a file
+        # off the device from the TUI thread, on the same Jensen endpoint, and
+        # nothing in the state machine stands between them and a live capture.
+        # An exclusion that only holds one way is not an exclusion.
+        #
+        # Refused, not queued: a silent queue means the transfer starts minutes
+        # later with no operator action, which is exactly the surprise FR-6.2
+        # rejects at the other door. Returning False (rather than raising)
+        # leaves the bucket untouched, so the file stays listed and the footer
+        # count still matches what is actually on the device.
+        if self._polling_suspended.is_set():
+            action = "meeting offload" if kind is RecordingKind.MEETING else "whisper offload"
+            self._bus.publish(Error(
+                message=(
+                    f"{action.capitalize()} refused: a live transcription session "
+                    "is holding the HiDock's USB interface, and the device can "
+                    f"only be driven by one at a time. {device_filename} was not "
+                    "transferred and is still on the device. Stop the live "
+                    "session (press l), then offload it again."
+                ),
+                severity=Severity.WARNING,
+                context=failure_context,
+            ))
+            return False
         if self._device_key is None:
             return False
         target = next((f for f in bucket if f.name == device_filename), None)
         if target is None:
             return False
         try:
-            self._offloader.offload_one(
-                device_key=self._device_key,
-                file=target,
-                kind=kind,
-                cancel_event=self._cancel_transfer,
-            )
+            with self._device_command():
+                self._offloader.offload_one(
+                    device_key=self._device_key,
+                    file=target,
+                    kind=kind,
+                    cancel_event=self._cancel_transfer,
+                )
         except TransferAborted as exc:
             # A transfer-aborted mid-stream is the only class that leaves the
             # file on the device in a retriable state. The operator should be
@@ -362,11 +529,12 @@ class App:
         return True
 
     def _handle_disconnect(self) -> None:
-        if self._adapter.is_connected():
-            try:
-                self._adapter.disconnect()
-            except DeviceError:
-                pass
+        with self._device_command():
+            if self._adapter.is_connected():
+                try:
+                    self._adapter.disconnect()
+                except DeviceError:
+                    pass
         self._cancel_transfer.clear()
         self._detach_signal.clear()
         self._device_key = None
@@ -376,12 +544,22 @@ class App:
         self._transition(AppState.IDLE_DISCONNECTED)
 
     def _run_scan_and_drain(self) -> None:
+        # FR-6.1: a live transcription session holds the Jensen endpoint. The
+        # check lives HERE, immediately above the command that would be issued,
+        # rather than in the loop's scaffolding -- a flag consulted only by the
+        # caller still lets every other entry into this method interleave USB
+        # traffic with live capture. Returning (rather than raising
+        # DeviceNotConnected) keeps the state machine where it is: the device
+        # is present and healthy, it is simply claimed by someone else.
+        if self._polling_suspended.is_set():
+            return
         if self._device_key is None:
             raise DeviceNotConnected()
         # Count-delta gate. `get_file_count` is cheap; run the expensive
         # `list_files` scan only when something actually changed on the
         # device (or on first-after-attach when `_last_known_count` is None).
-        current_count = self._adapter.get_file_count()
+        with self._device_command():
+            current_count = self._adapter.get_file_count()
         if self._last_known_count is not None and current_count == self._last_known_count:
             # Nothing new on the device. Stay in CONNECTED_IDLE so key
             # bindings remain active. No bus events -- the last scan's
@@ -389,7 +567,8 @@ class App:
             return
         self._last_known_count = current_count
         self._transition(AppState.SCANNING)
-        scan = self._offloader.scan_pending_files(self._device_key)
+        with self._device_command():
+            scan = self._offloader.scan_pending_files(self._device_key)
         # Expose the classified scan for the TUI's whisper/unknown modals.
         # Stored unconditionally (including empty lists) so the footer can
         # clear stale counts when a device is re-scanned.
@@ -404,12 +583,13 @@ class App:
             if self._cancel_transfer.is_set() or self._stop_signal.is_set():
                 return
             try:
-                self._offloader.offload(
-                    device_key=self._device_key,
-                    file=file,
-                    cancel_event=self._cancel_transfer,
-                    kind=RecordingKind.MEETING,
-                )
+                with self._device_command():
+                    self._offloader.offload(
+                        device_key=self._device_key,
+                        file=file,
+                        cancel_event=self._cancel_transfer,
+                        kind=RecordingKind.MEETING,
+                    )
             except TransferAborted as exc:
                 self._bus.publish(
                     Error(

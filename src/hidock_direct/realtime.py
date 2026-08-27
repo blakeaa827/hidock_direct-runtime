@@ -47,6 +47,14 @@ STOP_BODY = bytes.fromhex("0000000000000000")
 _CMD_REALTIME_CONTROL = 33
 _CMD_REALTIME_TRANSFER = 34
 
+# When the device was last taken out of realtime mode, PROCESS-WIDE. Deliberately
+# module-level rather than per-instance: the settle interval is a fact about the
+# DEVICE, and every consumer builds a fresh `RealtimeSession` per session (the live
+# surface does exactly that on each `l` press). Held per-instance, the guard read
+# `None` on every restart that has ever happened and paced nothing at all — while
+# rapid start/stop cycling is the observed cause of device wedging.
+_last_stop_at_process: Optional[float] = None
+
 _HEADER_BYTES = 4       # leading 4 bytes of each transfer body; NOT audio
 _BYTES_PER_FRAME = 4    # stereo * int16
 SAMPLE_RATE_HZ = 16000
@@ -132,7 +140,7 @@ class RealtimeSession:
         self._usb_errors = tuple(usb_errors) if usb_errors is not None else _default_usb_errors()
         self._active = False
         self._seq = 0
-        self._last_stop_at: Optional[float] = None
+        self._stop_requested = False
 
     # -- lifecycle -------------------------------------------------------
 
@@ -146,6 +154,12 @@ class RealtimeSession:
             # caller's lifecycle, not to this module.
             raise RealtimeUnavailable("device is not connected")
 
+        # Clear any cancellation left by a PREVIOUS session on this object.
+        # The flag means "a stop landed during THIS start", so it has to be
+        # scoped to this attempt — leaving it set made a session object
+        # single-use, which broke restart-after-stop.
+        self._stop_requested = False
+
         self._await_settle()
         ack = self._control(START_BODY)
         if ack[:1] != b"\x00":
@@ -155,17 +169,31 @@ class RealtimeSession:
             )
         self._active = True
         self._seq = 0
+        if self._stop_requested:
+            # A stop landed while we were mid-handshake. The device is now IN
+            # realtime mode, so leaving quietly would strand it there; take it
+            # back out before reporting the session unusable.
+            self.stop()
+            raise RealtimeUnavailable("realtime start was cancelled before it completed")
 
     def stop(self) -> None:
         """Idempotent, and never raises.
 
         A stop that raises from inside a `finally` replaces the real failure
         with its own, so transport errors here are logged and swallowed.
+
+        The cancellation is recorded BEFORE the active check. A stop arriving
+        while `start()` is still in flight — the live surface stops from the
+        keyboard thread, so this is ordinary, not exotic — used to return here
+        having done nothing: `_active` was still False, no intent was kept, and
+        `start()` went on to put the device into realtime mode with nobody
+        left to take it out. The device then needs a POWER CYCLE, not a replug.
         """
+        self._stop_requested = True
         if not self._active:
             return
         self._active = False
-        self._last_stop_at = time.monotonic()
+        self._mark_stopped()
         try:
             self._control(STOP_BODY)
         except Exception as exc:  # noqa: BLE001 -- must not mask the original
@@ -208,6 +236,20 @@ class RealtimeSession:
         last_data_at = time.monotonic()
 
         while True:
+            if not self._active or self._stop_requested:
+                # `stop()` ran — almost always from `__exit__`, on another
+                # thread than the one draining this generator. Checking only at
+                # entry (above) made `stop()` unable to stop anything already
+                # running: the loop kept issuing CMD 34 until `idle_timeout`
+                # elapsed, so a caller that had already released its claim on
+                # the device was still driving the endpoint. With the live
+                # surface's 5 s join against this module's 10 s idle timeout
+                # that was not a race but a certainty on every ordinary stop.
+                #
+                # Returning rather than raising is deliberate: a consumer that
+                # asked to stop is not experiencing a failure, and the frames
+                # already yielded are still valid.
+                return
             try:
                 response = self._transfer()
             except self._usb_errors as exc:  # type: ignore[misc]
@@ -283,11 +325,15 @@ class RealtimeSession:
             raise RealtimeUnavailable("adapter exposes no Jensen transport")
         return jensen
 
+    def _mark_stopped(self) -> None:
+        global _last_stop_at_process
+        _last_stop_at_process = time.monotonic()
+
     def _await_settle(self) -> None:
         """A wedged device needs a power cycle, so pace restarts in-module
         rather than trusting every caller to remember."""
-        if self._last_stop_at is None or self._settle <= 0:
+        if _last_stop_at_process is None or self._settle <= 0:
             return
-        remaining = self._settle - (time.monotonic() - self._last_stop_at)
+        remaining = self._settle - (time.monotonic() - _last_stop_at_process)
         if remaining > 0:
             self._sleep(remaining)
