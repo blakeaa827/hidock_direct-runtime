@@ -151,3 +151,72 @@ def test_env_example_has_no_real_api_key():
             break
     else:
         pytest.fail("ASSEMBLYAI_API_KEY line not found in .env.example")
+
+
+# --------------------------------------------------------------------------
+# TLS trust store — the live path's silent portability trap
+# --------------------------------------------------------------------------
+
+
+def test_an_empty_ca_store_is_repaired_from_certifi(monkeypatch):
+    """Observed live 2026-08-27 on a python.org Python.
+
+    The offload path uses httpx (certifi, always works); the live path uses
+    websockets, which the AAI SDK calls without an `ssl` argument, so it uses
+    OpenSSL's default paths. Those are empty on a python.org build until
+    `Install Certificates.command` runs — batch transcription succeeds for
+    months and the live session dies on CERTIFICATE_VERIFY_FAILED.
+
+    MUTATION: make `ensure_tls_trust_store` return None unconditionally and
+    this test fails.
+    """
+    import ssl as ssl_mod
+
+    from hidock_direct.config import ensure_tls_trust_store
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+
+    class Empty:
+        def get_ca_certs(self):
+            return []
+
+    monkeypatch.setattr(ssl_mod, "create_default_context", lambda *a, **k: Empty())
+
+    repaired = ensure_tls_trust_store()
+    import certifi
+
+    assert repaired == certifi.where()
+    assert os.environ["SSL_CERT_FILE"] == certifi.where()
+
+
+def test_a_working_ca_store_is_left_alone(monkeypatch):
+    """MUTATION: drop the `if ...get_ca_certs(): return None` guard -> fails."""
+    from hidock_direct.config import ensure_tls_trust_store
+
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    assert ensure_tls_trust_store() is None
+    assert "SSL_CERT_FILE" not in os.environ
+
+
+def test_an_operator_chosen_bundle_is_never_overridden(monkeypatch):
+    """A process-global mutation must not out-vote a deliberate setting.
+
+    This is the INBOX_DIRS lesson applied: that defect was a setdefault whose
+    semantics inverted the operator's intent.
+
+    MUTATION: drop the `if os.environ.get("SSL_CERT_FILE")` guard -> fails.
+    """
+    import ssl as ssl_mod
+
+    from hidock_direct.config import ensure_tls_trust_store
+
+    monkeypatch.setenv("SSL_CERT_FILE", "/operator/chosen/bundle.pem")
+
+    class Empty:
+        def get_ca_certs(self):
+            return []
+
+    monkeypatch.setattr(ssl_mod, "create_default_context", lambda *a, **k: Empty())
+
+    assert ensure_tls_trust_store() is None
+    assert os.environ["SSL_CERT_FILE"] == "/operator/chosen/bundle.pem"

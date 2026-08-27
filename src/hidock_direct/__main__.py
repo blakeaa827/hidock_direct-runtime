@@ -10,7 +10,7 @@ import signal
 import sys
 
 from .app import App
-from .config import load_config, load_env_file_into_environ
+from .config import ensure_tls_trust_store, load_config, load_env_file_into_environ
 from .device import JensenDeviceAdapter
 from .events import Error, EventBus, RetryCandidatesDetected, Severity, TranscribeSkipped
 from .live_server import LiveSessionController, LiveSurface, launch_app_window
@@ -95,6 +95,14 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
     # hidock's config and the vendored diarize_audio's Config.from_env() (which
     # reads os.environ for ASSEMBLYAI_API_KEY / DRIVE_ENABLED) see all settings.
     load_env_file_into_environ()
+    # Before anything opens a TLS connection. On a python.org macOS build the
+    # OpenSSL default CA paths are empty until `Install Certificates.command`
+    # is run, which breaks the LIVE path (websockets -> default context) while
+    # leaving the offload path (httpx -> certifi) working — so the operator
+    # sees months of successful transcription and a live session that dies on
+    # CERTIFICATE_VERIFY_FAILED. Reported, not silent: a repaired trust store
+    # is a fact about the run worth being able to see in a screenshot.
+    _repaired_ca_bundle = ensure_tls_trust_store()
     try:
         config = load_config()
     except ValueError as exc:
@@ -113,6 +121,16 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         return 1
 
     bus = EventBus()
+    if _repaired_ca_bundle:
+        bus.publish(Error(
+            message=(
+                "This Python had no CA certificates, so TLS was pointed at certifi "
+                "(live transcription would otherwise fail to connect). To fix it "
+                "permanently, run Install Certificates.command for your Python."
+            ),
+            severity=Severity.WARNING,
+            context="startup",
+        ))
     store = StateStore(config.state_path)
     adapter = JensenDeviceAdapter()
     watcher = PollingUSBWatcher()

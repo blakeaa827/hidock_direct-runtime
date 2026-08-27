@@ -31,6 +31,49 @@ from dotenv import dotenv_values
 
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 
+
+def ensure_tls_trust_store() -> Optional[str]:
+    """Point OpenSSL at `certifi` when this interpreter has no usable CA store.
+
+    Why a clone-and-run app needs this, and why the symptom is so confusing:
+    the OFFLOAD path reaches AssemblyAI through `httpx`, which defaults to
+    certifi and therefore always works. The LIVE path reaches it through
+    `websockets`, which the AAI SDK calls WITHOUT an `ssl` argument
+    (`assemblyai/streaming/v3/client.py:78`), so it falls back to
+    `ssl.create_default_context()` and OpenSSL's default paths. On a python.org
+    macOS build those paths are EMPTY until `Install Certificates.command` has
+    been run — Homebrew builds are fine, which is why this is invisible on some
+    machines and fatal on others.
+
+    The result is a user whose transcription has worked for months and whose
+    live session dies with `CERTIFICATE_VERIFY_FAILED: unable to get local
+    issuer certificate`. Observed on the operator's second Mac 2026-08-27;
+    reproduced exactly here by pointing SSL_CERT_FILE at an empty bundle.
+
+    Deliberately conservative, and NOT the `INBOX_DIRS` shape that bit this
+    project before: it mutates a process global only when the store is provably
+    unusable, never overrides a value the operator or environment already set,
+    and returns what it did so the caller can say so out loud.
+    """
+    if os.environ.get("SSL_CERT_FILE"):
+        return None                      # somebody already chose; respect it.
+    try:
+        import ssl
+
+        if ssl.create_default_context().get_ca_certs():
+            return None                  # the interpreter is fine as-is.
+    except Exception:                    # noqa: BLE001 - never block startup
+        return None
+    try:
+        import certifi
+    except ImportError:
+        # certifi arrives transitively with assemblyai/httpx, so this is
+        # unreachable in a correct install. Say nothing rather than guess.
+        return None
+
+    os.environ["SSL_CERT_FILE"] = certifi.where()
+    return certifi.where()
+
 _TRUE_SET = {"1", "true", "yes", "on"}
 
 
