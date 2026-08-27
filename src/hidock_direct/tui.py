@@ -150,6 +150,16 @@ class KeyboardReader:
                 continue
 
 
+# The log label follows an event's SEVERITY. `Error` is the bus's general
+# operator-message type and carries a severity so it can also say INFO and
+# WARNING; hardcoding "ERROR" made every routine live-session line announce
+# itself as a failure, which spends the word on messages that are not.
+_SEVERITY_LABEL = {
+    Severity.INFO: "INFO",
+    Severity.WARNING: "WARN",
+    Severity.ERROR: "ERROR",
+}
+
 RECENT_LOG_LIMIT = 10
 
 
@@ -330,8 +340,18 @@ class TUI:
                         (datetime.now(), f"{event.count} unknown file(s) — press u to route", Severity.WARNING)
                     )
             elif isinstance(event, Error):
+                # The label follows the event's SEVERITY, not its class name.
+                # `Error` is the bus's general operator-message type and carries
+                # a severity precisely so it can also say INFO and WARNING — the
+                # colour at `_SEVERITY_STYLE` has always honoured that. The
+                # label was hardcoded "ERROR", so every routine live-session
+                # line ("Live transcription is running…", "Live window: opened
+                # in Google Chrome.") announced itself as a failure. An operator
+                # scanning for real problems cannot afford a log where the word
+                # ERROR carries no information.
                 ctx = f" [{event.context}]" if event.context else ""
-                self._log.append((datetime.now(), f"ERROR{ctx}: {event.message}", event.severity))
+                label = _SEVERITY_LABEL.get(event.severity, "ERROR")
+                self._log.append((datetime.now(), f"{label}{ctx}: {event.message}", event.severity))
 
     def _log_key_ignored(self, message: str) -> None:
         with self._lock:

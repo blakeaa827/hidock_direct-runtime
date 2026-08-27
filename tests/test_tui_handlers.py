@@ -172,3 +172,37 @@ def test_whisper_unknown_gate_is_unchanged_by_the_retry_binding() -> None:
     effect of making `r` device-independent."""
     assert keys_active_in_state("IDLE_DISCONNECTED") is False
     assert keys_active_in_state("DRAINING") is False
+
+
+def test_the_log_label_follows_severity_not_the_event_class():
+    """Observed live 2026-08-27: every routine live line said ERROR.
+
+    `Error` is the bus's general operator-message type and carries a severity
+    so it can also say INFO and WARNING — the COLOUR always honoured that, only
+    the label was hardcoded. So "Live transcription is running — <url>" and
+    "Live window: opened in Google Chrome." both announced themselves as
+    failures, which spends the word ERROR on messages that are not errors.
+
+    MUTATION: put the literal "ERROR" back in the f-string at tui.py:353 and
+    this test fails on the INFO and WARNING cases.
+    """
+    from hidock_direct.events import Error, EventBus, Severity
+    from hidock_direct.tui import TUI
+
+    bus = EventBus()
+    tui = TUI(bus=bus, keyboard=_NoKeyboard())
+
+    bus.publish(Error(message="running", severity=Severity.INFO, context="live"))
+    bus.publish(Error(message="old sdk", severity=Severity.WARNING, context="live"))
+    bus.publish(Error(message="it broke", severity=Severity.ERROR, context="live"))
+
+    rendered = [msg for _when, msg, _sev in tui._log]
+    assert rendered[0].startswith("INFO [live]: "), rendered[0]
+    assert rendered[1].startswith("WARN [live]: "), rendered[1]
+    assert rendered[2].startswith("ERROR [live]: "), rendered[2]
+
+
+class _NoKeyboard:
+    """Keyboard seam stub — the TUI must not touch a real TTY under test."""
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
