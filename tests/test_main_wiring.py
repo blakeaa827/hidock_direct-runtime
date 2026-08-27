@@ -354,6 +354,43 @@ def test_no_module_in_the_package_mutates_os_environ():
             if hit:
                 offenders.append(f"{path.relative_to(pkg)}:{node.lineno}: {hit}")
 
+    # ARGUED-FOR EXEMPTION, one site. This docstring said the next mutation
+    # "has to be argued for rather than merely added"; here is the argument.
+    #
+    # `config.ensure_tls_trust_store` writes SSL_CERT_FILE when the interpreter
+    # has NO usable CA store. It is the same class the docstring already
+    # sanctions for `load_env_file_into_environ` — process-wide startup config,
+    # not a per-call parameter smuggled through a global — and it is NOT the
+    # INBOX_DIRS shape: it never overrides a value the operator set, it acts
+    # only when the store is provably empty, and it returns what it did so the
+    # caller reports it.
+    #
+    # There is also no alternative lever. The AAI SDK opens its websocket via
+    # `websockets.sync.client.connect(uri, additional_headers=, open_timeout=)`
+    # (assemblyai/streaming/v3/client.py:78) and never forwards an `ssl`
+    # argument, so an SSLContext cannot be injected; SSL_CERT_FILE is the only
+    # supported way to give that connection a trust store. Without it, a
+    # python.org macOS Python transcribes fine over httpx/certifi and dies on
+    # every live session with CERTIFICATE_VERIFY_FAILED — observed on the
+    # operator's second Mac 2026-08-27.
+    #
+    # Scoped to the exact function so any OTHER new mutation still fails.
+    _ARGUED = {"config.py": ("ensure_tls_trust_store",)}
+
+    def _exempt(entry: str) -> bool:
+        rel, lineno = entry.split(":")[0], int(entry.split(":")[1])
+        for fname, funcs in _ARGUED.items():
+            if rel != fname:
+                continue
+            tree = ast.parse((pkg / rel).read_text())
+            for fn in ast.walk(tree):
+                if (isinstance(fn, ast.FunctionDef) and fn.name in funcs
+                        and fn.lineno <= lineno <= (fn.end_lineno or fn.lineno)):
+                    return True
+        return False
+
+    offenders = [o for o in offenders if not _exempt(o)]
+
     assert offenders == [], (
         "process-global environment mutation in the package — pass the value as "
         "an argument instead:\n  " + "\n  ".join(offenders)
