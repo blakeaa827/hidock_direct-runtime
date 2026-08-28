@@ -128,6 +128,7 @@ from hidock_direct.events import (
     LiveTurn,
     Severity,
 )
+from hidock_direct.live_archive import LiveArchive
 from hidock_direct.live_server import (
     LAUNCH_TIMEOUT_SECONDS,
     LiveSessionController,
@@ -452,6 +453,10 @@ class FakeSurface:
         # lifetimes and the distinction is load-bearing (argv vs the activity log).
         self.ticket_ttls: List[float] = []
         self.launch_urls: List[str] = []
+        # Every call to `speaker_names()`, with the map as it stood at the time.
+        # WHEN the archive reads the map is the whole point of handing it a
+        # callable, so the reads are recorded rather than merely counted.
+        self.speaker_names_reads: List[Dict[str, Optional[str]]] = []
         # Shared with the owning `Controller` harness when there is one, so the
         # ORDER of start's steps is observable and not merely their occurrence.
         self.timeline: List[str] = []
@@ -478,6 +483,12 @@ class FakeSurface:
     def stop(self) -> None:
         _bind_against(LiveSurface.stop)
         self.stopped += 1
+        # The real one clears its `label -> name` map here (`live_server.py:990`,
+        # FR-1.6: the ring is dropped and the token retired with it). A double
+        # that kept the names would make the phase-1d ordering requirement —
+        # finalise the recording BEFORE the surface stops — unfalsifiable, since
+        # the late read would still find the map populated.
+        self.names = {}
         if self.stop_error is not None:
             raise self.stop_error
 
@@ -490,6 +501,15 @@ class FakeSurface:
     def set_name(self, label, name) -> None:
         _bind_against(LiveSurface.set_name, label, name)
         self.names[label] = name
+
+    def speaker_names(self) -> Dict[str, str]:
+        # A real method, not an attribute: the controller hands the BOUND METHOD
+        # to the archive so the map is read at stop rather than at start. A
+        # double exposing a plain dict here would make that distinction
+        # unobservable and let a snapshot-passing regression through.
+        _bind_against(LiveSurface.speaker_names)
+        self.speaker_names_reads.append(dict(self.names))
+        return {k: v for k, v in self.names.items() if v}
 
     @property
     def url(self) -> str:
@@ -524,16 +544,22 @@ class FakeCapture:
         self.block_after_frames = True
         self.released = threading.Event()
         self.first_frame_sent = threading.Event()
+        # Shared with the owning harness so CONTEXT NESTING is observable. Phase
+        # 1d's ordering claim is about which `__exit__` runs last, and counters
+        # cannot express that.
+        self.timeline: List[str] = []
 
     def __enter__(self) -> "FakeCapture":
         _bind_against(RealtimeSession.__enter__)
         if self.enter_error is not None:
             raise self.enter_error
         self.entered += 1
+        self.timeline.append("capture.enter")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         _bind_against(RealtimeSession.__exit__, exc_type, exc, tb)
+        self.timeline.append("capture.exit")
         self.stop()
         return False
 
@@ -565,16 +591,19 @@ class FakeTranscriber:
         self.enter_error: Optional[BaseException] = None
         self.entered = 0
         self.stopped = 0
+        self.timeline: List[str] = []
 
     def __enter__(self) -> "FakeTranscriber":
         _bind_against(LiveTranscriber.__enter__)
         if self.enter_error is not None:
             raise self.enter_error
         self.entered += 1
+        self.timeline.append("transcriber.enter")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         _bind_against(LiveTranscriber.__exit__, exc_type, exc, tb)
+        self.timeline.append("transcriber.exit")
         self.stop()
         return False
 
@@ -587,6 +616,84 @@ class FakeTranscriber:
         if self.feed_error is not None:
             raise self.feed_error
         self.fed.append(frame)
+        self.timeline.append("feed")
+
+
+class FakeArchive:
+    """Stands in for `LiveArchive` (phase 1d).
+
+    Binds against the real class the same way every other double here does, so a
+    controller that called it with the wrong keyword — or stopped handing it the
+    `names` CALLABLE — fails at the seam instead of passing on a permissive
+    signature. Records the ORDER of its lifecycle against the harness timeline,
+    because `live_archive_prd.md` §7's ordering claims ("audio to disk before the
+    wire", "finalise before the surface stops") are order claims and a counter
+    cannot falsify one.
+    """
+
+    def __init__(self, archive_dir, *, bus, operator_name, names=None, clock=None):
+        kwargs = dict(bus=bus, operator_name=operator_name, names=names)
+        if clock is not None:
+            kwargs["clock"] = clock
+        _bind_against(LiveArchive.__init__, archive_dir, **kwargs)
+        self.archive_dir = archive_dir
+        self.bus = bus
+        self.operator_name = operator_name
+        self.names = names
+        self.written: List[Frame] = []
+        self.entered = 0
+        self.stops = 0
+        self.write_error: Optional[BaseException] = None
+        self.stop_error: Optional[BaseException] = None
+        self.exit_error: Optional[BaseException] = None
+        # Set by the tests that care; `None` means "nothing was earned", which is
+        # the real class's own pre-audio state.
+        self._wav_path = None
+        self._transcript_path = None
+        # The map as `names()` returned it at stop. The controller's whole reason
+        # for passing a callable is that this is read LATE.
+        self.names_at_stop: Optional[Dict[str, str]] = None
+        self.timeline: List[str] = []
+
+    @property
+    def wav_path(self):
+        return self._wav_path
+
+    @property
+    def transcript_path(self):
+        return self._transcript_path
+
+    def __enter__(self) -> "FakeArchive":
+        _bind_against(LiveArchive.__enter__)
+        self.entered += 1
+        self.timeline.append("archive.enter")
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        _bind_against(LiveArchive.__exit__, exc_type, exc, tb)
+        self.timeline.append("archive.exit")
+        if self.exit_error is not None:
+            raise self.exit_error
+        self.stop()
+        return False
+
+    def write(self, frame) -> None:
+        _bind_against(LiveArchive.write, frame)
+        if self.write_error is not None:
+            raise self.write_error
+        self.written.append(frame)
+        self.timeline.append("archive.write")
+
+    def stop(self) -> None:
+        _bind_against(LiveArchive.stop)
+        self.stops += 1
+        self.timeline.append("archive.stop")
+        if self.names is not None and self.names_at_stop is None:
+            # Exactly what the real one does at stop (§5), and the only way a
+            # snapshot-vs-callable regression becomes visible from out here.
+            self.names_at_stop = self.names()
+        if self.stop_error is not None:
+            raise self.stop_error
 
 
 class _FakeAdapter:
@@ -622,6 +729,8 @@ class Controller:
         self.surfaces: List[FakeSurface] = []
         self.captures: List[FakeCapture] = []
         self.transcribers: List[FakeTranscriber] = []
+        self.archives: List[FakeArchive] = []
+        self.archive_error: Optional[BaseException] = None
         self.suspends = 0
         self.resumes = 0
         self.launched: List[str] = []
@@ -642,8 +751,13 @@ class Controller:
             surface_factory=self._surface_factory,
             capture_factory=self._capture_factory,
             transcriber_factory=self._transcriber_factory,
+            archive_factory=self._archive_factory,
             launch_browser=self._launch,
         )
+        # `archive_dir` is NOT defaulted here. It is None on the controller, and
+        # None means "this composition archives nothing" — so registering the
+        # factory unconditionally leaves every pre-1d test untouched (the factory
+        # is never reached) while the 1d tests opt in by passing `archive_dir`.
         kwargs.update(overrides)
         self.controller = LiveSessionController(**kwargs)
 
@@ -674,14 +788,25 @@ class Controller:
 
     def _capture_factory(self, adapter, **kwargs) -> FakeCapture:
         made = FakeCapture(adapter, **kwargs)
+        made.timeline = self.timeline
         self.timeline.append("capture")
         self.captures.append(made)
         return made
 
     def _transcriber_factory(self, bus, **kwargs) -> FakeTranscriber:
         made = FakeTranscriber(bus, **kwargs)
+        made.timeline = self.timeline
         self.timeline.append("transcriber")
         self.transcribers.append(made)
+        return made
+
+    def _archive_factory(self, archive_dir, **kwargs) -> FakeArchive:
+        if self.archive_error is not None:
+            raise self.archive_error
+        made = FakeArchive(archive_dir, **kwargs)
+        made.timeline = self.timeline
+        self.timeline.append("archive")
+        self.archives.append(made)
         return made
 
     def _launch(self, url, **kwargs) -> str:
@@ -707,6 +832,17 @@ class Controller:
     def transcriber(self) -> FakeTranscriber:
         _wait_until(lambda: self.transcribers, msg="transcriber was never created")
         return self.transcribers[-1]
+
+    @property
+    def archive(self) -> FakeArchive:
+        assert self.archives, (
+            "no archive was created — the controller was given no `archive_dir`, "
+            "or `_new_archive` swallowed the factory call"
+        )
+        return self.archives[-1]
+
+    def infos(self) -> List[Error]:
+        return [e for e in self.errors() if e.severity is Severity.INFO]
 
     def errors(self) -> List[Error]:
         return [e for e in self.events if isinstance(e, Error)]
@@ -2963,7 +3099,18 @@ def test_the_url_is_surfaced_even_when_the_window_opened(controller):
 
 def test_a_live_session_writes_no_file_anywhere(tmp_path, monkeypatch, controller):
     """NFR-6, at the composition level. The operator's archive is a live Drive
-    mount; this whole feature must be invisible to it."""
+    mount; this whole feature must be invisible to it.
+
+    SCOPE, corrected for phase 1d. `live_archive_prd.md` §1 deliberately
+    supersedes phase 1b §4.1 — the device does NOT persist live-session audio, so
+    "write nothing" was losing every live call's recording. A live session now
+    writes a WAV and a transcript, but only through `live_archive.py`, and only
+    when the composition was given an `archive_dir`. What survives here — and is
+    still worth pinning — is that the surface and the controller write nothing
+    THEMSELVES: this harness supplies no `archive_dir`, so nothing below the
+    controller may put a byte on disk. The phase-1d writes are pinned by
+    `test_live_archive.py` and by the archive-wiring section at the end of this
+    file; do not "fix" this test by giving it an archive_dir."""
     # MUTATION: write a session transcript beside the archive on stop.
     monkeypatch.chdir(tmp_path)
     harness = controller()
@@ -3656,15 +3803,19 @@ def test_the_tui_accepts_the_live_controller_as_a_keyword_seam():
 # ==========================================================================
 
 
-def _controller_call_kwargs() -> Dict[str, str]:
-    """The kwargs `__main__` passes when it constructs the LiveSessionController,
-    as source text — so the test reads what production actually wires, not what a
-    fixture hands in."""
+def _main_call_kwargs(constructor: str) -> Dict[str, str]:
+    """The kwargs `__main__` passes when it constructs `constructor`, as source
+    text — so the test reads what production actually wires, not what a fixture
+    hands in."""
     tree = ast.parse((SRC / "__main__.py").read_text())
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "LiveSessionController":
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == constructor:
             return {kw.arg: ast.unparse(kw.value) for kw in node.keywords if kw.arg}
-    raise AssertionError("__main__.py never constructs a LiveSessionController")
+    raise AssertionError(f"__main__.py never constructs a {constructor}")
+
+
+def _controller_call_kwargs() -> Dict[str, str]:
+    return _main_call_kwargs("LiveSessionController")
 
 
 def test_the_composition_root_wires_every_seam_to_the_real_collaborator():
@@ -3673,7 +3824,8 @@ def test_the_composition_root_wires_every_seam_to_the_real_collaborator():
     omitted. Reading the real call site is the only assertion that could have
     caught it."""
     # MUTATION: `api_key=config.assemblyai_api_key` -> `api_key=""`, or
-    # `busy_predicate=lambda: False`. Every behavioural test still passes.
+    # `busy_predicate=lambda: False`, or `archive_dir=config.archive_dir` ->
+    # `archive_dir=None`. Every behavioural test still passes.
     passed = _controller_call_kwargs()
 
     assert passed.get("bus") == "bus"
@@ -3684,6 +3836,18 @@ def test_the_composition_root_wires_every_seam_to_the_real_collaborator():
     assert passed.get("suspend_polling") == "app.suspend_device_polling"
     assert passed.get("resume_polling") == "app.resume_device_polling"
     assert "app.device_busy" in (passed.get("busy_predicate") or "")
+    # The VALUE, not merely the presence of the keyword. `archive_dir=None` is a
+    # real, accepted configuration — it is the pre-1d composition, and the
+    # controller answers it by archiving nothing at all and saying nothing about
+    # it. So an `archive_dir=None` here restores the phase-1a..1c DATA-LOSS
+    # defect that phase 1d exists to close, and it does so while satisfying every
+    # seam-presence sweep below. The recording is the only copy of a live call
+    # that will ever exist; where it goes is not a detail this sweep may skip.
+    assert passed.get("archive_dir") == "config.archive_dir", (
+        f"__main__ passes archive_dir={passed.get('archive_dir')!r}; a live "
+        "session's recording is the only copy of the call that will ever exist "
+        "and it must go to the operator's configured archive"
+    )
 
 
 def test_every_live_controller_seam_is_supplied_by_the_composition_root():
@@ -3712,13 +3876,90 @@ def test_the_supplied_factories_resolve_to_the_real_production_types():
     """Supplied-but-inert is the same bug wearing a kwarg. Each factory must name
     the real collaborator, not a stub that keeps the sweep above green."""
     # MUTATION: `surface_factory=lambda **kw: None` in __main__ — present in the
-    # call, so the sweep passes, and the feature is still dead.
+    # call, so the sweep passes, and the feature is still dead. Or
+    # `archive_factory=lambda archive_dir, **kw: None`, which loses every live
+    # recording while every seam-presence assertion above stays green.
     passed = _controller_call_kwargs()
 
     assert "LiveSurface" in passed["surface_factory"]
     assert "RealtimeSession" in passed["capture_factory"]
     assert "LiveTranscriber" in passed["transcriber_factory"]
     assert "launch_app_window" in passed["launch_browser"]
+    # `archive_factory` was omitted from this list while the list's own docstring
+    # named "supplied-but-inert is the same bug wearing a kwarg" — and it is the
+    # one seam whose inertness costs an artifact rather than a screen.
+    assert "LiveArchive" in passed["archive_factory"]
+
+
+def test_the_factory_kwargs_name_something_the_entry_point_actually_imported():
+    """A factory named in the call has to resolve, at runtime, to the real class.
+
+    The source-text sweep above reads `archive_factory=LiveArchive` and is
+    satisfied — by a local `LiveArchive = object` just as happily as by the
+    import. Binding the names against the module the entry point really built is
+    what tells a wiring from a spelling.
+    """
+    # MUTATION: `from .live_server import LiveArchive` (a re-export that is not
+    # the recorder), or shadow any of these four names in `__main__`.
+    from hidock_direct import __main__ as main_mod
+    from hidock_direct.live_archive import LiveArchive as RealArchive
+    from hidock_direct.live_server import LiveSurface as RealSurface
+    from hidock_direct.live_transcribe import LiveTranscriber as RealTranscriber
+    from hidock_direct.realtime import RealtimeSession as RealCapture
+
+    passed = _controller_call_kwargs()
+    for keyword, expected in (
+        ("archive_factory", RealArchive),
+        ("surface_factory", RealSurface),
+        ("capture_factory", RealCapture),
+        ("transcriber_factory", RealTranscriber),
+    ):
+        resolved = getattr(main_mod, passed[keyword], None)
+        assert resolved is expected, (
+            f"__main__.{passed[keyword]} is {resolved!r}, not {expected!r}; the "
+            f"{keyword} names something other than the real collaborator"
+        )
+
+
+def test_the_offloader_is_wired_to_the_live_session_log_on_the_same_bus():
+    """`live_archive_prd.md` FR-3.1..FR-3.3. A live call is transcribed AND BILLED
+    as it happens; if the device ever also keeps its own recording of it, the
+    offload path would send the same conversation to AssemblyAI a second time.
+
+    The whole suppression turns on one seam. A `LiveSessionLog` that `__main__`
+    never passes leaves `Offloader._live_sessions` at `None`, which suppresses
+    nothing forever — and the only evidence would be the bill. A log built
+    against a DIFFERENT bus than the one the bridge publishes its start/stop on
+    is the same defect with a plausible-looking call site.
+    """
+    # MUTATION: drop `live_sessions=live_sessions` from the `Offloader(...)` call,
+    # or build the log as `LiveSessionLog(EventBus())`. Every offload test still
+    # passes; every live call is billed twice the day the firmware starts keeping
+    # its own file.
+    from hidock_direct import __main__ as main_mod
+    from hidock_direct.offload import LiveSessionLog
+
+    passed = _main_call_kwargs("Offloader")
+    assert passed.get("live_sessions") == "live_sessions", (
+        f"__main__ passes live_sessions={passed.get('live_sessions')!r}"
+    )
+    assert passed.get("bus") == "bus"
+
+    tree = ast.parse((SRC / "__main__.py").read_text())
+    built = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and getattr(node.value.func, "id", None) == "LiveSessionLog"
+    ]
+    assert len(built) == 1, "__main__ does not build exactly one LiveSessionLog"
+    assert [t.id for t in built[0].targets] == ["live_sessions"]
+    assert [ast.unparse(a) for a in built[0].value.args] == ["bus"], (
+        "the live-session log listens on a different bus than the offloader "
+        "publishes on, so it observes no live sessions at all"
+    )
+    assert main_mod.LiveSessionLog is LiveSessionLog
 
 
 def test_main_builds_a_controller_and_hands_it_to_the_tui(tmp_path, monkeypatch):
@@ -4331,3 +4572,367 @@ def test_every_element_with_an_explicit_display_can_still_be_hidden():
         "#live-indicator no longer sets a display; re-point this test at "
         "whatever element now needs the override, or drop it"
     )
+
+
+# ==========================================================================
+# Phase 1d — the ARCHIVE wiring (`live_archive_prd.md` §7)
+#
+# `test_live_archive.py` pins the recorder. Nothing pinned the controller that
+# feeds it: the archive being handed every frame, `names` being passed as a
+# CALLABLE, the save line, the three error floors, and the two ordering claims
+# §7 rests on. Every one of those could have been deleted and both suites would
+# have stayed green — which is the failure mode `ad98cbc` shipped for the retry
+# surface and the reason this file's header names reachability as a property.
+#
+# These tests opt in by passing `archive_dir`; a controller without one archives
+# nothing by design, which is why the rest of the file is unaffected.
+# ==========================================================================
+
+
+def _archiving(controller, tmp_path, **overrides):
+    """A controller wired to a `FakeArchive`, started, with one frame delivered."""
+    harness = controller(archive_dir=tmp_path / "archive", **overrides)
+    harness.controller.start()
+    return harness
+
+
+def test_the_composition_that_has_an_archive_dir_builds_a_recorder(controller, tmp_path):
+    """FR-1.1. The device does not keep a recording for a live session, so ours is
+    the only copy that will ever exist. It is built from `config.archive_dir` and
+    handed the bus and the operator's name."""
+    # MUTATION: `_new_archive` returns None unconditionally, or `start()` stops
+    # calling it — the session still works, and every recording is silently lost.
+    harness = _archiving(controller, tmp_path)
+
+    assert harness.archives, "a configured archive_dir built no recorder"
+    assert harness.archive.archive_dir == tmp_path / "archive"
+    assert harness.archive.bus is harness.bus
+    assert harness.archive.operator_name == harness.surface.kwargs["operator_name"]
+    assert harness.archive.entered == 1, "the recorder was built but never entered"
+
+    harness.controller.stop()
+
+
+def test_no_archive_dir_means_no_recorder_and_no_complaint(controller):
+    """The pre-1d composition. `None` is a real configuration, not a failure, and
+    must not manufacture an error line on a session that is working."""
+    # MUTATION: drop the `if self._archive_dir is None: return None` guard, and
+    # every archive-less composition publishes an ERROR on every `l`.
+    harness = controller()
+    harness.controller.start()
+
+    assert harness.archives == []
+    problems = [e for e in harness.errors() if e.severity is Severity.ERROR]
+    assert problems == [], f"an archive-less composition complained: {problems}"
+
+    harness.controller.stop()
+
+    assert [e for e in harness.errors() if "recorded" in e.message] == []
+    assert [e for e in harness.errors() if "saved" in e.message] == []
+
+
+def test_every_frame_reaches_the_archive_before_it_reaches_the_wire(controller, tmp_path):
+    """§7's ordering: audio to the disk BEFORE the bridge. Ours is the only
+    recording that will exist and `feed()` is the call that can end the session,
+    so a frame fed first and written second is a frame that can be lost."""
+    # MUTATION: swap the two statements in the pump's loop body, so `feed(frame)`
+    # runs before `self._record(archive, frame, generation)`.
+    harness = _archiving(controller, tmp_path)
+    _wait_until(lambda: harness.transcriber.fed, msg="no frame ever reached the bridge")
+
+    assert harness.archive.written == harness.transcriber.fed, (
+        "the archive and the bridge did not see the same frames"
+    )
+    # Order, not just presence. Both markers land on the ONE shared timeline, so
+    # "written before fed" is read off the real interleaving rather than inferred
+    # from two independent counters that happen to agree.
+    steps = [s for s in harness.timeline if s in ("archive.write", "feed")]
+    assert steps[:2] == ["archive.write", "feed"], (
+        f"the first frame reached the wire before the disk: {steps[:4]}"
+    )
+
+    harness.controller.stop()
+
+
+def test_names_is_handed_as_a_callable_so_it_is_read_at_stop(controller, tmp_path):
+    """§5, and the reason `_new_archive` passes `surface.speaker_names` rather than
+    `surface.speaker_names()`. A name typed in the last minute of a call must reach
+    the lines rendered in the first; a snapshot taken at session start archives a
+    document of `Speaker 1`s for a call whose speakers were named."""
+    # MUTATION: `names=surface.speaker_names()` — a dict frozen at session start.
+    # Everything else still passes; only this test sees the difference.
+    harness = _archiving(controller, tmp_path)
+
+    assert callable(harness.archive.names), (
+        "the archive was handed a snapshot; a name set after start can never reach it"
+    )
+    assert harness.surface.speaker_names_reads == [], "the map was read at START"
+
+    # The operator names a speaker DURING the call, exactly as `POST /names` does.
+    harness.surface.set_name("A", "Dana")
+
+    harness.controller.stop()
+
+    assert harness.archive.names_at_stop == {"A": "Dana"}, (
+        f"the archive rendered from {harness.archive.names_at_stop}, not the map as "
+        "it stood at stop"
+    )
+
+
+def test_the_save_line_names_both_paths_at_info(controller, tmp_path):
+    """The operator has just been told by this project that live audio was being
+    lost. "It is saved, here" is the line that closes that, and it names paths so
+    the file can be opened without going looking for it."""
+    # MUTATION: publish a count ("live session saved") instead of the paths, or
+    # drop the `if saved:` publish from `_teardown` entirely.
+    harness = _archiving(controller, tmp_path)
+    wav = tmp_path / "archive" / "2026-08-27_101500.wav"
+    md = tmp_path / "archive" / "2026-08-27_101500.md"
+    harness.archive._wav_path = wav
+    harness.archive._transcript_path = md
+
+    harness.controller.stop()
+
+    saved = [e for e in harness.infos() if str(wav) in e.message]
+    assert len(saved) == 1, f"expected exactly one save line, got {harness.messages()}"
+    assert str(md) in saved[0].message, "the transcript path was not named"
+    assert saved[0].severity is Severity.INFO, "a successful save is not a problem"
+
+
+def test_a_session_that_recorded_nothing_announces_nothing(controller, tmp_path):
+    """FR-1.5. No audio means no file, and a save line naming a path that does not
+    exist is worse than silence — it is the operator's evidence the call is safe."""
+    # MUTATION: `_finalise_archive` returns its message before the `wav is None`
+    # check, so an empty session reports "Live session saved — audio None".
+    harness = _archiving(controller, tmp_path)
+    assert harness.archive.wav_path is None
+
+    harness.controller.stop()
+
+    assert [e for e in harness.infos() if "saved" in e.message] == []
+    assert "None" not in harness.messages()
+
+
+def test_a_failed_transcript_still_names_the_audio(controller, tmp_path):
+    """FR-ERR-3. Audio without a transcript is recoverable — by hand or through the
+    batch path — and naming the file is what makes it so. The reverse is not."""
+    # MUTATION: `if transcript is None: return None`, which loses the recording to
+    # the operator even though it is sitting on disk.
+    harness = _archiving(controller, tmp_path)
+    wav = tmp_path / "archive" / "2026-08-27_101500.wav"
+    harness.archive._wav_path = wav
+    harness.archive._transcript_path = None
+
+    harness.controller.stop()
+
+    named = [e for e in harness.errors() if str(wav) in e.message]
+    assert len(named) == 1, f"the audio path was never named: {harness.messages()}"
+
+
+def test_a_recorder_that_cannot_be_built_costs_the_recording_not_the_call(
+    controller, tmp_path
+):
+    """FR-ERR-1. The transcript on screen is still worth having. An unwritable
+    archive path must be surfaced, not raised — a raise here happens between the
+    device claim being taken and the pump existing."""
+    # MUTATION: let `_new_archive` propagate, and an unwritable archive directory
+    # turns pressing `l` into a hard failure that also leaks the FR-6.3 suspension.
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.archive_error = OSError("read-only file system")
+
+    harness.controller.start()
+
+    assert harness.controller.is_live is True, "the call died over a file write"
+    assert harness.archives == []
+    complaints = [e for e in harness.errors() if "read-only file system" in e.message]
+    assert len(complaints) == 1, f"the operator was not told: {harness.messages()}"
+    assert complaints[0].severity is Severity.ERROR
+    _wait_until(lambda: harness.transcriber.fed, msg="the bridge never ran")
+
+    harness.controller.stop()
+    assert harness.resumes == 1, "the FR-6.3 suspension leaked"
+
+
+def test_a_write_failure_stops_recording_once_not_once_per_frame(controller, tmp_path):
+    """FR-ERR-2. `frames()` yields ~10 chunks/sec, so a per-frame message buries
+    the activity log in seconds and the operator stops reading it."""
+    # MUTATION: drop the `recording = self._record(...)` assignment (or ignore the
+    # return), so every subsequent frame re-raises and re-announces.
+    frames = [Frame(near=b"\x00\x00", far=b"\x11\x11", seq=n) for n in range(1, 6)]
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.controller.start()
+    harness.archive.write_error = OSError("input/output error")
+    harness.capture.frames_to_yield = frames
+    harness.capture.released.set()
+
+    _wait_until(
+        lambda: len(harness.transcriber.fed) >= len(frames),
+        msg="the session did not survive the write failure",
+    )
+
+    complaints = [e for e in harness.errors() if "input/output error" in e.message]
+    assert len(complaints) == 1, (
+        f"{len(complaints)} messages for one failure across {len(frames)} frames"
+    )
+
+    harness.controller.stop()
+
+
+def test_the_archive_is_finalised_before_the_surface_stops(controller, tmp_path):
+    """`LiveSurface.stop()` clears the name map, and the transcript is rendered
+    FROM that map. Finalising after the surface archives a document of `Speaker 1`s
+    for a call whose speakers the operator had already named."""
+    # MUTATION: move `self._finalise_archive(...)` below the `surface.stop()` block
+    # in `_teardown`. Every counter still agrees; only the names are gone.
+    #
+    # The pump's own `with` ordinarily finalises the recording while the surface
+    # is still untouched, which makes `_teardown`'s ordering invisible on the
+    # happy path. So this drives the path that MOTIVATED it: `stop()` joins the
+    # pump for five seconds and then tears down regardless, and a pump blocked
+    # longer than that on a device read has finalised nothing. A capture whose
+    # `stop()` does not release is exactly that pump.
+    stuck = threading.Event()
+
+    def blocked_on_a_device_read():
+        # Blocks INSIDE `capture.frames()`, which is where a wedged Jensen read
+        # actually blocks — so the pump has entered no `finally` and finalised
+        # nothing when `stop()`'s bounded join gives up on it. Installed by the
+        # FACTORY, not on the instance afterwards: the pump thread is already
+        # calling `frames()` by the time `start()` returns.
+        stuck.wait(timeout=30.0)
+        return iter(())
+
+    def wedged_capture_factory(adapter, **kwargs):
+        made = FakeCapture(adapter, **kwargs)
+        made.frames = blocked_on_a_device_read
+        return made
+
+    harness = controller(
+        archive_dir=tmp_path / "archive", capture_factory=wedged_capture_factory
+    )
+    harness.controller.start()
+    harness.surface.set_name("A", "Dana")
+
+    try:
+        harness.controller.stop()
+
+        assert harness.archive.stops >= 1, "neither the pump nor teardown finalised"
+        assert harness.archive.names_at_stop == {"A": "Dana"}, (
+            f"the recording was finalised after the surface cleared the map: "
+            f"{harness.archive.names_at_stop}"
+        )
+    finally:
+        stuck.set()
+
+
+def test_the_archive_is_the_outermost_context_so_it_closes_last(controller, tmp_path):
+    """§7 sketches the archive innermost. That would finalise the transcript BEFORE
+    `transcriber.__exit__` closes the provider sessions — and that close delivers
+    each speaker's final turn. Innermost drops the last thing everyone said from
+    the archived document while leaving it on screen, and the document is the copy
+    the pipeline reads."""
+    # MUTATION: reorder the pump's `with` statements to put `recorder` innermost.
+    harness = _archiving(controller, tmp_path)
+
+    harness.controller.stop()
+    _wait_until(
+        lambda: "archive.exit" in harness.timeline,
+        msg="the archive context never closed",
+    )
+
+    steps = [
+        s
+        for s in harness.timeline
+        if s.endswith(".enter") or s.endswith(".exit")
+    ]
+    assert steps == [
+        "archive.enter",
+        "capture.enter",
+        "transcriber.enter",
+        "transcriber.exit",
+        "capture.exit",
+        "archive.exit",
+    ], f"the contexts are not nested archive-outermost: {steps}"
+
+
+def test_stop_is_idempotent_across_the_pump_and_the_teardown(controller, tmp_path):
+    """Both the pump's `with` and `_teardown` finalise, by design — `stop()` joins
+    the pump for five seconds and then tears down regardless. `LiveArchive.stop()`
+    is idempotent for exactly that, and the wiring must not render twice."""
+    # MUTATION: `_finalise_archive` renders instead of delegating, or the pump
+    # stops using `with` — either way a second document is produced.
+    harness = _archiving(controller, tmp_path)
+    harness.archive._wav_path = tmp_path / "archive" / "a.wav"
+    harness.archive._transcript_path = tmp_path / "archive" / "a.md"
+
+    harness.controller.stop()
+    harness.controller.stop()
+
+    saved = [e for e in harness.infos() if "saved" in e.message]
+    assert len(saved) == 1, f"the save line was published {len(saved)} times"
+    assert harness.archive.names_at_stop is not None
+
+
+def test_an_archive_that_raises_on_stop_still_releases_the_device(controller, tmp_path):
+    """Everything after `_finalise_archive` releases the claim. A raise there would
+    strand the offload worker suspended (FR-6.3) over a file write, and the only
+    symptom is the absence of something."""
+    # MUTATION: call `_finalise_archive` outside its try, or drop `_teardown`'s
+    # `finally: self._resume()`.
+    harness = _archiving(controller, tmp_path)
+    harness.archive.stop_error = OSError("no space left on device")
+
+    harness.controller.stop()
+
+    assert harness.resumes == 1, "the FR-6.3 suspension leaked over a file write"
+    assert harness.controller.is_live is False
+    assert "no space left on device" in harness.messages()
+
+
+def test_a_stale_pump_cannot_finalise_the_next_sessions_recording(controller, tmp_path):
+    """The archive is passed to `_pump` rather than read off `self`, for the same
+    reason `generation` is: a pump that outlived its `stop()` join would otherwise
+    reach into the NEXT session and finalise ITS recording mid-call."""
+    # MUTATION: `_pump` reads `self._archive` instead of taking it as an argument.
+    harness = _archiving(controller, tmp_path)
+    first = harness.archive
+    harness.controller.stop()
+
+    harness.controller.start()
+    second = harness.archive
+    assert second is not first, "the second session reused the first's recorder"
+
+    # The first session's recorder was finalised once, by its own session.
+    assert first.stops >= 1
+    stops_before = second.stops
+
+    # Release the FIRST session's capture: its pump now runs its `finally` late.
+    harness.captures[0].released.set()
+    time.sleep(0.2)
+
+    assert second.stops == stops_before, (
+        "a stale pump finalised the live session's recording"
+    )
+    harness.controller.stop()
+
+
+def test_the_surface_exposes_the_operators_names_keyed_by_provider_label():
+    """`render_markdown(speaker_names=...)` matches against the PROVIDER's label
+    (`utterances[].speaker`), so the map is handed across unchanged rather than
+    pre-resolved. Resolving here would produce a map that matches nothing."""
+    # MUTATION: `speaker_names` returns `{display_name: name}` or resolves labels
+    # to "Speaker 1" first — the archive then renders every line as a number.
+    surface = LiveSurface(operator_name="Blake")
+    surface.set_name("A", "Dana")
+
+    names = surface.speaker_names()
+
+    assert names == {"A": "Dana"}, (
+        "the map is not keyed by the provider label render_markdown matches on"
+    )
+    assert names is not surface.__dict__.get("_names"), "handed out its own mutable map"
+
+    # And it is a SNAPSHOT: mutating the returned map must not reach the surface,
+    # since the archive holds it while the operator is still typing into the panel.
+    names["B"] = "Sam"
+    assert surface.speaker_names() == {"A": "Dana"}

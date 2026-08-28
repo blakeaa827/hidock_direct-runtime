@@ -15,7 +15,7 @@ import shutil
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -34,9 +34,12 @@ from .events import (
     Error,
     EventBus,
     FileDiscovered,
+    LiveTranscriptionStarted,
+    LiveTranscriptionStopped,
     ScanComplete,
     ScanStarted,
     Severity,
+    TranscribeSkipped,
     TransferAborted,
     UnknownsDetected,
     WhispersDetected,
@@ -203,6 +206,140 @@ def _unique_archive_path(archive_dir: Path, basename: str, when: datetime) -> Pa
         i += 1
 
 
+# -- live-session suppression (live_archive_prd.md FR-3.1 .. FR-3.3) ---------
+#
+# A live session is transcribed as it happens, and it is billed as it happens.
+# If the device ever also persists its own recording of that call, offloading it
+# would send the same conversation to AssemblyAI a second time.
+#
+# The operator verified on hardware (2026-08-27, power cycle + rescan) that the
+# device keeps NO recording while it streams, so nothing below is expected to
+# fire. It exists because that is one observation of the device's behaviour and
+# not a model of it (PRD §2.1) — and a firmware that started keeping the file
+# would otherwise double-bill silently.
+#
+# Two shapes are deliberately refused:
+#
+# * A ledger pre-seed. `state.is_processed` gates the DOWNLOAD, so an entry
+#   written ahead of time would skip the transfer and lose the audio — trading a
+#   double-billing bug for a data-loss bug, on the very path this phase exists
+#   to stop losing audio on (FR-3.2).
+# * A silent skip. Every suppression is announced on the bus as a
+#   `TranscribeSkipped`, naming the live session it matched and the archived
+#   file, so a wrong guess is something the operator reads rather than something
+#   they discover as a missing transcript months later (FR-3.3).
+
+
+def _as_aware(when: datetime) -> datetime:
+    """Local-stamp a naive datetime. Naive and aware values do not compare."""
+    return when.astimezone() if when.tzinfo is None else when
+
+
+# How far BEFORE the bridge announces a live session a device recording of that
+# same session could be stamped. Pressing `l` opens the capture context first —
+# CMD 32 START puts the device into realtime mode there — and
+# `LiveTranscriptionStarted` is only published once both AssemblyAI websockets
+# have connected. A recording the device began at the first of those two moments
+# therefore carries a timestamp slightly ahead of the window we observed. A
+# minute covers provider connection setup with room to spare while staying far
+# below any plausible gap between an operator starting a recording ON the device
+# and then pressing `l` — which is the case this tolerance must NOT swallow,
+# because that recording holds audio from before the live session and is the one
+# thing here that would be wrong to leave untranscribed.
+LIVE_SESSION_LEAD_TOLERANCE = timedelta(seconds=60)
+
+# Bound on retained windows. Suppression only ever consults recent ones, and an
+# app left running for weeks must not accumulate them without limit.
+LIVE_SESSION_HISTORY = 16
+
+
+@dataclass(frozen=True)
+class LiveSessionWindow:
+    """One completed live transcription, as wall-clock start and stop."""
+
+    started_at: datetime
+    stopped_at: datetime
+
+    def covers_start_of(self, recorded_at: datetime) -> bool:
+        """Did a recording that STARTED at `recorded_at` begin inside this session?
+
+        The start, not an overlap. A device recording already running when `l`
+        was pressed overlaps this window at its trailing edge, but it holds audio
+        from before the live session that nothing else transcribed — suppressing
+        it would delete a transcript rather than avoid a duplicate one.
+        """
+        return (
+            self.started_at - LIVE_SESSION_LEAD_TOLERANCE
+            <= recorded_at
+            <= self.stopped_at
+        )
+
+
+class LiveSessionLog:
+    """Remembers when live transcription actually ran, for the batch path to consult.
+
+    The oracle is the bridge's own pair of events: `LiveTranscriptionStarted` is
+    published once both provider sessions are open and `LiveTranscriptionStopped`
+    once they are closed, so a window here means "this stretch of wall-clock was
+    transcribed live, and billed" — which is exactly the question FR-3.1 asks. A
+    live session whose bridge never opened publishes neither, and a recording
+    from that stretch is correctly transcribed by the batch path.
+
+    **Only CLOSED windows are consultable, and that direction is deliberate.**
+    An open window would have to be treated as extending to now, and a stop event
+    that never arrived would then suppress transcription for every recording the
+    app ever offloaded again — a silent, permanent, self-inflicted outage whose
+    only symptom is the absence of transcripts. Failing the other way costs one
+    duplicated transcription of one call, which is visible in the log the moment
+    it happens. Nothing is lost by it in practice either: `_run_scan_and_drain`
+    and `_offload_pending` both refuse to touch the device while a live session
+    holds it, so no offload can complete inside an open window anyway.
+    """
+
+    def __init__(self, bus: EventBus, *, clock: Callable[[], datetime] = datetime.now):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._open_since: Optional[datetime] = None
+        self._windows: List[LiveSessionWindow] = []
+        # Subscribed HERE rather than by the composition root, so that a log
+        # which exists is a log which is listening. One handed to the `Offloader`
+        # but never wired to the bus would suppress nothing, forever, and the
+        # only evidence would be an AssemblyAI bill.
+        bus.subscribe(self.observe)
+
+    def observe(self, event) -> None:
+        """Bus subscriber. Called under the bus's lock, so it never publishes."""
+        if isinstance(event, LiveTranscriptionStarted):
+            with self._lock:
+                self._open_since = _as_aware(self._clock())
+        elif isinstance(event, LiveTranscriptionStopped):
+            with self._lock:
+                started = self._open_since
+                self._open_since = None
+                if started is None:
+                    # A stop with no start we saw. Inventing a window from one
+                    # endpoint would assert a stretch of time we never observed.
+                    return
+                self._windows.append(
+                    LiveSessionWindow(started, _as_aware(self._clock()))
+                )
+                del self._windows[:-LIVE_SESSION_HISTORY]
+
+    def window_covering(self, recorded_at: datetime) -> Optional[LiveSessionWindow]:
+        """The live session a recording starting at `recorded_at` belongs to, if any.
+
+        Most recent first: a device that produced a file for the call that just
+        ended is the case this exists for.
+        """
+        recorded_at = _as_aware(recorded_at)
+        with self._lock:
+            windows = list(self._windows)
+        for window in reversed(windows):
+            if window.covers_start_of(recorded_at):
+                return window
+        return None
+
+
 class Offloader:
     """Runs the size-stable -> download -> verify -> rename -> state pipeline.
 
@@ -223,6 +360,11 @@ class Offloader:
         delete_after_offload: bool,
         transcribe_on_offload: bool = True,
         hta_converter: Optional[HTAConverter] = None,
+        # The record of which stretches of wall-clock were already transcribed
+        # live (FR-3.1). `None` means this composition never runs live sessions,
+        # so nothing can have been transcribed twice; `__main__` always supplies
+        # one built against the same bus this offloader publishes on.
+        live_sessions: Optional[LiveSessionLog] = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], datetime] = datetime.now,
     ):
@@ -234,6 +376,7 @@ class Offloader:
         self._delete_after_offload = delete_after_offload
         self._transcribe_on_offload = transcribe_on_offload
         self._hta = hta_converter
+        self._live_sessions = live_sessions
         self._sleep = sleep
         self._clock = clock
 
@@ -529,15 +672,28 @@ class Offloader:
             )
         )
 
+        # FR-3.1 / FR-3.3. The suppression is per-file and it happens HERE, after
+        # the download, the verify, the rename and the ledger write — everything
+        # that keeps the audio has already run, and only the paid second pass is
+        # declined. Nothing above this line is conditional on a live session.
         if self._transcribe_on_offload:
-            from .transcribe import transcribe_file as _transcribe
-            _transcribe(
-                target_path,
-                self._archive_dir,
-                bus=self._bus,
-                device_filename=device_filename,
-                recorded_at=file.device_mtime,
-            )
+            live_window = self._live_session_covering(target_path, file.device_mtime)
+            if live_window is not None:
+                self._bus.publish(
+                    TranscribeSkipped(
+                        device_filename=device_filename,
+                        reason=self._live_suppression_reason(live_window, target_path),
+                    )
+                )
+            else:
+                from .transcribe import transcribe_file as _transcribe
+                _transcribe(
+                    target_path,
+                    self._archive_dir,
+                    bus=self._bus,
+                    device_filename=device_filename,
+                    recorded_at=file.device_mtime,
+                )
 
         return OffloadResult(
             device_filename=device_filename,
@@ -566,6 +722,42 @@ class Offloader:
             file=file,
             cancel_event=cancel_event,
             kind=kind,
+        )
+
+    def _live_session_covering(
+        self, target_path: Path, device_mtime: Optional[datetime]
+    ) -> Optional[LiveSessionWindow]:
+        """The live session this recording belongs to, or None (FR-3.1).
+
+        `resolve_recorded_at` is the same start-time resolver the transcription
+        bridge uses, so the moment compared here is the moment the recording
+        STARTED — not the file's mtime, which for an offloaded file is
+        recording-end plus transfer time and would place every device recording
+        well after the session that produced it.
+        """
+        if self._live_sessions is None:
+            return None
+        return self._live_sessions.window_covering(
+            resolve_recorded_at(target_path, device_mtime)
+        )
+
+    @staticmethod
+    def _live_suppression_reason(window: LiveSessionWindow, target_path: Path) -> str:
+        """What the operator is told when a batch transcription is declined.
+
+        Names the session that matched and the file that was kept, so a wrong
+        guess is legible and actionable. A skip writes no ledger entry, so `r`
+        will not find this file — the remedy has to be stated rather than
+        implied.
+        """
+        return (
+            "already transcribed live — this recording starts inside the live "
+            f"session of {window.started_at:%Y-%m-%d %H:%M:%S}–"
+            f"{window.stopped_at:%H:%M:%S}, which was transcribed and billed as "
+            "it happened. The audio was still offloaded and is archived at "
+            f"{target_path}; if it is NOT that call, transcribe it from the "
+            "archive by hand — a skip leaves no failed ledger entry, so r will "
+            "not offer it."
         )
 
     def _mark_device_deleted(self, device_key: DeviceKey, device_filename: str) -> None:

@@ -13,10 +13,11 @@ from .app import App
 from .config import ensure_tls_trust_store, load_config, load_env_file_into_environ
 from .device import JensenDeviceAdapter
 from .events import Error, EventBus, RetryCandidatesDetected, Severity, TranscribeSkipped
+from .live_archive import LiveArchive
 from .live_server import LiveSessionController, LiveSurface, launch_app_window
 from .live_transcribe import LiveTranscriber
 from .locks import FileLock, LockHeld
-from .offload import Offloader
+from .offload import LiveSessionLog, Offloader
 from .realtime import RealtimeSession
 from .state import StateStore
 from .tui import TUI
@@ -134,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
     store = StateStore(config.state_path)
     adapter = JensenDeviceAdapter()
     watcher = PollingUSBWatcher()
+    # `live_archive_prd.md` FR-3.1..FR-3.3. Constructed against the SAME bus the
+    # live bridge publishes its start/stop on and the offloader publishes its
+    # skip on — a log wired to a different bus, or to none, would be inert and
+    # its only symptom would be a duplicated AssemblyAI charge. Built before the
+    # `Offloader` so no window can be missed between the two.
+    live_sessions = LiveSessionLog(bus)
     offloader = Offloader(
         adapter=adapter,
         store=store,
@@ -142,6 +149,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         tmp_dir=config.tmp_dir,
         delete_after_offload=config.delete_from_device_after_offload,
         transcribe_on_offload=config.transcribe_on_offload,
+        live_sessions=live_sessions,
     )
     app = App(
         adapter=adapter,
@@ -168,12 +176,21 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         api_key=config.assemblyai_api_key,
         operator_name=config.operator_name,
         max_speakers=config.live_max_speakers,
+        # The same directory the offload path writes to, handed over at
+        # composition time rather than read from a process global at use time
+        # (`live_archive_prd.md`; the INBOX_DIRS defect is what that shape
+        # costs). A live session's recording is an ordinary archive recording —
+        # same `YYYY/MM` folder, same `YYYY-MM-DD_HHMMSS` basename — because the
+        # device keeps none of its own while it streams, so ours is the only
+        # copy of the call that will ever exist.
+        archive_dir=config.archive_dir,
         suspend_polling=app.suspend_device_polling,
         resume_polling=app.resume_device_polling,
         busy_predicate=lambda: app.device_busy,
         surface_factory=LiveSurface,
         capture_factory=RealtimeSession,
         transcriber_factory=LiveTranscriber,
+        archive_factory=LiveArchive,
         launch_browser=launch_app_window,
     )
     tui = TUI(

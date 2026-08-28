@@ -7,6 +7,8 @@ and immune to SDK version drift.
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -19,6 +21,7 @@ def render_markdown(
     *,
     source_filename: str,
     recorded_at: datetime,
+    speaker_names: Mapping[str, str] | None = None,
 ) -> str:
     """Render a transcript dict to the PRD §2.4 markdown format.
 
@@ -26,6 +29,17 @@ def render_markdown(
         transcript: raw AAI response dict (matches types.TranscriptResponse schema).
         source_filename: the original `.wav` filename (used verbatim in frontmatter).
         recorded_at: timezone-aware datetime (source file mtime).
+        speaker_names: optional map from the RAW provider speaker key (the value
+            in `utterances[].speaker`, e.g. `"A"`) to a display name. A key that
+            has a name renders `**<name>**`; every other speaker keeps the
+            existing `**Speaker {num}**` label. Numbering is computed over ALL
+            speakers in first-appearance order exactly as it is without this
+            argument, so naming one speaker never renumbers another -- a number
+            means the same thing whether or not its neighbours are named.
+            Names are untrusted operator input and are sanitised
+            (`_sanitize_speaker_name`) before they reach the document.
+            `None` (the default), an empty map, and a map whose keys match no
+            speaker all produce byte-identical output to omitting the argument.
 
     Returns:
         Full markdown document with trailing newline.
@@ -64,14 +78,61 @@ def render_markdown(
         if raw_speaker not in speaker_map:
             speaker_map[raw_speaker] = len(speaker_map) + 1
         num = speaker_map[raw_speaker]
+        label = _speaker_label(raw_speaker, num, speaker_names)
         start_ms = int(u.get("start") or 0)
         mm, ss = divmod(start_ms // 1000, 60)
         text = (u.get("text") or "").strip()
-        lines.append(f"**Speaker {num}** ({mm:02d}:{ss:02d}): {text}")
+        lines.append(f"**{label}** ({mm:02d}:{ss:02d}): {text}")
         lines.append("")
     body = "\n".join(lines)
     # Ensure single trailing newline.
     return body.rstrip("\n") + "\n"
+
+
+# Characters that would end the current line. A name carrying one of these could
+# open a new document line and forge a frontmatter fence, a heading, or an extra
+# speaker turn, so they are folded to a space rather than escaped.
+_LINE_BREAKING = re.compile("[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]")
+# Remaining C0/C1 controls carry no display meaning; drop them outright.
+_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f-\x9f]")
+_WHITESPACE_RUN = re.compile(r"\s+")
+# Inline Markdown structure that would otherwise escape the `**...**` label and
+# reflow the rest of the line. Backslash is in the set and the translation is a
+# single pass, so an escape introduced here is never itself re-escaped.
+_MD_STRUCTURAL = str.maketrans({ch: "\\" + ch for ch in "\\*_`[]<>|~"})
+
+
+def _sanitize_speaker_name(name: str) -> str:
+    """Make an untrusted operator-supplied name safe to inline in the document.
+
+    The name is written into a Markdown body that sits under YAML frontmatter,
+    so the invariant is structural: whatever comes back must occupy exactly one
+    line and must not introduce Markdown structure. Returns `""` when nothing
+    printable survives, which the caller treats as "unnamed".
+    """
+    flattened = _LINE_BREAKING.sub(" ", name)
+    flattened = _CONTROL.sub("", flattened)
+    flattened = _WHITESPACE_RUN.sub(" ", flattened).strip()
+    return flattened.translate(_MD_STRUCTURAL)
+
+
+def _speaker_label(
+    raw_speaker: str,
+    num: int,
+    speaker_names: Mapping[str, str] | None,
+) -> str:
+    """The bold label for one turn: the operator's name, else `Speaker {num}`.
+
+    `num` is the unchanged first-appearance number, so falling back here yields
+    exactly the label this renderer emitted before names existed.
+    """
+    if speaker_names:
+        name = speaker_names.get(raw_speaker)
+        if name is not None:
+            safe = _sanitize_speaker_name(name if isinstance(name, str) else str(name))
+            if safe:
+                return safe
+    return f"Speaker {num}"
 
 
 def _top_highlights(result: Any) -> list[str]:

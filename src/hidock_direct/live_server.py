@@ -32,11 +32,20 @@ Three properties shape every design decision in this module:
    interleave request/response pairs, so a live session suspends offload polling
    for its duration and releases it on **every** exit path (§3.6).
 
-Nothing here is persisted. No file, no ledger entry, no archive path: the 48 kHz
-flash recording and the offline pipeline remain the authoritative artifacts, and
-the operator's archive directory is a live Drive mount this feature must be
-invisible to (NFR-6). State is the turn ring, the name map, the token, the port
-and the subscriber set — all discarded on stop.
+The SURFACE persists nothing. No file, no ledger entry, no archive path: its
+state is the turn ring, the name map, the token, the port and the subscriber set,
+all discarded on stop (NFR-6).
+
+The SESSION does persist, since phase 1d, and the two facts are not in conflict.
+`LiveSessionController` composes a `LiveArchive` alongside the capture and the
+bridge, because the device **stops its own recording while it streams and never
+persists the live-session audio** (operator hardware test 2026-08-27: a power
+cycle and a rescan produced nothing to offload) — so phases 1a–1c bought a live
+transcript at the cost of the recording, and nobody chose that trade. Every byte
+that reaches the disk is written by `live_archive.py`; this module hands it
+frames as they arrive and, at stop, the operator's `label -> name` map. The split
+is what keeps NFR-6 true of the surface while `live_archive_prd.md` FR-1.1 is
+true of the session.
 
 Nothing here logs transcript text, audio bytes, the token, or the session URL
 (which carries the token). The URL reaches the operator over the event bus, which
@@ -45,6 +54,7 @@ is the TUI's activity log, not the logging module (NFR-4).
 
 from __future__ import annotations
 
+import contextlib
 import http.cookies
 import http.server
 import json
@@ -1158,6 +1168,23 @@ class LiveSurface:
             payload = self._names_payload()
         self._broadcast(payload)
 
+    def speaker_names(self) -> Dict[str, str]:
+        """The operator's `label -> name` map, as a snapshot.
+
+        The archive reads this ONCE, at stop (`live_archive_prd.md` §5), which is
+        what lets a name typed in the last minute of a call reach lines rendered
+        in the first — the same property `_display_name` gives the page, applied
+        to the document.
+
+        Keyed by the PROVIDER's label, which is what
+        `render_markdown(speaker_names=...)` matches against, so it is handed
+        across unchanged rather than pre-resolved here. A copy, taken under the
+        lock that serialises `set_name`: the caller renders a whole document from
+        it while the operator may still be typing into the panel.
+        """
+        with self._lock:
+            return dict(self._names)
+
     # -- inbound events ---------------------------------------------------
 
     def publish(self, event) -> None:
@@ -1507,6 +1534,15 @@ def _default_transcriber_factory(bus, **kwargs):
     return LiveTranscriber(bus, **kwargs)
 
 
+def _default_archive_factory(archive_dir, **kwargs):
+    # Imported inside the call, like the two factories above: `live_archive`
+    # reaches the vendored `diarize_audio` renderer, and an app that never
+    # presses `l` should not pay for that import graph at startup.
+    from .live_archive import LiveArchive
+
+    return LiveArchive(archive_dir, **kwargs)
+
+
 class LiveSessionController:
     """Owns a live session: capture, bridge, surface, and the device claim.
 
@@ -1522,12 +1558,23 @@ class LiveSessionController:
         api_key: str,
         operator_name: str = DEFAULT_OPERATOR_NAME,
         max_speakers: int = DEFAULT_MAX_SPEAKERS,
+        # Where a live session's recording and transcript are written. Supplied
+        # by the composition root from `config.archive_dir` — at composition
+        # time, deliberately, rather than read from a process global at use
+        # time, which is the shape that produced the `INBOX_DIRS` defect.
+        #
+        # `None` means this composition archives nothing, which is the pre-1d
+        # behaviour and is NOT a production configuration: `__main__` always
+        # passes the archive, and the composition-root sweep in
+        # `test_live_server.py` fails the moment it stops.
+        archive_dir=None,
         suspend_polling: Optional[Callable[[], None]] = None,
         resume_polling: Optional[Callable[[], None]] = None,
         busy_predicate: Optional[Callable[[], bool]] = None,
         surface_factory: Optional[Callable[..., object]] = None,
         capture_factory: Optional[Callable[..., object]] = None,
         transcriber_factory: Optional[Callable[..., object]] = None,
+        archive_factory: Optional[Callable[..., object]] = None,
         launch_browser: Optional[Callable[..., str]] = None,
     ) -> None:
         self._bus = bus
@@ -1535,12 +1582,14 @@ class LiveSessionController:
         self._api_key = api_key
         self._operator_name = operator_name
         self._max_speakers = max_speakers
+        self._archive_dir = archive_dir
         self._suspend = suspend_polling or _noop
         self._resume = resume_polling or _noop
         self._busy = busy_predicate or _never_busy
         self._surface_factory = surface_factory or _default_surface_factory
         self._capture_factory = capture_factory or _default_capture_factory
         self._transcriber_factory = transcriber_factory or _default_transcriber_factory
+        self._archive_factory = archive_factory or _default_archive_factory
         self._launch_browser = launch_browser or launch_app_window
 
         self._lock = threading.RLock()
@@ -1557,6 +1606,10 @@ class LiveSessionController:
         self._stop_reason = ""
         self._surface = None
         self._capture = None
+        # Held so a teardown that the pump never reached still finalises the
+        # recording — `stop()` joins that pump for five seconds and then tears
+        # down regardless. Cleared with the rest of the session state.
+        self._archive = None
         self._thread: Optional[threading.Thread] = None
 
     # -- operator control -------------------------------------------------
@@ -1637,8 +1690,11 @@ class LiveSessionController:
             transcriber = self._transcriber_factory(
                 self._bus, api_key=self._api_key, max_speakers=self._max_speakers
             )
+            archive = self._new_archive(surface)
+            self._archive = archive
             thread = threading.Thread(
                 target=self._pump, args=(capture, transcriber, generation),
+                kwargs={"archive": archive},
                 name="hidock-live-pump", daemon=True,
             )
             self._thread = thread
@@ -1702,9 +1758,97 @@ class LiveSessionController:
             thread.join(timeout=5.0)
         self._teardown(generation)
 
+    # -- archival ---------------------------------------------------------
+
+    def _new_archive(self, surface):
+        """This session's recorder, or None when the composition archives nothing.
+
+        Never raises. The recording is worth having — the device does not keep
+        one for a live session, so ours is the only copy that will exist — but it
+        is not worth the call: a composition that cannot build a recorder says so
+        and the session goes ahead transcript-only (FR-ERR-1).
+
+        `names` is `surface.speaker_names`, the CALLABLE and not a snapshot. The
+        archive reads it once at stop (§5), which is what lets a name typed in
+        the last minute of a call reach lines rendered in the first. Passing a
+        dict here would freeze the map at session start and archive a document
+        whose early lines say `Speaker 1` and whose later ones say `Dana`.
+        """
+        if self._archive_dir is None:
+            return None
+        try:
+            return self._archive_factory(
+                self._archive_dir,
+                bus=self._bus,
+                operator_name=self._operator_name,
+                names=surface.speaker_names,
+            )
+        except Exception as exc:  # noqa: BLE001 - transcript-only, not no session
+            self._say(
+                f"Live audio is NOT being recorded to {self._archive_dir} "
+                f"({exc}). The live transcript still works, but this call will "
+                "leave no recording.",
+                Severity.ERROR,
+            )
+            return None
+
+    def _record(self, archive, frame, generation: int) -> bool:
+        """Append one frame. Returns whether recording continues.
+
+        FR-ERR-2: a write failure stops the RECORDING, not the session, and says
+        so ONCE — `frames()` yields ~10 chunks/sec, so a per-frame message would
+        bury the activity log in seconds. `live_archive` already classifies the
+        failures it expects and announces them itself; this is the floor under
+        the ones it does not, because an exception escaping here unwinds the
+        capture loop and ends a metered call over a file write.
+        """
+        try:
+            archive.write(frame)
+            return True
+        except Exception as exc:  # noqa: BLE001 - the session outlives this
+            self._say_unless_stale(
+                generation,
+                f"Live audio is no longer being recorded ({exc}). The live "
+                "transcript continues; audio written before the failure is kept.",
+                Severity.ERROR,
+            )
+            return False
+
+    def _finalise_archive(self, archive, generation: int) -> Optional[str]:
+        """Close the recording and say where it went, or None if there is nothing.
+
+        Called with the surface still alive, because `stop()` renders the
+        transcript from the surface's name map and `LiveSurface.stop()` clears
+        it. Ordinarily a second stop — the pump's `with` already finalised the
+        recording — and `LiveArchive.stop()` is idempotent for exactly that.
+        """
+        if archive is None:
+            return None
+        try:
+            archive.stop()
+        except Exception as exc:  # noqa: BLE001 - must not strand the claim
+            log.warning("live: the archive did not stop cleanly (%s)", type(exc).__name__)
+            self._say_unless_stale(
+                generation,
+                f"The live recording could not be finalised ({exc}).",
+                Severity.ERROR,
+            )
+        wav = archive.wav_path
+        transcript = archive.transcript_path
+        if wav is None:
+            # FR-1.5: a session that captured no audio wrote nothing at all, and
+            # announcing a saved recording would name a file that is not there.
+            return None
+        if transcript is None:
+            # FR-ERR-3: audio survives a transcript failure — which `live_archive`
+            # has already surfaced — and naming the file is what makes it
+            # recoverable by hand or through the batch path.
+            return f"Live audio saved — {wav}. No transcript was written."
+        return f"Live session saved — audio {wav}, transcript {transcript}."
+
     # -- the pump ---------------------------------------------------------
 
-    def _pump(self, capture, transcriber, generation: int) -> None:
+    def _pump(self, capture, transcriber, generation: int, *, archive=None) -> None:
         """Frames out of the device, into the bridge, until something ends it.
 
         Every exit path — a clean stop, a capture failure, a bridge failure, an
@@ -1718,30 +1862,55 @@ class LiveSessionController:
         teardown that identified only "a session" would then dismantle the NEXT
         one — resuming polling while its capture is driving the same Jensen
         endpoint, which is the collision FR-6.1 exists to prevent.
+
+        `archive` is this session's recorder, passed rather than read off `self`
+        for the same reason: a stale pump reading `self._archive` would finalise
+        the NEXT session's recording. It is keyword-only and defaults to None
+        because a composition with no archive directory has none to pass.
         """
+        # The archive is the OUTERMOST context, so it is the LAST thing stopped.
+        # `live_archive_prd.md` §7's sketch lists it innermost; that would
+        # finalise the transcript BEFORE `transcriber.__exit__` closes the two
+        # provider sessions — and that close delivers turns. Read from the SDK
+        # rather than assumed: `StreamingClient.disconnect(terminate=True)`
+        # (`assemblyai/streaming/v3/client.py`) enqueues `TerminateSession` and
+        # then waits, commented "the server sends the final Turn and
+        # TerminationEvent after receiving Terminate ... waiting on it here lets
+        # those messages dispatch before teardown". Innermost would drop the last
+        # thing each speaker said from the archived document while leaving it on
+        # screen — and the document is the copy the pipeline reads.
+        recorder = archive if archive is not None else contextlib.nullcontext()
+        recording = archive is not None
         try:
-            with capture:
-                with transcriber:
-                    while not self._stopping and not self._stale(generation):
-                        delivered = False
-                        for frame in capture.frames():
+            with recorder:
+                with capture:
+                    with transcriber:
+                        while not self._stopping and not self._stale(generation):
+                            delivered = False
+                            for frame in capture.frames():
+                                if self._stopping or self._stale(generation):
+                                    break
+                                # Audio to the disk BEFORE the wire (§7). Ours
+                                # is the only recording that will exist, and
+                                # `feed` is the call that can end the session.
+                                if recording:
+                                    recording = self._record(archive, frame, generation)
+                                transcriber.feed(frame)
+                                delivered = True
                             if self._stopping or self._stale(generation):
                                 break
-                            transcriber.feed(frame)
-                            delivered = True
-                        if self._stopping or self._stale(generation):
-                            break
-                        if not delivered:
-                            # `frames()` bounds emptiness by wall clock, so an
-                            # empty drain is the device having stopped sending —
-                            # a conversational pause still produces samples.
-                            self._say_unless_stale(
-                                generation,
-                                "Live transcription stopped — the device stopped "
-                                "sending audio.",
-                                Severity.WARNING,
-                            )
-                            break
+                            if not delivered:
+                                # `frames()` bounds emptiness by wall clock, so
+                                # an empty drain is the device having stopped
+                                # sending — a conversational pause still
+                                # produces samples.
+                                self._say_unless_stale(
+                                    generation,
+                                    "Live transcription stopped — the device "
+                                    "stopped sending audio.",
+                                    Severity.WARNING,
+                                )
+                                break
         except Exception as exc:  # noqa: BLE001 - surfaced, then released
             # Translated, not forwarded. This string is the operator's only
             # account of why a live call stopped, and the commonest cause — the
@@ -1798,9 +1967,27 @@ class LiveSessionController:
             self._torn_down = True
             self._live = False
             surface = self._surface
+            archive = self._archive
             self._surface = None
+            self._archive = None
             self._capture = None
             self._thread = None
+
+        # BEFORE the surface stops, because the recording's transcript is
+        # rendered from the operator's `label -> name` map and `LiveSurface.stop`
+        # clears it. Normally a no-op — the pump's `with` already finalised it —
+        # but `stop()` joins that pump for five seconds and then tears down
+        # regardless, and a recording finalised without the map is a document of
+        # `Speaker 1`s for a call whose speakers the operator had already named.
+        #
+        # Wrapped whole: everything below releases the device claim, and a raise
+        # from here would strand the offload worker suspended (FR-6.3) over a
+        # file write.
+        try:
+            saved = self._finalise_archive(archive, generation)
+        except Exception as exc:  # noqa: BLE001 - must not strand the claim
+            log.warning("live: the recording was not finalised (%s)", type(exc).__name__)
+            saved = None
 
         try:
             if surface is not None:
@@ -1810,6 +1997,18 @@ class LiveSessionController:
             log.warning("live: surface did not stop cleanly (%s)", type(exc).__name__)
         finally:
             self._resume()
+
+        # WHERE the call went. The operator has just been told by this project
+        # that live audio was being lost; "it is saved, here" is the line that
+        # closes that, and it names paths rather than a count so the file can be
+        # opened without going looking for it.
+        #
+        # Published after the surface is gone, deliberately: an `Error` with
+        # `context == "live"` is forwarded to the page, which renders every one
+        # of them in its problem style — so announcing it a moment earlier would
+        # put an amber warning on screen saying the recording succeeded.
+        if saved:
+            self._say_unless_stale(generation, saved, Severity.INFO)
 
         # Say WHY, using what the caller passed. "stopped" and "app shutting
         # down" are different events and the operator can act on the difference;
