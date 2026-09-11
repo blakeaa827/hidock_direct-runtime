@@ -71,6 +71,7 @@ import webbrowser
 from collections import deque
 from typing import Callable, Dict, List, Optional
 
+from .config import parse_speaker_count
 from .events import (
     Error,
     EventBus,
@@ -93,7 +94,10 @@ DEFAULT_RING_SIZE = 2000
 # transcript.
 DEFAULT_OPERATOR_NAME = "Me"
 
-# 1b's ceiling, carried through so the two phases cannot disagree.
+# The ceiling a composition that supplies none falls back to — 1b's value,
+# carried through so the two phases cannot disagree. NOT what the operator
+# sees: `__main__` always passes `config.live_max_speakers`, which is what
+# the `l` prompt prepopulates with.
 DEFAULT_MAX_SPEAKERS = 6
 
 # How long the launcher waits on a browser process before deciding the window is
@@ -1618,33 +1622,85 @@ class LiveSessionController:
     def is_live(self) -> bool:
         return self._live
 
-    def toggle(self) -> None:
+    @property
+    def default_max_speakers(self) -> int:
+        """What the `l` prompt prepopulates with — the CONFIGURED value.
+
+        Read by the TUI so the prompt has ONE source for its default, wired by
+        `__main__` to `config.live_max_speakers`. It is deliberately not the
+        previous session's answer: a 10-person call settling on 10 and silently
+        carrying that into the next 1:1 splits one remote voice across several
+        labels — this PRD's own defect, reintroduced from the other direction.
+        """
+        return self._max_speakers
+
+    def start_refusal(self) -> Optional[str]:
+        """Why a session could not start right now, or None if one could.
+
+        Answerable WITHOUT starting anything, because the TUI asks it before
+        opening the prompt (FR-ERR-2): refusing after the operator has chosen a
+        number wastes the decision and reads as though the number caused the
+        failure. `start()` raises exactly this string, so the reason the prompt
+        shows and the reason a start gives are one implementation rather than
+        two kept in step by convention.
+        """
+        if self._live:
+            return "a live session is already running; press l to stop it"
+        # FR-6.2. Refuse and say why; do NOT queue — a silent queue means the
+        # window appears minutes later with no explanation.
+        if self._busy():
+            return (
+                "cannot start live transcription while an offload transfer is in "
+                "flight — the live stream and the transfer share one USB endpoint; "
+                "press l again once the offload finishes"
+            )
+        return None
+
+    def toggle(self, max_speakers: Optional[int] = None) -> None:
         """One key, both directions — and it never raises.
 
         `l` is read on the TUI's keyboard thread, where the reader swallows
         exceptions: a refusal that raised there would be a keypress that did
         nothing, with no message.
+
+        `max_speakers` is the count the operator just typed at the prompt. It is
+        optional because the STOP half of the same key has no number to carry.
         """
         try:
             if self._live:
                 self.stop("stopped by the operator")
             else:
-                self.start()
+                self.start(max_speakers=max_speakers)
         except Exception as exc:  # noqa: BLE001 - the refusal must be visible
             self._say(str(exc), Severity.WARNING)
 
-    def start(self) -> None:
-        if self._live:
-            raise LiveSessionError("a live session is already running; press l to stop it")
+    def start(self, max_speakers: Optional[int] = None) -> None:
+        """Open a live session, optionally under a ceiling chosen for THIS call.
 
-        # FR-6.2. Refuse and say why; do NOT queue — a silent queue means the
-        # window appears minutes later with no explanation.
-        if self._busy():
-            raise LiveSessionError(
-                "cannot start live transcription while an offload transfer is in "
-                "flight — the live stream and the transfer share one USB endpoint; "
-                "press l again once the offload finishes"
-            )
+        `max_speakers` is per-session and is never written back onto the
+        controller (FR-2.5): the next `l` prompts again from the configured
+        default. `None` means "no operator answer" — the shutdown path and any
+        future non-prompt caller — and takes the configured default rather than
+        putting a `None` on the wire.
+        """
+        refusal = self.start_refusal()
+        if refusal is not None:
+            raise LiveSessionError(refusal)
+
+        # Refused, never clamped, and refused HERE rather than only at the
+        # prompt, because the prompt is not the only caller. Past the ceiling the
+        # vendor MERGES additional speakers into the closest existing label, so a
+        # silently-clamped session destroys a distinction rather than degrading
+        # it — on a call the operator is paying for, with nothing above this
+        # layer able to report the substitution.
+        if max_speakers is None:
+            session_max_speakers = self._max_speakers
+        else:
+            session_max_speakers, reason = parse_speaker_count(str(max_speakers))
+            if session_max_speakers is None:
+                raise LiveSessionError(
+                    f"cannot start live transcription — {reason}"
+                )
 
         surface = self._surface_factory(operator_name=self._operator_name)
         try:
@@ -1688,7 +1744,7 @@ class LiveSessionController:
             capture = self._capture_factory(self._adapter)
             self._capture = capture
             transcriber = self._transcriber_factory(
-                self._bus, api_key=self._api_key, max_speakers=self._max_speakers
+                self._bus, api_key=self._api_key, max_speakers=session_max_speakers
             )
             archive = self._new_archive(surface)
             self._archive = archive

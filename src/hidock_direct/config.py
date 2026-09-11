@@ -86,7 +86,7 @@ class Config:
     log_level: str
     source: str  # "env" or "<path>" — for diagnostics
     operator_name: str  # HIDOCK_OPERATOR_NAME — the live surface's near-channel identity
-    live_max_speakers: int  # HIDOCK_LIVE_MAX_SPEAKERS — far-channel diarization ceiling
+    live_max_speakers: int  # HIDOCK_LIVE_MAX_SPEAKERS — the `l` prompt's prepopulated value
     # Never in the repr: `Config` is printed in diagnostics, and a live key
     # reached a session transcript that way on 2026-08-22. No field carries a
     # dataclass default — `load_config` is the single place a default is
@@ -178,6 +178,61 @@ def diarize_config_for_archive(archive_dir):
     )
 
 
+# The vendor's own hard cap, quoted in `live_speaker_count_prompt_prd.md` §1:
+# "A hard cap on the number of speaker labels in the audio stream (integer, 1-10).
+#  This is a strict limit, not a hint — once it is reached, any additional speakers
+#  are merged into the closest existing label rather than given a new one."
+#
+# It is AssemblyAI's number, not ours, and it is not re-derived anywhere else.
+SPEAKER_COUNT_MIN = 1
+SPEAKER_COUNT_MAX = 10
+
+# Named once so a refusal cannot say one range while the check enforces another.
+_SPEAKER_RANGE = f"{SPEAKER_COUNT_MIN}-{SPEAKER_COUNT_MAX}"
+
+_ASCII_DIGITS = frozenset("0123456789")
+
+
+def parse_speaker_count(text: str) -> tuple[Optional[int], str]:
+    """Parse an operator-typed speaker count. Returns `(value, reason)`.
+
+    One implementation, two callers: `load_config` at startup and the `l`
+    prompt at keypress time. A second copy of a vocabulary kept in agreement by
+    convention is exactly what produced the 2026-08-20 `Invalid API key` defect,
+    and a range that drifted between the two would let a value load at startup
+    that the prompt then refuses — so Enter alone could never start a session
+    and the operator would have no way to learn why.
+
+    On success: `(n, "")`. On refusal: `(None, reason)`, where `reason` names
+    the vendor's range, because 1-10 is not guessable from the number typed.
+
+    It NEVER clamps. A clamp starts a metered session under a ceiling the
+    operator neither chose nor saw, and past that ceiling the vendor MERGES
+    additional speakers into the closest existing label — destroying a
+    distinction rather than degrading it.
+
+    The accepted alphabet is ASCII digits only. `int()` accepts `"١"` and
+    `str.isdigit()` calls it a digit, so a length-plus-isdigit guard would admit
+    a ceiling the operator cannot read back off their own screen; `"1.5"` and
+    `"8x"` are refused for the same reason a first-digit regex would be wrong —
+    it would silently accept 1 and 8.
+    """
+    candidate = (text or "").strip()
+    if not candidate or not set(candidate) <= _ASCII_DIGITS:
+        typed = repr(candidate) if candidate else "nothing"
+        return None, (
+            f"{typed} is not a speaker count — "
+            f"type a whole number from {_SPEAKER_RANGE}"
+        )
+    value = int(candidate)
+    if not (SPEAKER_COUNT_MIN <= value <= SPEAKER_COUNT_MAX):
+        return None, (
+            f"{value} is outside AssemblyAI's hard cap — "
+            f"type a whole number from {_SPEAKER_RANGE}"
+        )
+    return value, ""
+
+
 def _resolve(name: str, default: str, env_values: dict, overlay: Optional[dict]) -> str:
     if overlay is not None and name in overlay:
         return str(overlay[name])
@@ -210,7 +265,14 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     # true for every user of a public clone — never the maintainer's name, and
     # never derived from the OS account, which is frequently a handle.
     operator = _resolve("HIDOCK_OPERATOR_NAME", "Me", env_values, overlay).strip() or "Me"
-    speakers = _resolve("HIDOCK_LIVE_MAX_SPEAKERS", "6", env_values, overlay)
+    # The PREPOPULATED value the `l` prompt opens with, not a fixed ceiling: the
+    # right number is per-call and only the operator knows it. 8 is the
+    # operator's own stated requirement — "prepopulated with a default of 8 so
+    # the user can just hit enter if they choose not to override it" — and it
+    # sits where the vendor's guidance points, a little headroom above a typical
+    # call. 6 was live on the 10-person call that collapsed 2-3 people into one
+    # label.
+    speakers = _resolve("HIDOCK_LIVE_MAX_SPEAKERS", "8", env_values, overlay)
     api_key = _resolve("ASSEMBLYAI_API_KEY", "", env_values, overlay)
 
     try:
@@ -224,14 +286,14 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     # naming the variable, not a silent fallback to the default (which the
     # operator would never learn about) and not a TypeError from inside a paid
     # live session.
-    try:
-        speakers_int = int(speakers)
-    except ValueError as exc:
-        raise ValueError(
-            f"HIDOCK_LIVE_MAX_SPEAKERS must be an integer, got {speakers!r}"
-        ) from exc
-    if speakers_int <= 0:
-        raise ValueError(f"HIDOCK_LIVE_MAX_SPEAKERS must be > 0, got {speakers_int}")
+    #
+    # Through `parse_speaker_count`, not a second range check beside it: this
+    # value now PREPOPULATES the prompt, so a setting the loader admits and the
+    # prompt refuses would be a value Enter alone could never commit, with no
+    # refusal text anywhere to explain it.
+    speakers_int, speakers_reason = parse_speaker_count(str(speakers))
+    if speakers_int is None:
+        raise ValueError(f"HIDOCK_LIVE_MAX_SPEAKERS: {speakers_reason}")
 
     delete_bool = str(delete).strip().lower() in _TRUE_SET
     transcribe_bool = str(transcribe).strip().lower() in _TRUE_SET

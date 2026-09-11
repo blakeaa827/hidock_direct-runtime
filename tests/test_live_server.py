@@ -3655,15 +3655,36 @@ def test_the_launcher_never_blocks_on_the_browser_process(monkeypatch):
 
 
 class _RecordingController:
-    """Faithful stand-in for `LiveSessionController` at the TUI seam."""
+    """Faithful stand-in for `LiveSessionController` at the TUI seam.
 
-    def __init__(self):
+    Phase 1e: `toggle` carries the per-session speaker ceiling, and the TUI reads
+    `default_max_speakers` to prepopulate its prompt and `start_refusal()` to
+    decide whether to open one at all. `committed` records the ceiling of every
+    press, because "a session started" and "a session started with the
+    operator's number" are different claims and only the second falsifies a
+    clamp.
+    """
+
+    def __init__(self, *, default_max_speakers: int = 8, refusal=None):
         self.toggles = 0
+        self.committed: List[Optional[int]] = []
         self.live = False
+        self.default = default_max_speakers
+        self.refusal = refusal
 
-    def toggle(self) -> None:
-        _bind_against(LiveSessionController.toggle)
+    @property
+    def default_max_speakers(self) -> int:
+        _bind_against(LiveSessionController.default_max_speakers.fget)
+        return self.default
+
+    def start_refusal(self) -> Optional[str]:
+        _bind_against(LiveSessionController.start_refusal)
+        return self.refusal
+
+    def toggle(self, max_speakers: Optional[int] = None) -> None:
+        _bind_against(LiveSessionController.toggle, max_speakers=max_speakers)
         self.toggles += 1
+        self.committed.append(max_speakers)
         self.live = not self.live
 
     def stop(self, reason: str = "stopped") -> None:
@@ -3693,13 +3714,21 @@ def _tui(controller_double=None, state: str = "CONNECTED_IDLE") -> TUI:
 def test_pressing_l_reaches_the_live_session_controller():
     """U-18. Dispatched through the REAL `_on_key`, not by calling `toggle()`: the
     binding is the part that can be missing, and calling the method directly is
-    what let the retry surface look tested while `r` did nothing."""
+    what let the retry surface look tested while `r` did nothing.
+
+    TRANSFORMED for phase 1e (live_speaker_count_prompt_prd.md FR-1.1). The
+    assertion that `l` reaches the controller is kept in full; what changed is
+    that it reaches it on CONFIRMATION rather than on the keystroke, because `l`
+    now opens the speaker-count prompt and starts nothing until Enter. The old
+    single-keystroke form would now pass against an implementation that ignored
+    the prompt entirely, which is why it could not simply be left as it was."""
     # MUTATION: bind `L` instead of `l`, or omit the branch entirely (the key then
     # logs "no binding at top level" and the feature is unreachable).
     double = _RecordingController()
     tui = _tui(double)
 
     tui._on_key("l")
+    tui._on_key("\r")
 
     assert double.toggles == 1
     joined = " ".join(message for _when, message, _sev in tui._log)
@@ -3707,13 +3736,18 @@ def test_pressing_l_reaches_the_live_session_controller():
 
 
 def test_pressing_l_twice_toggles_the_session_off_again():
-    """FR-5.2 — one key, both directions, through the dispatcher."""
+    """FR-5.2 — one key, both directions, through the dispatcher.
+
+    TRANSFORMED for phase 1e: the START half is now `l` then Enter, and the STOP
+    half stays a bare `l` (FR-1.1 puts a prompt in front of starting a metered
+    session; there is nothing to ask before ending one)."""
     # MUTATION: guard the branch with `if not controller.is_live`, making `l` a
     # start-only key and leaving a metered session with no stop.
     double = _RecordingController()
     tui = _tui(double)
 
     tui._on_key("l")
+    tui._on_key("\r")
     tui._on_key("l")
 
     assert double.toggles == 2
@@ -3730,6 +3764,8 @@ def test_l_is_dispatched_ahead_of_the_connected_idle_gate():
 
     tui._on_key("l")
 
+    assert tui._speaker_prompt is not None, "the state gate swallowed `l`"
+    tui._on_key("\r")
     assert double.toggles == 1, "the state gate swallowed `l`"
     joined = " ".join(message for _when, message, _sev in tui._log)
     assert "keys active only in CONNECTED_IDLE" not in joined
@@ -3784,6 +3820,7 @@ def test_l_does_not_disturb_the_modal_key_sets():
     tui._on_key("l")
 
     assert double.toggles == 0
+    assert tui._speaker_prompt is None, "a prompt opened from a keystroke aimed elsewhere"
     assert tui._whisper_modal is not None
 
 
@@ -4243,13 +4280,22 @@ def test_the_operator_name_defaults_to_me_when_unset(tmp_path, monkeypatch):
     assert _config(tmp_path, monkeypatch).operator_name == "Me"
 
 
-def test_the_live_speaker_ceiling_is_configurable_and_defaults_to_six(tmp_path, monkeypatch):
-    """A modern meeting platform, not a room — six is a conference call, not six
-    people around one microphone (inherited from 1b's DEFAULT_MAX_SPEAKERS)."""
+def test_the_live_speaker_ceiling_is_configurable(tmp_path, monkeypatch):
+    """TRANSFORMED for phase 1e (live_speaker_count_prompt_prd.md FR-2.4).
+
+    This test asserted a DEFAULT of six. That default is now 8, and it is no
+    longer a fixed ceiling at all — it is the value the `l` prompt is
+    prepopulated with, which the operator commits with Enter or overrides per
+    call. Six was live on the 10-person call that collapsed two or three people
+    into one label.
+
+    The default assertion is not dropped: it MOVED to
+    `test_config.py::test_the_prepopulated_speaker_default_is_eight`, which is
+    where the §5 U-12 obligation lives and where the vendor range it now has to
+    satisfy is pinned alongside it. What stays here is the part this file is
+    about — that the live surface's ceiling is configurable and typed."""
     # MUTATION: `int(...)` dropped, so the ceiling reaches the SDK as a string and
     # the far session's diarization request is malformed.
-    assert _config(tmp_path, monkeypatch).live_max_speakers == 6
-
     config = _config(tmp_path, monkeypatch, HIDOCK_LIVE_MAX_SPEAKERS="3")
 
     assert config.live_max_speakers == 3
@@ -4936,3 +4982,405 @@ def test_the_surface_exposes_the_operators_names_keyed_by_provider_label():
     # since the archive holds it while the operator is still typing into the panel.
     names["B"] = "Sam"
     assert surface.speaker_names() == {"A": "Dana"}
+
+
+# ==========================================================================
+# Phase 1e — the per-session speaker ceiling
+# (live_speaker_count_prompt_prd.md §5 U-1, U-5, U-6, U-8, U-9, U-10)
+#
+# `max_speakers` lives on `StreamingParameters`, NOT on the updateable
+# `StreamingSessionParameters`, so it can only be chosen as the session opens —
+# which is the moment `l` is pressed. That is why it travels as an argument all
+# the way from a keystroke to a wire parameter, and why the tests below refuse
+# to stop at the controller's kwarg: a value that reaches `start()` and not the
+# far session's `StreamingParameters` buys nothing at all.
+# ==========================================================================
+
+
+from assemblyai.streaming.v3 import StreamingClient as _RealStreamingClient
+
+
+class _CapturingStreamingClient:
+    """Faithful stand-in for `StreamingClient`, holding the params it was given.
+
+    Not `**kwargs`-permissive, like every other double in this file: it binds
+    each call against the real SDK class first, so a drift between our call site
+    and the SDK surfaces here rather than in a paid session.
+    """
+
+    def __init__(self, channel: str):
+        self.channel = channel
+        self.params = None
+        self.streamed: List[bytes] = []
+
+    def connect(self, params) -> None:
+        _bind_against(_RealStreamingClient.connect, params)
+        self.params = params
+
+    def stream(self, data) -> None:
+        _bind_against(_RealStreamingClient.stream, data)
+        self.streamed.append(bytes(data))
+
+    def disconnect(self, terminate: bool = False) -> None:
+        _bind_against(_RealStreamingClient.disconnect, terminate=terminate)
+
+    def on(self, event, handler) -> None:
+        _bind_against(_RealStreamingClient.on, event, handler)
+
+
+def _real_bridge(clients: Dict[str, _CapturingStreamingClient]):
+    """A transcriber factory that builds the REAL `LiveTranscriber`.
+
+    The point of the whole chain is what lands in `StreamingParameters`, and
+    `_params` — the code that decides which channel is diarized and under what
+    ceiling — only runs in the real bridge. A `FakeTranscriber` recording its
+    kwargs proves the controller passed a number, not that the number became a
+    session parameter.
+    """
+
+    def factory(bus, **kwargs):
+        def client_factory(channel: str) -> _CapturingStreamingClient:
+            made = _CapturingStreamingClient(channel)
+            clients[channel] = made
+            return made
+
+        return LiveTranscriber(bus, client_factory=client_factory, **kwargs)
+
+    return factory
+
+
+def _prompted_tui(harness) -> TUI:
+    """A real TUI over the harness's real controller — the operator's own path."""
+    tui = TUI(bus=harness.bus, live_controller=harness.controller,
+              keyboard=_NoopKeyboard())
+    tui._state = "CONNECTED_IDLE"
+    return tui
+
+
+def _answer(tui, typed: str = "") -> None:
+    """Press `l`, type `typed`, confirm — asserting the prompt actually mediated.
+
+    The two assertions are load-bearing rather than defensive. Without them a
+    test that only inspects what reached the wire passes against an
+    implementation with NO prompt at all: `l` starts a session under the
+    configured ceiling, the digits fall through to the unmapped-key branch, and
+    `\r` does nothing — and the far session's parameters look exactly right for
+    the one case where the operator typed the default anyway.
+    """
+    tui._on_key("l")
+    assert tui._speaker_prompt is not None, "`l` did not open the speaker prompt"
+    for ch in typed:
+        tui._on_key(ch)
+    tui._on_key("\r")
+    assert tui._speaker_prompt is None, "the prompt did not close on confirmation"
+
+
+# -- U-1: the keystroke claims nothing --------------------------------------
+
+
+def test_pressing_l_claims_no_device_and_opens_no_window(controller):
+    """U-1 / FR-1.1 against the REAL controller, which is where the claims are.
+
+    Starting a session suspends offload polling (the live stream and the poll
+    loop drive the same Jensen endpoint), binds a loopback HTTP server and
+    launches a browser window. A prompt that opened AFTER any of that would have
+    the operator choosing a number while their offload worker was already
+    suspended — and a suspension released only on a session's exit paths is one
+    a cancelled prompt might never release at all.
+
+    MUTATION: keep `self._live_controller.toggle()` on the `l` branch and open
+    the prompt afterwards.
+    """
+    harness = controller()
+    tui = _prompted_tui(harness)
+
+    tui._on_key("l")
+
+    assert tui._speaker_prompt is not None, "`l` did not open the prompt"
+    assert harness.suspends == 0, "offload polling was suspended before confirmation"
+    assert harness.surfaces == [], "a surface was bound before confirmation"
+    assert harness.launched == [], "a browser window was opened before confirmation"
+    assert harness.captures == [], "the device was claimed before confirmation"
+    assert harness.controller.is_live is False
+
+
+def test_cancelling_the_prompt_leaves_the_offload_worker_untouched(controller):
+    """U-4's consequence, and the one that is invisible when it goes wrong: a
+    suspended poll loop silently stops discovering recordings, and its only
+    symptom is an absence.
+
+    MUTATION: suspend polling when the prompt OPENS rather than when the session
+    starts — `esc` then leaves the worker suspended with no session to resume it.
+    """
+    harness = controller()
+    tui = _prompted_tui(harness)
+
+    tui._on_key("l")
+    tui._on_key("\x1b")
+
+    assert harness.suspends == 0
+    assert harness.resumes == 0
+    assert harness.surfaces == []
+
+
+# -- U-5 / U-6: the number reaches the far session's StreamingParameters -----
+
+
+def test_the_typed_count_reaches_the_far_sessions_max_speakers(controller):
+    """U-5 / FR-2.3, end to end: a keystroke at the TUI becomes a parameter on
+    the far channel's provider session, through the real `LiveTranscriber`.
+
+    Every link in that chain has been a place a value died in this project
+    before — `ad98cbc` shipped a surface no keystroke reached, and `eccf4a8` a
+    retry path whose kwargs the callee refused. Asserting on the controller's
+    kwarg would leave the last two links untested, and the ceiling only exists
+    once it is on the wire.
+
+    MUTATION: `transcriber_factory(bus, api_key=..., max_speakers=self._max_speakers)`
+    — ignore the per-session argument and pass the configured default. The
+    prompt then reads as though it works and every call runs at 8.
+    """
+    clients: Dict[str, _CapturingStreamingClient] = {}
+    harness = controller(transcriber_factory=_real_bridge(clients), max_speakers=8)
+    tui = _prompted_tui(harness)
+
+    _answer(tui, "3")
+
+    _wait_until(
+        lambda: "far" in clients and clients["far"].params is not None,
+        msg="the far session never connected",
+    )
+    assert clients["far"].params.max_speakers == 3, (
+        f"the far session opened under a ceiling of "
+        f"{clients['far'].params.max_speakers}, not the 3 the operator typed"
+    )
+    assert clients["far"].params.speaker_labels is True
+
+
+def test_enter_alone_puts_the_prepopulated_default_on_the_wire(controller):
+    """U-2's end of the same chain. Enter is the common case — the operator who
+    does not override — so the default has to travel the identical path rather
+    than through a branch that skips the argument.
+
+    MUTATION: pass `max_speakers=None` when the operator typed nothing and let
+    the bridge's own `DEFAULT_MAX_SPEAKERS` (6, from phase 1b) apply — the
+    configured 8 never reaches the wire and `HIDOCK_LIVE_MAX_SPEAKERS` is inert.
+    """
+    clients: Dict[str, _CapturingStreamingClient] = {}
+    harness = controller(transcriber_factory=_real_bridge(clients), max_speakers=8)
+    tui = _prompted_tui(harness)
+
+    _answer(tui)
+
+    _wait_until(
+        lambda: "far" in clients and clients["far"].params is not None,
+        msg="the far session never connected",
+    )
+    assert clients["far"].params.max_speakers == 8
+
+
+@pytest.mark.parametrize("typed", ["1", "10"])
+def test_the_near_session_requests_no_diarization_whatever_the_count(controller, typed):
+    """U-6 / FR-2.3. The near channel is the operator — one person, by the
+    BlueCatch topology — so it requests no diarization at all and cannot emit a
+    wrong speaker label because it emits none. The per-session ceiling must not
+    leak onto it: a near session carrying `speaker_labels` would start splitting
+    the operator's own voice across labels on a quiet line.
+
+    Both ends of the vendor's range, because a leak is most likely to be written
+    as "pass it to both and let the far one care".
+
+    MUTATION: `max_speakers=self._max_speakers` unconditionally in
+    `LiveTranscriber._params`, dropping the `if diarize` guard.
+    """
+    clients: Dict[str, _CapturingStreamingClient] = {}
+    harness = controller(transcriber_factory=_real_bridge(clients), max_speakers=8)
+    tui = _prompted_tui(harness)
+
+    _answer(tui, typed)
+
+    _wait_until(
+        lambda: "near" in clients and clients["near"].params is not None,
+        msg="the near session never connected",
+    )
+    assert clients["near"].params.max_speakers is None
+    assert not clients["near"].params.speaker_labels
+
+
+# -- the controller's own contract ------------------------------------------
+
+
+def test_the_controller_exposes_the_configured_default_for_the_prompt(controller):
+    """U-2 / FR-2.5. The prompt prepopulates from the CONTROLLER's configured
+    value, which `__main__` wires to `config.live_max_speakers` (asserted
+    against the real composition root by
+    `test_the_composition_root_wires_every_seam_to_the_real_collaborator`).
+    Reading it from anywhere else would give the prompt a second source of the
+    same default.
+
+    MUTATION: return `DEFAULT_MAX_SPEAKERS` from the property instead of the
+    configured value — every clone then prompts with 6 whatever the operator set.
+    """
+    harness = controller(max_speakers=4)
+
+    assert harness.controller.default_max_speakers == 4
+
+
+def test_a_session_never_rewrites_the_default_the_next_prompt_reads(controller):
+    """U-9 / FR-2.5 at the controller. The concrete failure: a 10-person call
+    settles on 10, the next call is a 1:1, and a silently-carried 10 splits one
+    remote voice across several labels — the exact defect this PRD was filed to
+    fix, reintroduced from the other direction.
+
+    MUTATION: `self._max_speakers = max_speakers` at the top of `start()`. The
+    per-session value becomes sticky and every subsequent prompt is prepopulated
+    from the last call.
+    """
+    harness = controller(max_speakers=8)
+
+    harness.controller.start(max_speakers=10)
+    harness.controller.stop()
+
+    assert harness.controller.default_max_speakers == 8
+
+
+def test_a_start_with_no_ceiling_uses_the_configured_default(controller):
+    """The shutdown path and any future caller that has no operator answer must
+    still get a working session rather than a `None` on the wire.
+
+    MUTATION: `max_speakers=max_speakers` passed straight through, so a call
+    without one hands `None` to the bridge and the far session's diarization
+    request is malformed.
+    """
+    harness = controller(max_speakers=5)
+
+    harness.controller.start()
+
+    assert harness.transcriber.kwargs["max_speakers"] == 5
+
+
+def test_the_controller_refuses_a_ceiling_outside_the_vendor_range(controller):
+    """U-8 at the controller — the layer the TUI is not the only caller of.
+
+    A clamp here would be worse than at the prompt, because nothing above it
+    would ever report the substitution: past the ceiling the vendor MERGES
+    additional speakers into the closest existing label, so a 11-clamped-to-10
+    session destroys a distinction rather than degrading it, silently, on a
+    call the operator is paying for.
+
+    MUTATION: `max_speakers=min(10, max(1, max_speakers))` in `start()`.
+    """
+    harness = controller(max_speakers=8)
+
+    with pytest.raises(LiveSessionError) as excinfo:
+        harness.controller.start(max_speakers=11)
+
+    assert "1-10" in str(excinfo.value).replace("–", "-")
+    assert harness.transcribers == [], "a session opened under a clamped ceiling"
+    assert harness.surfaces == [], "a surface was bound for a refused session"
+    assert harness.suspends == 0, "offload polling was suspended for a refused session"
+    assert harness.controller.is_live is False
+
+
+def test_toggle_carries_the_ceiling_and_still_never_raises(controller):
+    """`toggle()` is what the keyboard thread calls, and `KeyboardReader._run`
+    swallows exceptions — so a refusal that raised there is a keypress that does
+    nothing, with no message. It has to carry the number AND keep that contract.
+
+    MUTATION: `def toggle(self)` without the parameter (a TypeError the keyboard
+    thread eats), or let the range refusal propagate out of `toggle`.
+    """
+    harness = controller(max_speakers=8)
+
+    harness.controller.toggle(max_speakers=2)
+    assert harness.transcriber.kwargs["max_speakers"] == 2
+
+    harness.controller.toggle()  # the stop half — no ceiling to carry
+    assert harness.controller.is_live is False
+
+    harness.controller.toggle(max_speakers=99)  # must not raise
+    assert harness.controller.is_live is False
+    assert "1-10" in harness.messages().replace("–", "-"), (
+        "an out-of-range ceiling was refused without telling the operator why"
+    )
+
+
+# -- U-10: the refusal that has to precede the prompt -----------------------
+
+
+def test_start_refusal_is_none_when_a_session_could_start(controller):
+    """The TUI asks before opening a prompt, so the question must be answerable
+    without doing anything.
+
+    MUTATION: implement `start_refusal()` by calling `start()` in a try/except —
+    it would answer correctly and leave a live session behind.
+    """
+    harness = controller()
+
+    assert harness.controller.start_refusal() is None
+    assert harness.surfaces == []
+    assert harness.suspends == 0
+    assert harness.controller.is_live is False
+
+
+def test_start_refusal_names_the_in_flight_offload(controller):
+    """U-10 / FR-ERR-2. Only the controller can name the offload, and the reason
+    is the whole value of refusing early: "live transcription unavailable" would
+    leave the operator pressing `l` until the transfer happened to finish.
+
+    MUTATION: return a bare `True`/`False` instead of the reason — the TUI then
+    has nothing to show and invents its own wording.
+    """
+    harness = controller(busy=True)
+
+    reason = harness.controller.start_refusal()
+
+    assert reason, "a busy device was not refused"
+    assert "offload" in reason.lower() or "transfer" in reason.lower()
+
+
+def test_the_refusal_the_prompt_reads_is_the_one_start_raises(controller):
+    """An agreement test that calls BOTH implementations rather than restating
+    either. The `10fba18` lesson: the agreement test it replaced hand-copied the
+    rule it claimed to check, so it pinned the copy and stayed green across a
+    total rewrite.
+
+    Two refusal texts kept in step by convention is how the operator ends up
+    reading one reason at the prompt and a different one from the session that
+    then fails anyway.
+
+    MUTATION: leave `start()`'s own `if self._busy(): raise LiveSessionError(...)`
+    in place alongside a separately-worded `start_refusal()`.
+    """
+    harness = controller(busy=True)
+
+    reason = harness.controller.start_refusal()
+    with pytest.raises(LiveSessionError) as excinfo:
+        harness.controller.start()
+
+    assert str(excinfo.value) == reason, (
+        "the prompt's refusal and the start refusal are two different strings, "
+        "which means two implementations of one rule"
+    )
+
+
+def test_a_busy_device_opens_no_prompt_and_claims_nothing(controller):
+    """U-10 through the operator's own entry point. Refusing AFTER the operator
+    has chosen a number wastes the decision and reads as though the number
+    caused the failure.
+
+    MUTATION: open the prompt first and let `toggle()` surface the refusal on
+    confirm.
+    """
+    harness = controller(busy=True)
+    tui = _prompted_tui(harness)
+
+    tui._on_key("l")
+
+    assert tui._speaker_prompt is None, "the prompt opened over a refused start"
+    assert harness.surfaces == []
+    assert harness.suspends == 0
+    joined = " ".join(message for _when, message, _sev in tui._log).lower()
+    assert "offload" in joined or "transfer" in joined, (
+        "the operator was not told why `l` did nothing"
+    )

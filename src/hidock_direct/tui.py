@@ -8,7 +8,8 @@ Keyboard input: when stdin is a TTY, a `KeyboardReader` thread puts the
 terminal in cbreak mode and dispatches single keypresses to the TUI. Keys
 open the whisper selector modal (`w`) or the unknown-file prompt (`u`),
 both of which call into `App.offload_whisper` / `App.route_unknown`; `r`
-opens the retry confirm and `l` toggles the live-transcription session
+opens the retry confirm and `l` opens the speaker-count prompt that starts
+(or, while one is running, plainly stops) the live-transcription session
 through the injected controller. When stdin is NOT a TTY (tests, piped
 input), the reader no-ops silently.
 """
@@ -20,6 +21,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol
@@ -33,6 +35,7 @@ from rich.table import Table
 from rich.text import Text
 
 from .classify import RecordingKind
+from .config import SPEAKER_COUNT_MAX, SPEAKER_COUNT_MIN, parse_speaker_count
 from .events import (
     DeviceAttached,
     DeviceDetached,
@@ -162,6 +165,88 @@ _SEVERITY_LABEL = {
 
 RECENT_LOG_LIMIT = 10
 
+# AssemblyAI's documented hard cap on `max_speakers` is `config.SPEAKER_COUNT_MIN`
+# / `SPEAKER_COUNT_MAX`, and the check that enforces it is
+# `config.parse_speaker_count`. Both are IMPORTED, never restated here: the
+# loader admits the value that prepopulates this prompt, so a range this module
+# defined for itself could admit a default the prompt then refuses — Enter alone
+# would never start a session and the operator would have no way to learn why.
+# A second copy of a vocabulary kept in agreement by convention is also what
+# produced the 2026-08-20 `Invalid API key` defect and the `10fba18` ledger
+# defect; the prompt does not get to be the third.
+
+# The widest entry the range admits, DERIVED from the vendor's cap. A third
+# digit can never be valid, so it is refused at the keystroke like any other
+# unusable key — which keeps the value on screen and the value that would commit
+# the same thing at every moment. Two digits are still accepted into the buffer
+# and refused at confirmation ("11"), because refusing mid-number would make the
+# two-digit ceiling untypable.
+_SPEAKER_ENTRY_MAX_CHARS = len(str(SPEAKER_COUNT_MAX))
+
+
+def _speaker_refusal(attempted: str) -> str:
+    """The parser's own words about `attempted`, for the prompt to display.
+
+    Used at the keystroke and at confirmation, so the operator reads one
+    vocabulary in both places — and it is the vocabulary that actually decides,
+    not a string kept in step with it by hand. `attempted` is what the entry
+    WOULD have become had the key been accepted, so the refusal names the thing
+    the operator tried rather than the thing still on screen.
+    """
+    _value, reason = parse_speaker_count(attempted)
+    if reason:
+        return reason
+    # `parse_speaker_count` returns an EMPTY reason when the text parses, and
+    # the two-digit-ceiling guard calls this with entries that can parse (any
+    # leading zero, e.g. "08"). Returning "" there dropped the keystroke with no
+    # message and no log line — a key that does nothing, with nothing anywhere
+    # saying why, which is the exact failure the surrounding comment claims this
+    # design avoids.
+    return (
+        f"{attempted!r} is more digits than this field takes — "
+        f"{SPEAKER_COUNT_MIN}-{SPEAKER_COUNT_MAX}, so at most two."
+    )
+
+
+# The vendor's own guidance, on screen, because the trade is not guessable from
+# the number alone and is counter-intuitive in one direction: too HIGH is also
+# wrong. "Give the model a little headroom above the number of speakers you
+# expect; setting it too high can cause over-splitting."
+SPEAKER_COUNT_GUIDANCE = (
+    f"Range {SPEAKER_COUNT_MIN}-{SPEAKER_COUNT_MAX}. Give the model a little "
+    "headroom above the number of speakers you expect — too high over-splits "
+    "one person across several labels, and past the cap extra speakers are "
+    "merged into the closest existing one."
+)
+
+
+@dataclass
+class SpeakerPrompt:
+    """The transient state of the speaker-count prompt `l` opens.
+
+    Discarded on confirm and on cancel, exactly like `_retry_confirm` — the
+    value applies to ONE session, so the next `l` prepopulates from config and
+    never from the previous answer (FR-2.5).
+
+    `value` is the text on screen, not a parsed int: what is displayed and what
+    would commit have to be the same thing at every moment, and an int cannot
+    represent the empty field that a Backspace leaves.
+
+    `pristine` is True while the field still holds the prepopulated default, so
+    the first digit REPLACES it — a prepopulated field behaves like one whose
+    contents are selected. Appending instead would read `81` when the operator
+    pressed `1` on a default of `8`, and refuse them for typing the number they
+    wanted.
+    """
+
+    value: str
+    message: str = ""
+    pristine: bool = True
+
+    def __post_init__(self) -> None:
+        # The default arrives from config as an int; the field is text.
+        self.value = str(self.value)
+
 
 def format_pending_footer(
     whisper_count: int, unknown_count: int, failed_count: int = 0
@@ -246,6 +331,10 @@ class TUI:
         self._whisper_modal: Optional[WhisperSelectionState] = None
         self._unknown_queue: List[str] = []
         self._retry_confirm = None
+        # The speaker-count prompt `l` opens (live_speaker_count_prompt_prd.md).
+        # None whenever it is closed; a `SpeakerPrompt` while the operator is
+        # deciding. Nothing is started, claimed or suspended while it is open.
+        self._speaker_prompt: Optional[SpeakerPrompt] = None
         # FR-11: the run region. Persistent — deliberately NOT the log,
         # which holds ten entries and would evict a long run's own summary.
         self._retry_progress = None
@@ -408,6 +497,92 @@ class TUI:
             return
         self._start_retry_batch(selected)
 
+    def _handle_speaker_prompt_key(self, ch: str) -> None:
+        """Digits / Backspace / Enter / Esc on the open speaker-count prompt.
+
+        Follows `_handle_retry_confirm_key`: a state field, one handler, and the
+        same logging convention for a key that did nothing — "I pressed a key and
+        nothing happened" otherwise has several indistinguishable causes.
+
+        Nothing here ever CLAMPS. An entry outside the vendor's 1-10 is refused
+        with a reason and the prompt stays open, because a clamp starts a metered
+        session under a ceiling the operator neither chose nor saw — and past the
+        cap the vendor merges additional speakers into the closest existing
+        label, destroying the distinction rather than degrading it.
+
+        Refusal happens at the KEYSTROKE for anything that is not a usable digit
+        (the terminal is in cbreak mode, so every stray key in the app lands
+        here) and at CONFIRMATION for a digit string outside the range. Both use
+        the same message, so the displayed value and the value that would commit
+        are the same thing at every moment.
+        """
+        with self._lock:
+            prompt = self._speaker_prompt
+        if prompt is None:
+            return
+
+        if ch == "\x1b":
+            with self._lock:
+                self._speaker_prompt = None
+            self._log_key_ignored("live session cancelled — nothing was started")
+            return
+
+        if ch in ("\r", "\n"):
+            # cbreak terminals send `\r`; the whisper modal accepts both and a
+            # prompt that took only one would look dead on the other terminal.
+            value, reason = parse_speaker_count(prompt.value)
+            if value is None:
+                # An empty field lands here too: backspacing the value away and
+                # pressing Enter is refused, not quietly re-defaulted to config
+                # — the operator cleared it deliberately, and a session that
+                # starts under a number they just deleted is the surprise this
+                # prompt exists to remove.
+                with self._lock:
+                    prompt.message = reason
+                return
+            with self._lock:
+                self._speaker_prompt = None
+            # The prompt's own value, never the configured default: the field is
+            # editable, so committing the default would make the edit theatre.
+            self._live_controller.toggle(max_speakers=value)
+            return
+
+        if ch in ("\x7f", "\x08"):
+            # Terminals send DEL for Backspace; some send BS. Handling one leaves
+            # the operator unable to correct a typo on their own terminal. It is
+            # an edit, so it consumes the prepopulated value rather than leaving
+            # a field the operator believes they emptied — and it is guarded,
+            # because an IndexError on the keyboard thread is swallowed by
+            # `KeyboardReader._run` and reaches the operator as a dead prompt.
+            with self._lock:
+                prompt.value = prompt.value[:-1]
+                prompt.pristine = False
+                prompt.message = ""
+            return
+
+        if ch.isascii() and ch.isdigit():
+            with self._lock:
+                if prompt.pristine:
+                    prompt.value = ch
+                elif len(prompt.value) >= _SPEAKER_ENTRY_MAX_CHARS:
+                    prompt.message = _speaker_refusal(prompt.value + ch)
+                    return
+                else:
+                    prompt.value += ch
+                prompt.pristine = False
+                # The refusal was about one keystroke, not about the prompt's
+                # state: a latched message leaves the operator reading a
+                # complaint about a key they already corrected.
+                prompt.message = ""
+            return
+
+        with self._lock:
+            prompt.message = _speaker_refusal(ch)
+        self._log_key_ignored(
+            f"key {ch!r} ignored: the speaker-count prompt is open "
+            f"(digits / backspace / enter / esc)"
+        )
+
     def _start_retry_batch(self, selected) -> None:
         """Run the batch off the keyboard thread.
 
@@ -474,6 +649,7 @@ class TUI:
             in_whisper = self._whisper_modal is not None
             in_unknown = bool(self._unknown_queue)
             in_retry_confirm = self._retry_confirm is not None
+            in_speaker_prompt = self._speaker_prompt is not None
 
         if in_whisper:
             self._handle_whisper_modal_key(ch)
@@ -483,6 +659,14 @@ class TUI:
             return
         if in_retry_confirm:
             self._handle_retry_confirm_key(ch)
+            return
+        if in_speaker_prompt:
+            # Routed with the other modals, after them and ahead of every
+            # top-level binding: an open prompt owns the keyboard (a `w` here
+            # must not open the whisper selector behind it), and a modal that is
+            # already open owns `l` (a prompt opened from a keystroke aimed
+            # elsewhere is one Enter away from a metered session).
+            self._handle_speaker_prompt_key(ch)
             return
         # Top-level key. Log EVERY received keystroke + the reason it was
         # accepted or ignored. Without this, "I pressed `w` and nothing
@@ -531,7 +715,29 @@ class TUI:
                     "wired — live transcription is unreachable"
                 )
                 return
-            self._live_controller.toggle()
+            if self._live_controller.is_live:
+                # Stopping asks nothing. `max_speakers` is a START parameter —
+                # it lives on `StreamingParameters`, not the updateable session
+                # parameters — and making the operator answer a question to end
+                # a call would be a prompt in front of the one direction that
+                # has nothing to decide (FR-5.2 of the surface PRD survives).
+                self._live_controller.toggle()
+                return
+            # FR-ERR-2: the busy refusal is raised BEFORE the prompt opens.
+            # Refusing after the operator has chosen a number wastes the
+            # decision and reads as though the number caused the failure. The
+            # controller owns the words because only it can name the offload.
+            refusal = self._live_controller.start_refusal()
+            if refusal:
+                self._log_key_ignored(refusal)
+                return
+            # FR-1.1: opening the prompt starts NOTHING — no session, no device
+            # claim, no suspended offload polling, no browser window. FR-1.2:
+            # prepopulated from config so Enter alone starts.
+            with self._lock:
+                self._speaker_prompt = SpeakerPrompt(
+                    value=self._live_controller.default_max_speakers
+                )
             return
 
         if not keys_active_in_state(current_state):
@@ -656,6 +862,7 @@ class TUI:
             unknowns = self._unknown_count
             failed = self._failed_count
             retry_confirm = self._retry_confirm
+            speaker_prompt = self._speaker_prompt
             retry_progress = self._retry_progress
             retry_summary = self._retry_summary
             modal = self._whisper_modal
@@ -668,6 +875,15 @@ class TUI:
             center = self._render_unknown_prompt(unknown_queue)
         elif retry_confirm is not None:
             center = self._render_retry_confirm(retry_confirm)
+        elif speaker_prompt is not None:
+            # Replaces the log rather than stacking above it: the panel is the
+            # only place the operator can read what they are about to commit,
+            # and a renderable taller than its pane is cropped from the bottom
+            # with no sign that anything was lost — the defect that shipped in
+            # the activity log (`971a2a8`) and this app is routinely run in a
+            # small window. A ten-entry log stacked on top would crop the prompt
+            # away at ordinary terminal heights.
+            center = self._render_speaker_prompt(speaker_prompt)
         elif retry_progress is not None or retry_summary is not None:
             # Stacked, not replaced: the run region must persist without
             # hiding the activity log it deliberately does not live in.
@@ -765,6 +981,43 @@ class TUI:
                 rows.append(Text(f"stopped: {redact(summary.aborted_reason)}", style="yellow"))
             rows.append(Text("esc to dismiss", style="dim"))
         return Panel(Group(*rows), title="Retry", border_style="green")
+
+    @staticmethod
+    def _render_speaker_prompt(prompt: SpeakerPrompt) -> Panel:
+        """The number the operator is about to commit, the range, and the trade.
+
+        All three are on screen together on purpose: the cap is the vendor's and
+        is not inferable, the modal's two exits are not discoverable on a
+        cbreak-mode keyboard with no other affordance, and the guidance is
+        counter-intuitive in one direction — an operator avoiding the merge
+        failure walks straight into the over-splitting one without it.
+        """
+        # Row order is crop order. This panel is a MODAL that consumes every
+        # key, and a `rich` panel taller than its pane is cropped from the
+        # BOTTOM — which had put "esc cancel" first in line to disappear,
+        # leaving an operator trapped in a prompt with nothing on screen saying
+        # how to leave it. The exit affordance now sits above the guidance, so
+        # the line that is lost first is the one you can most afford to lose.
+        rows: list[Text] = [
+            Text.assemble(
+                ("People on this call, including you: ", "bold"),
+                (prompt.value or "—", "bold cyan"),
+            )
+        ]
+        if prompt.message:
+            rows.append(Text(prompt.message, style="bold yellow"))
+        rows.append(
+            Text(
+                "digits edit · backspace delete · enter start · esc cancel",
+                style="dim",
+            )
+        )
+        # Last, and therefore first to be cropped: useful, but the operator can
+        # act without it. The value, any refusal, and the way out cannot.
+        rows.append(Text(SPEAKER_COUNT_GUIDANCE, style="dim"))
+        return Panel(
+            Group(*rows), title="Live session — speaker count", border_style="yellow"
+        )
 
     @staticmethod
     def _render_unknown_prompt(queue: List[str]) -> Panel:

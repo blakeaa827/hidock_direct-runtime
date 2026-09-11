@@ -175,6 +175,13 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         adapter=adapter,
         api_key=config.assemblyai_api_key,
         operator_name=config.operator_name,
+        # The PREPOPULATED speaker count, not a fixed ceiling: the controller
+        # exposes it as `default_max_speakers`, the `l` prompt opens with it, and
+        # the operator can override it for that call alone. Supplied here rather
+        # than left to the controller's own fallback for the `ad98cbc` reason —
+        # a default only the test suite ever fills is an inert feature wearing a
+        # kwarg, and `HIDOCK_LIVE_MAX_SPEAKERS` would set nothing the operator
+        # ever sees.
         max_speakers=config.live_max_speakers,
         # The same directory the offload path writes to, handed over at
         # composition time rather than read from a process global at use time
