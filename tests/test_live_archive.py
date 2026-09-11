@@ -128,9 +128,11 @@ import io
 import json
 import logging
 import re
+import math
 import shutil
 import stat
 import struct
+import subprocess
 import sys
 import wave
 from collections import deque
@@ -168,6 +170,11 @@ from hidock_direct.state import DeviceKey, StateStore
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "hidock_direct"
 
+# Resolved at IMPORT, deliberately: `_no_mp3_encoder_unless_a_test_installs_one`
+# patches `shutil.which` for every test in this file, so a real binary has to be
+# found before that fixture can hide it.
+_REAL_LAME = shutil.which("lame")
+
 # ---------------------------------------------------------------------------
 # The module under test, imported so that its ABSENCE is red rather than fatal
 # ---------------------------------------------------------------------------
@@ -194,15 +201,17 @@ try:
         TRANSCRIPT_SUFFIX,
         LiveArchive,
         _PARTIAL_SUFFIX,
+        _bitrate_is_reachable,
     )
 except ImportError as exc:  # phase 1d has not been implemented yet
     live_archive_module = None  # type: ignore[assignment]
     LiveArchive = None  # type: ignore[assignment]
     LIVE_ID_PREFIX = "live-"
-    MP3_BITRATE_KBPS = 96
+    MP3_BITRATE_KBPS = 160
     RAW_RESPONSE_SUFFIX = ".aai.json"
     TRANSCRIPT_SUFFIX = ".md"
     _PARTIAL_SUFFIX = ".tmp"
+    _bitrate_is_reachable = None  # type: ignore[assignment]
     _MODULE_IMPORT_ERROR: Optional[ImportError] = exc
 else:
     _MODULE_IMPORT_ERROR = None
@@ -2554,10 +2563,13 @@ def test_a_sidecar_never_replaces_one_that_is_already_there(sessions, occupied):
 #
 # Two independent reasons, and the second is the one that bites.
 #
-# SIZE, measured not assumed: the device's own files run 96 kbps / 43 MB per
-# hour across 769 recordings; our 16 kHz stereo PCM is 512 kbps / 230 MB per
-# hour. 5.3x, into a Drive-synced folder, so it costs storage on two machines and
-# the bandwidth between them.
+# SIZE, measured not assumed: our 16 kHz stereo PCM is 512 kbps / 230 MB per
+# hour, against 160 kbps / 72 MB per hour encoded. 3.2x, into a Drive-synced
+# folder, so it costs storage on two machines and the bandwidth between them.
+# (It was 96 kbps / 43 MB per hour to match the device's own files; that parity
+# was given up deliberately — see `MP3_BITRATE_KBPS` — since the device records
+# 48 kHz mono and we capture 16 kHz stereo, so the two were never the same
+# audio and the matching number matched nothing real.)
 #
 # CORRECTNESS: the archive holds 795 `.mp3` and zero `.wav`, and the pipeline
 # hardcodes `<stem>.mp3` in five places including `auto_speaker_id.py:3869`. A
@@ -2613,11 +2625,13 @@ def test_an_installed_encoder_archives_the_call_as_an_mp3_and_removes_the_wav(
 def test_the_encoder_is_asked_for_the_archives_own_bitrate_and_a_neutral_temp_name(
     sessions, encoder
 ):
-    """FR-2.2b. 96 kbps is read off the device's own files, so a live call is the
-    same size class as a batched one rather than a new one — and the target it is
-    handed is a TEMP name that does not end in `.mp3`, so an interrupted or
-    killed encode never leaves something the pipeline would index as a
-    recording."""
+    """FR-2.2b. The declared bitrate must actually reach the encoder — and the
+    target it is handed is a TEMP name that does not end in `.mp3`, so an
+    interrupted or killed encode never leaves something the pipeline would index
+    as a recording.
+
+    Asserted through `MP3_BITRATE_KBPS` rather than a literal, so raising it
+    cannot leave a test passing against the number it used to be."""
     # MUTATION: drop `-b`/`str(MP3_BITRATE_KBPS)` from `_lame_command`, or hand
     # `target` to the encoder directly instead of `tmp`.
     encoder.install("ok")
@@ -2631,7 +2645,7 @@ def test_the_encoder_is_asked_for_the_archives_own_bitrate_and_a_neutral_temp_na
     assert argv, "the encoder was never run"
     assert encoder.invocations() == 1, f"the encoder ran {encoder.invocations()} times"
     assert str(MP3_BITRATE_KBPS) in argv, (
-        f"the archive's 96 kbps never reached the encoder's argv: {argv}"
+        f"the archive's {MP3_BITRATE_KBPS} kbps never reached the argv: {argv}"
     )
     source, target = Path(argv[-2]), Path(argv[-1])
     assert source.name == f"{FIXED_BASENAME}.wav"
@@ -2791,9 +2805,17 @@ def test_the_real_encoder_accepts_the_command_this_module_builds(
     assert body[:3] == b"ID3" or body[0] == 0xFF, (
         f"{name} produced something that is not an MP3 stream: {body[:8]!r}"
     )
-    # 96 kbps against 512 kbps of PCM. Asserting a real ratio rather than
-    # "smaller", because a truncated file is also smaller.
-    assert len(body) < samples_for(2.0) * CHANNELS * BYTES_PER_SAMPLE / 3
+    # Asserting the size the DECLARED bitrate predicts, rather than "smaller
+    # than the PCM" — a truncated file is also smaller, and a fixed fraction of
+    # the PCM silently stops meaning anything when the bitrate moves. This is
+    # two-sided on purpose: it fails on a truncated encode AND on an encode that
+    # ignored `-b`, which the old one-sided form could not tell apart.
+    expected = 2.0 * MP3_BITRATE_KBPS * 1000 / 8
+    assert 0.7 * expected < len(body) < 1.4 * expected, (
+        f"{len(body)} bytes is not a 2-second {MP3_BITRATE_KBPS} kbps encode "
+        f"(expected about {expected:.0f})"
+    )
+    assert len(body) < samples_for(2.0) * CHANNELS * BYTES_PER_SAMPLE
     assert harness.suffixed(".wav") == []
 
 
@@ -3994,3 +4016,95 @@ def test_the_guarded_rewrite_is_its_own_function_not_the_sidecar_writer(sessions
     body = source.split("def rename_speaker")[1].split("\n    def ")[0]
     assert "_rewrite_if_unchanged" in body
     assert "_atomic_write_text" not in body
+
+
+# ---------------------------------------------------------------------------
+# The bitrate is at the format ceiling, and the ceiling is enforced SILENTLY
+# ---------------------------------------------------------------------------
+
+
+def test_the_configured_bitrate_is_reachable_at_the_rate_we_capture():
+    """The shipped pair must be one the format can actually deliver.
+
+    This is the invariant the whole `MP3_BITRATE_KBPS` comment rests on. It is
+    worth a test rather than a comment because the failure mode is silence: ask
+    for more than MPEG-2 Layer III allows and the encoder returns 0 having
+    written the clamped file, so a raised constant that did nothing looks
+    exactly like one that worked.
+
+    MUTATION: raise `MP3_BITRATE_KBPS` above 160 while `SAMPLE_RATE_HZ` is
+    16000 -- which is the specific mistake a future reader makes when they hit
+    the same "the recording quality is awful" report and reach for the same dial.
+    """
+    assert _bitrate_is_reachable(MP3_BITRATE_KBPS, SAMPLE_RATE_HZ), (
+        f"{MP3_BITRATE_KBPS} kbps is not reachable at {SAMPLE_RATE_HZ} Hz; the "
+        "encoder will clamp it and report success"
+    )
+
+
+@pytest.mark.parametrize(
+    "bitrate,rate,reachable",
+    [
+        (160, 16000, True),    # the shipped pair, at the ceiling
+        (161, 16000, False),   # one over, and still silently accepted by lame
+        (192, 16000, False),
+        (320, 16000, False),
+        (96, 16000, True),
+        (192, 44100, True),    # MPEG-1 territory: the ceiling does not apply
+        (320, 48000, True),
+    ],
+)
+def test_the_reachability_predicate_knows_where_the_ceiling_is(
+    bitrate, rate, reachable
+):
+    """MUTATION: compare against the wrong side of 32 kHz, or drop the bound."""
+    assert _bitrate_is_reachable(bitrate, rate) is reachable
+
+
+@pytest.mark.skipif(_REAL_LAME is None, reason="no real lame on this machine")
+def test_a_real_encoder_delivers_the_declared_bitrate_and_clamps_above_it(
+    tmp_path,
+):
+    """The empirical claim in `MP3_BITRATE_KBPS`'s comment, actually run.
+
+    A comment asserting what a third-party binary does is a claim with no
+    verification attached, and this one is load-bearing: it is the reason the
+    constant is 160 and not a larger number. So it is measured against the real
+    binary when one is present -- our configured bitrate comes back at its
+    declared size, and asking for more comes back BYTE-IDENTICAL rather than
+    larger and rather than failing.
+
+    Skipped, not failed, where lame is absent: the encoder is presence-detected
+    in production too, and a clone without it must not have a red suite.
+    """
+    source = tmp_path / "probe.wav"
+    seconds = 4
+    with wave.open(str(source), "wb") as handle:
+        handle.setnchannels(CHANNELS)
+        handle.setsampwidth(BYTES_PER_SAMPLE)
+        handle.setframerate(SAMPLE_RATE_HZ)
+        frames = bytearray()
+        for i in range(SAMPLE_RATE_HZ * seconds):
+            value = int(8000 * math.sin(i * 2 * math.pi * 440 / SAMPLE_RATE_HZ))
+            frames += struct.pack("<hh", value, value)
+        handle.writeframes(bytes(frames))
+
+    def encode(kbps: int) -> bytes:
+        target = tmp_path / f"out{kbps}.mp3"
+        subprocess.run(
+            [_REAL_LAME, "--quiet", "-b", str(kbps), str(source), str(target)],
+            check=True, capture_output=True,
+        )
+        return target.read_bytes()
+
+    at_ceiling = encode(MP3_BITRATE_KBPS)
+    expected = seconds * MP3_BITRATE_KBPS * 1000 / 8
+    assert 0.8 * expected < len(at_ceiling) < 1.2 * expected, (
+        f"{len(at_ceiling)} bytes is not {seconds}s at {MP3_BITRATE_KBPS} kbps"
+    )
+
+    over = encode(MP3_BITRATE_KBPS + 32)
+    assert over == at_ceiling, (
+        "asking for more than the format allows produced a DIFFERENT file, so "
+        "the ceiling this constant is pinned to has moved -- re-derive it"
+    )

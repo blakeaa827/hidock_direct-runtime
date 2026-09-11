@@ -121,10 +121,50 @@ TRANSCRIPT_SUFFIX = ".md"
 RAW_RESPONSE_SUFFIX = ".aai.json"
 _PARTIAL_SUFFIX = ".tmp"
 
-# The archive's own bitrate, read off the device's files (PRD §2.2b): 769
-# recordings, 382 hours, 96 kbps / 43 MB per hour. Matching it keeps a live call
-# the same size as a batched one rather than making a new size class.
-MP3_BITRATE_KBPS = 96
+# The archive's own bitrate. This was 96, read off the device's own files (PRD
+# §2.2b: 769 recordings, 382 hours, 96 kbps / 43 MB per hour) so a live call
+# would be the same size class as a batched one. That parity argument is
+# deliberately given up here: the device records 48 kHz mono and we capture
+# 16 kHz stereo, so the two were never the same audio and matching their
+# bitrates matched a number rather than a quality.
+#
+# 160 is not a preference, it is the CEILING. MPEG-2 Layer III — which is what
+# any sample rate below 32 kHz selects — tops out at 160 kbps, and both encoders
+# we drive clamp to it SILENTLY: `lame -b 192` and `ffmpeg -b:a 192k` on a
+# 16 kHz input each produce a byte-identical 160 kbps file with no warning
+# (measured 2026-09-11). So a larger number here would not be a larger file, it
+# would be a comment that lies. `_bitrate_is_reachable` exists to keep that
+# honest if the sample rate ever changes.
+#
+# What it buys is small and worth stating plainly rather than discovering later:
+# on real speech through this device, re-encoding at 96 vs 160 differs by
+# 0.12 dB of error-to-signal, against 1.14 dB for 64 -> 96. The curve is flat
+# here. The cost is 43 -> 72 MB/hour into a Drive-synced folder. It is taken
+# because audio is the one artifact that cannot be reconstructed — the device
+# keeps no copy of a live session — and the headroom is free at the format
+# level, not because it fixes the reported quality complaints. It does not:
+# encoding does not ADD impulses at either rate (155/min at 96 and 158/min at
+# 160, against 168/min in the source itself), so the clicking is upstream of
+# the encoder, and the 8 kHz bandwidth ceiling that makes voices sound thin is
+# the 16 kHz SAMPLE RATE, which this constant cannot touch.
+MP3_BITRATE_KBPS = 160
+
+# Sample rates below 32 kHz select MPEG-2/2.5 Layer III, whose bitrate table
+# stops at 160 kbps. Above that, encoders clamp rather than refuse.
+_MPEG2_MAX_BITRATE_KBPS = 160
+_MPEG1_MIN_SAMPLE_RATE_HZ = 32000
+
+
+def _bitrate_is_reachable(bitrate_kbps: int, sample_rate_hz: int) -> bool:
+    """Can the encoder actually deliver this bitrate at this sample rate?
+
+    Exists because the failure is SILENT. Asking either encoder for more than
+    the format allows produces the clamped file and exit code 0, so the only
+    evidence that a raised bitrate did nothing is a byte count nobody checks.
+    """
+    if sample_rate_hz >= _MPEG1_MIN_SAMPLE_RATE_HZ:
+        return True
+    return bitrate_kbps <= _MPEG2_MAX_BITRATE_KBPS
 # Floor and slope for the transcode's timeout. Both encoders run tens of times
 # faster than real time, so half the recording's duration is a wide margin and
 # still bounds `stop()` on a hung child rather than hanging the teardown.
