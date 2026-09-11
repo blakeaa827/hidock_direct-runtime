@@ -6338,3 +6338,264 @@ def test_a_deliberate_close_does_not_render_as_reconnecting(page_source):
     # Only `/close` arms it.
     armed = page_source.split('if (action === "close")')[1][:60]
     assert "closing = true" in armed
+
+
+# ---------------------------------------------------------------------------
+# Reopening the window (phase 1i) -- `o`
+# ---------------------------------------------------------------------------
+#
+# The lockout this answers is wider than it looks, and both halves were measured
+# 2026-09-11 rather than read:
+#
+#   * `detach()` removes a subscriber and stops nothing, so closing the browser
+#     tab leaves the server fully bound -- DURING a call as well as after one.
+#   * `start()` publishes the manual URL exactly once, minted at 300s, and
+#     nothing re-mints during the call.
+#
+# So on any call longer than five minutes, an operator who closes the tab is
+# locked out of a session that is still streaming and still billing.
+#
+# Assertion hygiene, because both traps are live here: `"o" in message.lower()`
+# is not an assertion (the unmapped-key fall-through contains an `o`), and
+# "a URL was logged" passes against `http://127.0.0.1:0/?k=...`, which cannot
+# connect to anything.
+
+
+def test_o_reopens_the_window_of_a_LIVE_session(controller):
+    """The wider half of the bug, and the one the original report missed.
+
+    MUTATION: select `self._ended_surface` only -- which refuses the operator
+    whose call is mid-flight, with AssemblyAI egress running.
+    """
+    harness = controller()
+    harness.controller.start()
+    launched_at_start = len(harness.launched)
+
+    assert harness.controller.reopen_window() is None
+
+    assert len(harness.launched) == launched_at_start + 1
+    assert f":{harness.surface.port}/" in harness.launched[-1]
+    assert "?k=" in harness.launched[-1]
+
+
+def test_o_reopens_the_window_kept_after_a_call(controller, tmp_path):
+    """The reported half. The window outlives the session; the way in must too."""
+    harness = _ended_with_transcript(controller, tmp_path)
+    launched = len(harness.launched)
+
+    assert harness.controller.reopen_window() is None
+
+    assert len(harness.launched) == launched + 1
+    said = harness.messages()
+    assert "saved transcript" in said, (
+        "the post-call wording did not say why the window still matters"
+    )
+
+
+def test_the_two_cases_are_worded_differently(controller, tmp_path):
+    """FR-2.2. The operator's next action differs, so the sentence must.
+
+    MUTATION: one shared headline, which tells an operator mid-call that their
+    names are being written to a transcript that does not exist yet.
+    """
+    live = controller()
+    live.controller.start()
+    live.controller.reopen_window()
+    live_said = live.messages()
+
+    ended = _ended_with_transcript(controller, tmp_path)
+    ended.controller.reopen_window()
+    ended_said = ended.messages()
+
+    assert "Reopening the live window" in live_said
+    assert "Reopening the live window" not in ended_said
+    assert "last call" in ended_said
+
+
+def test_every_press_mints_a_fresh_ticket(controller):
+    """FR-1.7. A cached URL is the single most natural wrong implementation, and
+    it is dead 300 seconds later.
+
+    MUTATION: compute the URL once in `start()` and hand the same string back.
+    """
+    harness = controller()
+    harness.controller.start()
+
+    harness.controller.reopen_window()
+    harness.controller.reopen_window()
+
+    urls = harness.launched[1:]
+    assert len(urls) == 2
+    assert urls[0] != urls[1], "the same ticket was handed out twice"
+
+
+def test_reopen_mints_a_short_argv_ticket_and_a_long_one_for_the_log(controller):
+    """FR-2.6. The invariant is about DESTINATION: argv is world-readable, and a
+    human needs time to read a URL off a screen.
+
+    MUTATION: mint one ticket and use it for both -- at 300s it puts a
+    five-minute credential on a command line every process can read; at 10s it
+    logs a URL that is dead before it can be typed.
+    """
+    harness = controller()
+    harness.controller.start()
+    before = len(harness.surface.ticket_ttls)
+
+    harness.controller.reopen_window()
+
+    ttls = harness.surface.ticket_ttls[before:]
+    assert len(ttls) == 2, f"expected two tickets per press, got {ttls}"
+    manual, argv = ttls
+    assert argv < manual
+    assert argv <= 15
+    assert manual >= 60
+
+
+def test_the_reopen_url_in_the_log_is_not_the_one_given_to_the_browser(controller):
+    """FR-2.7. Crossing them puts the long-lived ticket into argv.
+
+    MUTATION: pass `manual_url` to the launcher.
+    """
+    harness = controller()
+    harness.controller.start()
+    harness.controller.reopen_window()
+
+    assert harness.launched[-1] not in harness.messages()
+
+
+def test_the_reopen_url_is_said_before_the_browser_is_launched(controller):
+    """FR-2.8/FR-5.4: ALWAYS, not on failure.
+
+    Not merely the original rationale -- a SHIPPED string would become false.
+    `launch_app_window`'s total-failure return is "no browser could be opened;
+    use the URL in the activity log", and the raise branch says "open the URL
+    above". Both presuppose a URL that is already there.
+
+    MUTATION: publish the URL only from the launch-failure branch.
+    """
+    harness = controller()
+    harness.controller.start()
+    order: List[str] = []
+    harness.bus.subscribe(
+        lambda e: order.append("said")
+        if isinstance(e, Error) and "Reopening" in e.message
+        else None
+    )
+    real_launch = harness.controller._launch_browser
+    harness.controller._launch_browser = lambda url, **kw: (
+        order.append("launched") or real_launch(url, **kw)
+    )
+
+    harness.controller.reopen_window()
+
+    assert order == ["said", "launched"], order
+
+
+def test_a_stopped_surface_is_refused_in_words_never_with_a_port_zero_url(
+    controller, tmp_path,
+):
+    """FR-2.3/FR-2.4, and the trap the obvious implementation walks into.
+
+    `mint_ticket` has no `_running` guard where `redeem_ticket` has one, and
+    `port` returns the sentinel 0 once the server is gone -- so a stopped
+    surface composes `http://127.0.0.1:0/?k=...` and returns it cheerfully. The
+    browser then says "this site can't be reached", which reads as the app being
+    broken rather than a link having expired: a WORSE signal than the 403 this
+    whole feature removes.
+
+    MUTATION: drop the `surface.running`/`surface.port` check and trust the
+    surface to refuse. It does not.
+    """
+    harness = _ended_with_transcript(controller, tmp_path)
+    launched = len(harness.launched)
+    harness.surface._port = 0          # what `port` returns once `_server` is None
+
+    refusal = harness.controller.reopen_window()
+
+    assert refusal is not None
+    assert "http" not in refusal, f"a URL was offered for a dead surface: {refusal}"
+    assert "127.0.0.1:0" not in harness.messages()
+    assert len(harness.launched) == launched, "a dead address was handed to a browser"
+
+
+def test_reopen_with_no_surface_at_all_says_what_would_create_one(controller):
+    """FR-1.5. A refusal that does not name the next action is a dead end."""
+    harness = controller()
+
+    refusal = harness.controller.reopen_window()
+
+    assert refusal is not None
+    assert "press l" in refusal
+    assert harness.launched == []
+
+
+def test_reopen_never_raises_even_when_the_surface_misbehaves(controller):
+    """FR-ERR-1. `KeyboardReader._run` swallows exceptions, so a raise on that
+    thread is SILENCE -- the one outcome a key must never produce.
+
+    MUTATION: let the mint or the launch propagate.
+    """
+    harness = controller()
+    harness.controller.start()
+
+    class Exploding:
+        running = True
+        port = 5
+
+        def launch_url(self, ttl):
+            raise RuntimeError("the ticket table is on fire")
+
+    harness.controller._surface = Exploding()
+
+    refusal = harness.controller.reopen_window()
+
+    assert refusal is not None
+    assert "on fire" in refusal
+
+
+def test_reopen_does_not_restart_or_resubscribe_the_surface(controller):
+    """FR-1.6. `start()` wipes the ring, the names and the token -- a reopen that
+    reached it would destroy the transcript the operator came back for.
+
+    MUTATION: call `surface.start()` before minting, 'to be safe'.
+    """
+    harness = controller()
+    harness.controller.start()
+    harness.surface.names["A"] = "Dana"
+    started = harness.surface.started
+
+    harness.controller.reopen_window()
+
+    assert harness.surface.started == started, "the surface was restarted"
+    assert harness.surface.stopped == 0
+    assert harness.surface.names == {"A": "Dana"}, "the name map was wiped"
+
+
+def test_start_and_reopen_share_one_launch_implementation(controller):
+    """FR-2.10, read off the source.
+
+    Two copies of this sequence would be two matching expressions holding a
+    security property -- which ticket may reach argv -- in agreement by
+    convention. That is the arrangement `10fba18` and the duplicated
+    `Invalid API key` vocabulary already cost this repo.
+
+    MUTATION: inline the say/launch/report block into `reopen_window`.
+    """
+    source = (SRC / "live_server.py").read_text()
+    assert source.count("self._launch_browser(") == 1, (
+        "the browser launch has more than one call site"
+    )
+    body = source.split("def reopen_window")[1].split("\n    def ")[0]
+    assert "_offer_window(" in body
+    assert "_launch_browser" not in body
+
+
+def test_no_log_record_carries_the_session_token_on_reopen(controller, caplog):
+    """NFR-3. The ticket is in the log by design; the TOKEN never is."""
+    harness = controller()
+    harness.controller.start()
+    with caplog.at_level(logging.DEBUG):
+        harness.controller.reopen_window()
+
+    blob = "\n".join(r.getMessage() for r in caplog.records) + harness.messages()
+    assert harness.surface.token not in blob

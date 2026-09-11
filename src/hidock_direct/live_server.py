@@ -2093,9 +2093,30 @@ class LiveSessionController:
             if self._generation != generation or not self._live:
                 return
 
-        # FR-5.4 says ALWAYS, not on failure: the operator closes the window and
-        # the log is the only place the URL can come from.
-        self._say(f"Live transcription is running — {manual_url}", Severity.INFO)
+        self._offer_window(f"Live transcription is running — {manual_url}", launch_target)
+
+    def _offer_window(self, headline: str, launch_target: str) -> None:
+        """Say where the window is, then open it. Never raises.
+
+        ONE implementation, called by `start()` and by `reopen_window()`. A
+        second copy of this sequence would be two matching expressions holding a
+        security property — which ticket may reach argv — in agreement by
+        convention, and that is the arrangement this repo has already been
+        bitten by twice (`10fba18`, and the duplicated `Invalid API key` marker
+        vocabulary).
+
+        The URL is said BEFORE the launch and on every path, success included.
+        FR-5.4's own rationale is half of why; the other half is that a shipped
+        string would otherwise become false — `launch_app_window`'s total
+        failure returns "no browser could be opened; use the URL in the activity
+        log", and the raise branch below says "open the URL above". Both
+        presuppose a URL that is already there.
+
+        `headline` carries the manual (long-TTL) URL; `launch_target` carries
+        the short-TTL one, and they are never the same string — argv is
+        world-readable, which is what the two TTLs exist to separate.
+        """
+        self._say(headline, Severity.INFO)
         try:
             note = self._launch_browser(launch_target)
         except Exception as exc:  # noqa: BLE001 - a window is not the session
@@ -2105,6 +2126,69 @@ class LiveSessionController:
             )
         else:
             self._say(f"Live window: {note}.", Severity.INFO)
+
+    def reopen_window(self) -> Optional[str]:
+        """Put the operator back into their live window. Returns a refusal, or None.
+
+        Never raises: this runs on the keyboard thread, where
+        `KeyboardReader._run` swallows exceptions — so a raise here is silence,
+        which is the one outcome a key must never produce.
+
+        Selects a SURFACE, not a session state. `detach()` removes a subscriber
+        and stops nothing, so a closed tab leaves the server fully bound during
+        a call as well as after one — and `start()` publishes the manual URL
+        exactly once, at 300s, with nothing re-minting during the call. On any
+        call longer than five minutes an operator who closed the tab is locked
+        out of a session that is still streaming and still billing. Covering
+        only the post-call window would hand that operator a refusal.
+
+        Validation happens INSIDE the section that mints, and that is not
+        defensive habit: `mint_ticket` has no `_running` guard where
+        `redeem_ticket` has one, and `port` returns the sentinel 0 once the
+        server is gone — so a stopped surface composes `http://127.0.0.1:0/?k=…`
+        and returns it cheerfully. The browser then says "this site can't be
+        reached", which reads as the app being broken rather than a link having
+        expired: a worse signal than the 403 this method exists to remove.
+
+        The lock spans read, validate and mint, and is released before the
+        launch. The controller holds it across no slow work anywhere else.
+        """
+        with self._lock:
+            surface = self._surface or self._ended_surface
+            if surface is None:
+                return (
+                    "key 'o' ignored: there is no live window to reopen — "
+                    "press l to start a live session"
+                )
+            live = surface is self._surface
+            try:
+                if not surface.running or not surface.port:
+                    return (
+                        "key 'o' ignored: the live window has just closed — "
+                        "press l to start a new session"
+                    )
+                manual_url = surface.launch_url(_MANUAL_TICKET_TTL_SECONDS)
+                launch_target = surface.launch_url(_LAUNCH_TICKET_TTL_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - a key must not raise
+                log.warning("live: could not mint a reopen ticket (%s)", type(exc).__name__)
+                return f"key 'o' ignored: could not prepare the window ({exc})"
+
+        # The two cases differ in what the operator does next, so they differ in
+        # words: during a call the window is the live view; after one it is the
+        # last place a speaker can be named before `l` or exit takes it away.
+        if live:
+            headline = f"Reopening the live window — {manual_url}"
+        else:
+            headline = (
+                "Reopening the window for the last call — a name typed now is "
+                f"also written into the saved transcript. {manual_url}"
+            )
+        try:
+            self._offer_window(headline, launch_target)
+        except Exception as exc:  # noqa: BLE001 - a key must not raise
+            log.warning("live: reopening the window failed (%s)", type(exc).__name__)
+            return f"key 'o' ignored: the window could not be reopened ({exc})"
+        return None
 
     def stop(self, reason: str = "stopped") -> None:
         """Stop the live session. `reason` is what the operator is told.

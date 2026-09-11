@@ -280,3 +280,91 @@ def test_unreadable_ledger_does_not_render_as_no_candidates():
     assert tui._retry_confirm is None
     joined = " ".join(m for _, m, _ in tui._log)
     assert "retry unavailable" in joined and "/nope" in joined
+
+
+def test_o_dispatches_ahead_of_the_connected_idle_gate():
+    """`o` must work while the HiDock is unplugged.
+
+    A window kept after a call is still serving, and the state the operator is
+    most likely to have closed the tab in is exactly the one where the device is
+    gone. Gating `o` on CONNECTED_IDLE would refuse it precisely then.
+
+    MUTATION: move the `o` block below `keys_active_in_state`.
+    """
+    source = (Path(__file__).resolve().parent.parent
+              / "src" / "hidock_direct" / "tui.py").read_text()
+    assert source.index('if ch == "o":') < source.index("if not keys_active_in_state(")
+
+
+def test_o_with_no_live_controller_names_the_missing_wiring():
+    """FR-1.4, in the shape `l` already uses.
+
+    Asserted on the WIRING words, never on `"o" in message.lower()` -- the
+    unmapped-key fall-through message contains an `o`, so that assertion holds
+    under every mutation and pins nothing.
+    """
+    from hidock_direct.tui import TUI
+
+    tui = TUI(bus=EventBus(), live_controller=None)
+    tui._state = "IDLE_DISCONNECTED"
+
+    tui._on_key("o")
+
+    messages = [m for _, m, _ in tui._log]
+    assert any("live-session controller" in m for m in messages), messages
+    assert not any("keys active only in CONNECTED_IDLE" in m for m in messages), (
+        "`o` fell through to the state gate instead of naming the missing wiring"
+    )
+
+
+def test_the_reopen_refusal_reaches_the_operator():
+    """A key that appears to do nothing has indistinguishable causes, and this
+    one runs on a thread whose exceptions are swallowed. Dropping the returned
+    refusal is therefore SILENT: the operator presses `o`, the window does not
+    come back, and nothing says why.
+
+    The controller is a stub rather than a real one because the refusal TEXT is
+    the controller's business and is pinned there; what is pinned here is that
+    the TUI routes it.
+
+    MUTATION: call `reopen_window()` and discard its return value.
+    """
+    from hidock_direct.tui import TUI
+
+    class _Refusing:
+        def reopen_window(self):
+            return "key 'o' ignored: there is no live window to reopen"
+
+    tui = TUI(bus=EventBus(), live_controller=_Refusing())
+    tui._state = "IDLE_DISCONNECTED"
+
+    tui._on_key("o")
+
+    messages = [m for _, m, _ in tui._log]
+    assert any("no live window to reopen" in m for m in messages), messages
+
+
+def test_a_successful_reopen_logs_no_refusal():
+    """The other half: `None` means it worked, and must not be rendered.
+
+    Asserted as "no line at all", not as "no line containing 'ignored'":
+    `_log_key_ignored` writes its argument VERBATIM (tui.py:445-447), so a
+    mutation that logs `str(None)` puts the bare word "None" in the operator's
+    log and a substring assertion would sail past it.
+
+    MUTATION: log unconditionally, whatever the return value.
+    """
+    from hidock_direct.tui import TUI
+
+    class _Succeeding:
+        def reopen_window(self):
+            return None
+
+    tui = TUI(bus=EventBus(), live_controller=_Succeeding())
+    tui._state = "IDLE_DISCONNECTED"
+
+    tui._on_key("o")
+
+    assert [m for _, m, _ in tui._log] == [], (
+        "a successful reopen wrote to the operator's log"
+    )

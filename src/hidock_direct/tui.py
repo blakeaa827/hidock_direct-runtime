@@ -740,6 +740,24 @@ class TUI:
                 )
             return
 
+        # Beside `l` and ahead of the state gate, for `l`'s own reason plus one
+        # of its own: a window kept after a call is reachable while the HiDock
+        # is unplugged, so gating `o` on CONNECTED_IDLE would refuse it in
+        # exactly the state where the operator is most likely to have closed the
+        # tab and walked away. The controller owns every word, because only it
+        # knows which surface — live or post-call — is bound.
+        if ch == "o":
+            if self._live_controller is None:
+                self._log_key_ignored(
+                    "key 'o' ignored: this build has no live-session controller "
+                    "wired — live transcription is unreachable"
+                )
+                return
+            refusal = self._live_controller.reopen_window()
+            if refusal:
+                self._log_key_ignored(refusal)
+            return
+
         if not keys_active_in_state(current_state):
             with self._lock:
                 self._log.append((
