@@ -3531,3 +3531,466 @@ def test_names_typed_by_the_operator_survive_a_map_cleared_during_finalisation(
         f"mid-finalisation:\n{text}"
     )
     assert "**Speaker 1**" not in text
+
+
+# ---------------------------------------------------------------------------
+# Post-session naming (phase 1f) -- a name typed after the call ends
+# ---------------------------------------------------------------------------
+#
+# The constraint that shapes every test below is that the archived `.md` has a
+# SECOND writer. `personal_assistant/execution/auto_speaker_id.py:3176-3202`,
+# read 2026-09-11, reads this file, substitutes the voice database's name for a
+# generic label, and writes it back:
+#
+#     content = Path(filepath).read_text()
+#     for sp in speakers:
+#         if sp.identified_name and sp.identified_name != sp.label:
+#             old_a = f"**{sp.label}**"
+#             new_a = f"**{sp.identified_name}**"
+#             if old_a in content:
+#                 content = content.replace(old_a, new_a)
+#                 replacements += 1
+#     if replacements > 0:
+#         Path(filepath).write_text(content)
+#
+# Carried verbatim for the same reason as the daemon's predicate above: it is
+# the thing our own write must not destroy, it lives in another repo with no
+# import path from here, and a paraphrase would drift.
+
+
+def voice_id_pipeline_writes_back(path: Path, identified: Dict[str, str]) -> None:
+    """The other writer, driven exactly as its own source drives it.
+
+    A faithful double of a CONSUMER, not of a collaborator we control: it takes
+    the same substitution, the same anchor shape and the same non-atomic
+    `write_text`. A test that simulated it with an atomic rewrite would be
+    testing a race that does not exist.
+    """
+    content = path.read_text()
+    replacements = 0
+    for label, name in identified.items():
+        old_a = f"**{label}**"
+        new_a = f"**{name}**"
+        if old_a in content:
+            content = content.replace(old_a, new_a)
+            replacements += 1
+    if replacements > 0:
+        path.write_text(content)
+
+
+def _finished_call(sessions, *, names=None):
+    """One stopped session that actually wrote a transcript, with two far
+    speakers and the operator, so a rename has both a target and a bystander."""
+    harness = sessions(names=dict(names or {}))
+    with harness.rec:
+        harness.write(1.0)
+        harness.near("morning")
+        harness.turn("this is the first far speaker", label="A")
+        harness.turn("and this is a different one", label="B")
+    return harness
+
+
+def test_a_name_typed_after_the_call_reaches_the_archived_transcript(sessions):
+    """FR-3.1. The defect, stated as the behaviour that replaces it.
+
+    Before phase 1f the transcript was written once at stop and the window went
+    down with it, so a name typed afterwards had nowhere to go.
+
+    MUTATION: return `RenameOutcome(applied=False, ...)` without writing.
+    """
+    harness = _finished_call(sessions)
+    before = harness.transcript_text()
+    assert "**Speaker 1**" in before or "**Speaker 2**" in before
+
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    assert outcome.applied is True
+    assert "**Dana**" in harness.transcript_text()
+
+
+def test_the_rename_substitutes_and_does_not_re_render_the_document(sessions):
+    """FR-2.1/FR-2.2, and the reason the whole feature is built this way.
+
+    Asserted as byte equality on everything that is NOT the renamed label: a
+    re-render would reproduce the document from our turns and could differ
+    anywhere -- which is exactly how it would erase another writer's work.
+
+    MUTATION: re-render through `render_markdown` with the updated map instead
+    of substituting. That passes a naive "the name is in the file" assertion.
+    """
+    harness = _finished_call(sessions)
+    before = harness.transcript_text()
+    target = labels_of(before)[1]  # the first far speaker's rendered label
+
+    harness.rec.rename_speaker("A", "Dana")
+    after = harness.transcript_text()
+
+    assert before.replace(f"**{target}**", "**Dana**") == after
+
+
+def test_a_speaker_the_voice_pipeline_already_identified_is_left_alone(sessions):
+    """FR-2.4, and the finding that shaped the PRD.
+
+    The voice-ID pipeline runs against this same file and writes real names into
+    it. Renaming a DIFFERENT speaker afterwards must not cost it that work --
+    the naive implementation (re-render from our turns) destroys it silently,
+    because our turns have never heard of Rodney.
+
+    MUTATION: re-render on rename; or substitute with `old_anchor` computed
+    from the CURRENT map for every speaker rather than only the renamed one.
+    """
+    harness = _finished_call(sessions)
+    first, second = labels_of(harness.transcript_text())[1], None
+    text = harness.transcript_text()
+    far_labels = [lbl for lbl in labels_of(text) if lbl.startswith("Speaker")]
+    assert len(far_labels) >= 2, far_labels
+    second = far_labels[1]
+
+    # The other writer identifies the SECOND far speaker from its voice DB.
+    voice_id_pipeline_writes_back(harness.rec.transcript_path, {second: "Rodney"})
+    assert "**Rodney**" in harness.transcript_text()
+
+    # The operator now names the first one, in the window that is still open.
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    assert outcome.applied is True
+    text = harness.transcript_text()
+    assert "**Dana**" in text
+    assert "**Rodney**" in text, (
+        "the voice-identification pipeline's write-back was destroyed by our "
+        f"own rename:\n{text}"
+    )
+
+
+def test_a_label_the_other_writer_already_renamed_is_refused_never_guessed(
+    sessions,
+):
+    """FR-2.3. The anchor is gone, so something else owns that line now.
+
+    The one thing that must NOT happen is a fallback rewrite: the fallback is
+    precisely the destructive path. Refuse, say why, and leave the file alone.
+
+    MUTATION: fall back to `render_markdown` when the anchor is missing; or
+    return `applied=True` with no message.
+    """
+    harness = _finished_call(sessions)
+    far_labels = [lbl for lbl in labels_of(harness.transcript_text())
+                  if lbl.startswith("Speaker")]
+    voice_id_pipeline_writes_back(
+        harness.rec.transcript_path, {far_labels[0]: "Rodney"}
+    )
+    settled = harness.transcript_text()
+
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    assert outcome.applied is False
+    assert outcome.reason == "anchor-gone"
+    assert harness.transcript_text() == settled, "the file was written anyway"
+    assert "Dana" in outcome.message
+    assert far_labels[0] in outcome.message
+    assert "Dana" not in settled
+
+
+def test_renaming_to_the_same_name_twice_writes_once(sessions):
+    """NFR-4 and FR-3.2. Idempotent by not writing, not merely by not changing.
+
+    The archive is a Drive-synced mount, so a no-op that still replaces the file
+    is a sync event for nothing. mtime is the observable that separates the two.
+
+    MUTATION: drop the `old_anchor == new_anchor` short-circuit.
+    """
+    harness = _finished_call(sessions)
+    harness.rec.rename_speaker("A", "Dana")
+    settled = harness.transcript_text()
+    stamp = harness.rec.transcript_path.stat().st_mtime_ns
+
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    assert outcome.applied is False
+    assert outcome.reason == "unchanged"
+    assert harness.transcript_text() == settled
+    assert harness.rec.transcript_path.stat().st_mtime_ns == stamp
+
+
+def test_renaming_twice_anchors_on_the_name_it_last_wrote(sessions):
+    """A correction. `Dana` -> `Dana Okafor` must find `**Dana**`, not `**Speaker 1**`.
+
+    The anchor tracks what is ON THE PAGE, which is the point of keeping the map
+    that was rendered rather than the map the session started with.
+
+    MUTATION: anchor on `self._speaker_names(turns)` (the session's map) every
+    time, which is correct once and wrong on every later rename.
+    """
+    harness = _finished_call(sessions)
+    harness.rec.rename_speaker("A", "Dana")
+
+    outcome = harness.rec.rename_speaker("A", "Dana Okafor")
+
+    assert outcome.applied is True
+    text = harness.transcript_text()
+    assert "**Dana Okafor**" in text
+    assert "**Dana**" not in text.replace("**Dana Okafor**", "")
+
+
+def test_clearing_a_name_after_the_call_restores_the_number_the_daemon_wants(
+    sessions,
+):
+    """Clearing must return the label to the form the voice daemon acts on.
+
+    A cleared name that left a blank or a letter behind would withdraw the
+    speaker from voice identification permanently -- the §2.3 defect, arriving
+    by a new route.
+    """
+    harness = _finished_call(sessions, names={"A": "Dana"})
+    assert "**Dana**" in harness.transcript_text()
+
+    outcome = harness.rec.rename_speaker("A", None)
+
+    assert outcome.applied is True
+    text = harness.transcript_text()
+    assert "**Dana**" not in text
+    assert SPEAKER_LETTER_LABEL.search(text) is None
+    assert speaker_id_daemon_would_identify(text)
+
+
+def test_renaming_one_speaker_leaves_the_others_findable_by_the_daemon(sessions):
+    """FR-2.5. Naming withdraws ONE speaker from voice-ID, never the rest.
+
+    Asserted against the consumer's own predicate, head slice and all.
+
+    MUTATION: substitute `**Speaker \\d+**` globally rather than the one anchor.
+    """
+    harness = _finished_call(sessions)
+
+    harness.rec.rename_speaker("A", "Dana")
+
+    text = harness.transcript_text()
+    assert "**Dana**" in text
+    assert speaker_id_daemon_would_identify(text), (
+        "every generic label vanished, so the remaining speakers will never be "
+        f"identified:\n{text[:SPEAKER_ID_DAEMON_HEAD_CHARS]}"
+    )
+
+
+def test_a_rename_racing_another_writer_aborts_rather_than_discarding_it(
+    sessions, monkeypatch,
+):
+    """FR-2.7 -- the hazard `os.replace` creates and does not report.
+
+    Both writers are last-writer-wins. If the voice-ID pipeline writes between
+    our read and our write, an unguarded `os.replace` discards it with no error,
+    no exception and no trace.
+
+    The other writer is fired in the window the guard covers: after
+    `rename_speaker` has read the document it is about to substitute into, and
+    before the comparison read that authorises the replace. That is the window a
+    real interleaving lands in -- the compare and the `os.replace` are adjacent
+    statements, and the sliver between THOSE cannot be closed without a lock the
+    other writer does not take.
+
+    MUTATION: use `_atomic_write_text` instead of `_rewrite_if_unchanged`; or
+    compare mtime/size instead of content -- a name substitution can be
+    same-size, and the substitution here is chosen to be exactly that.
+    """
+    harness = _finished_call(sessions)
+    far_labels = [lbl for lbl in labels_of(harness.transcript_text())
+                  if lbl.startswith("Speaker")]
+    path = harness.rec.transcript_path
+    # Exactly as long as the label it replaces, so the file's SIZE is unchanged
+    # and only a content comparison can see the other writer at all. Derived
+    # from the label rather than written out, so it cannot drift out of being
+    # the same length.
+    intruder = "R" * len(far_labels[1])
+    before_size = path.stat().st_size
+
+    original = Path.read_text
+    reads = {"n": 0}
+
+    def racing_read(self, *args, **kwargs):
+        text = original(self, *args, **kwargs)
+        if self == path:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                voice_id_pipeline_writes_back(path, {far_labels[1]: intruder})
+        return text
+
+    monkeypatch.setattr(Path, "read_text", racing_read)
+    outcome = harness.rec.rename_speaker("A", "Dana")
+    monkeypatch.undo()
+
+    assert reads["n"] >= 2, "the guard never re-read; the race was not tested"
+    assert outcome.applied is False
+    assert outcome.reason == "raced"
+    text = harness.transcript_text()
+    assert path.stat().st_size == before_size, (
+        "the interfering write changed the file's size, so a size check would "
+        "have caught it and this test no longer pins the content comparison"
+    )
+    assert f"**{intruder}**" in text, (
+        f"the other writer's change was discarded by ours:\n{text}"
+    )
+    assert "**Dana**" not in text
+    assert "still in the panel" in outcome.message
+
+
+def test_a_raced_rename_leaves_no_temp_file_behind(sessions, monkeypatch):
+    """A refused write must not litter the archive the pipeline indexes.
+
+    `.tmp` is deliberately not the transcript's own suffix, so a stray one is
+    not indexed as a transcript -- but it is still a file appearing in a
+    Drive-synced directory for a write that did not happen.
+    """
+    harness = _finished_call(sessions)
+    path = harness.rec.transcript_path
+    original = Path.read_text
+    reads = {"n": 0}
+
+    def racing_read(self, *args, **kwargs):
+        text = original(self, *args, **kwargs)
+        if self == path:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                path.write_text(text + "\n<!-- someone else -->\n")
+        return text
+
+    monkeypatch.setattr(Path, "read_text", racing_read)
+    outcome = harness.rec.rename_speaker("A", "Dana")
+    monkeypatch.undo()
+
+    assert outcome.reason == "raced"
+    assert harness.suffixed(_PARTIAL_SUFFIX) == []
+
+
+def test_a_rename_before_the_transcript_exists_is_a_stated_no_op(sessions):
+    """FR-3.5. Not a failure: the stop-time snapshot has not been taken yet and
+    will carry the name instead, which is how in-session naming already works.
+
+    MUTATION: raise, or report `applied=True`, when there is no transcript.
+    """
+    harness = sessions(names={})
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("mid call", label="A")
+
+        outcome = harness.rec.rename_speaker("A", "Dana")
+
+        assert outcome.applied is False
+        assert outcome.reason == "no-transcript"
+        assert outcome.message is None
+        assert harness.rec.transcript_path is None
+
+        # And the name is not lost: the stop-time snapshot carries it, exactly
+        # as it did before this feature existed.
+        harness.names["A"] = "Dana"
+
+    assert "**Dana**" in harness.transcript_text()
+
+
+def test_a_session_that_wrote_no_transcript_reports_no_transcript(sessions):
+    """A call where nobody spoke writes audio and no document (FR-1.5)."""
+    harness = sessions(names={})
+    with harness.rec:
+        harness.write(1.0)
+
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    assert outcome.applied is False
+    assert outcome.reason == "no-transcript"
+
+
+def test_a_label_that_never_reached_the_document_is_reported_not_written(
+    sessions,
+):
+    """A panel row can exist for a label that produced no final utterance."""
+    harness = _finished_call(sessions)
+    settled = harness.transcript_text()
+
+    outcome = harness.rec.rename_speaker("ZZ", "Nobody")
+
+    assert outcome.applied is False
+    assert outcome.reason == "not-in-transcript"
+    assert harness.transcript_text() == settled
+
+
+def test_a_rename_that_cannot_be_written_says_so_and_keeps_the_recording(
+    sessions, monkeypatch,
+):
+    """FR-ERR-1/FR-ERR-3. A disk problem costs a message, never the artifacts."""
+    harness = _finished_call(sessions)
+    settled = harness.transcript_text()
+    monkeypatch.setattr(
+        live_archive_module.os, "replace",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+    )
+
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    monkeypatch.undo()
+    assert outcome.applied is False
+    assert outcome.reason == "unwritable"
+    assert "No space left on device" in outcome.message
+    assert harness.transcript_text() == settled
+    assert harness.rec.audio_path is not None and harness.rec.audio_path.exists()
+    assert harness.suffixed(".tmp") == []
+
+
+def test_a_hostile_post_session_name_cannot_forge_a_turn_or_frontmatter(
+    sessions,
+):
+    """FR-NFR: the substitution path must not bypass the emitter's sanitiser.
+
+    A rename writes operator input straight into a Markdown body under YAML
+    frontmatter. The `**...**` anchor is the only structure it is allowed to
+    occupy.
+
+    MUTATION: interpolate `name` into the anchor without going through
+    `speaker_labels`, which is what applies `_sanitize_speaker_name`.
+    """
+    hostile = "Dana**\n---\nrecorded_at: 1999-01-01T00:00:00+00:00\n**Speaker 9"
+    harness = _finished_call(sessions)
+    before_keys = frontmatter_keys(harness.transcript_text())
+    before_turns = len(turn_lines(harness.transcript_text()))
+
+    harness.rec.rename_speaker("A", hostile)
+
+    text = harness.transcript_text()
+    assert frontmatter_keys(text) == before_keys
+    assert len(turn_lines(text)) == before_turns
+    # The invariant is structural, not lexical: `---` inside a turn's text is
+    # prose, and a fence is `---` alone on a line. Exactly the two real fences
+    # must survive, and the forged `recorded_at` must never start a line.
+    assert len(re.findall(r"^---$", text, re.M)) == 2
+    assert re.search(r"^recorded_at: 1999", text, re.M) is None
+
+
+def test_rename_messages_carry_no_transcript_text(sessions):
+    """NFR-3. The operator's messages name files and labels, never content."""
+    secret = "the acquisition closes on tuesday"
+    harness = sessions(names={})
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn(secret, label="A")
+
+    messages = [
+        harness.rec.rename_speaker("A", "Dana").message,
+        harness.rec.rename_speaker("ZZ", "Nobody").message,
+    ]
+
+    for message in messages:
+        assert message is None or secret not in message
+
+
+def test_the_guarded_rewrite_is_its_own_function_not_the_sidecar_writer(sessions):
+    """FR-2.9, read off the source.
+
+    `_atomic_write_text`'s contract is a path "`_sidecar_target` only ever hands
+    back a name nothing occupies". That is true of the transcript when it is
+    written and stops being true minutes later, once the voice-ID pipeline also
+    holds it. Reusing it here would be reusing a contract that no longer applies.
+
+    MUTATION: point `rename_speaker` at `_atomic_write_text`.
+    """
+    source = (SRC / "live_archive.py").read_text()
+    body = source.split("def rename_speaker")[1].split("\n    def ")[0]
+    assert "_rewrite_if_unchanged" in body
+    assert "_atomic_write_text" not in body

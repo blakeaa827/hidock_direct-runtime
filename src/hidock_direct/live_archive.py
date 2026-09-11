@@ -89,7 +89,7 @@ from pathlib import Path
 from threading import RLock
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
-from diarize_audio.render import render_markdown
+from diarize_audio.render import render_markdown, speaker_labels
 
 from .events import (
     Error,
@@ -144,6 +144,23 @@ LIVE_ID_PREFIX = "live-"
 NEAR_SPEAKER_KEY = "near"
 _FAR_SPEAKER_PREFIX = "far-"
 _UNLABELLED_FAR_SPEAKER_KEY = "far-unlabelled"
+
+
+@dataclass(frozen=True)
+class RenameOutcome:
+    """What `LiveArchive.rename_speaker` did, and what to tell the operator.
+
+    `applied` is narrow on purpose: it means the document on disk changed. The
+    several ways of not changing it are NOT collapsed into one falsey value,
+    because they are different events — nothing to write yet, already says
+    that, someone else renamed it, the disk refused — and only some of them are
+    worth interrupting the operator over. `message` is None exactly when there
+    is nothing they need to know.
+    """
+
+    applied: bool
+    reason: str
+    message: Optional[str] = None
 
 
 @dataclass
@@ -261,6 +278,41 @@ def _safe_unlink(path: Optional[Path]) -> None:
         pass
 
 
+class _ConcurrentWrite(Exception):
+    """The file changed between reading it and writing it back."""
+
+
+def _rewrite_if_unchanged(path: Path, expected: str, text: str) -> None:
+    """Replace `path` with `text`, but only while it still holds `expected`.
+
+    Deliberately NOT `_atomic_write_text`, whose contract is a path
+    "`_sidecar_target` only ever hands back a name nothing occupies". That was
+    true of the transcript at the moment we wrote it and stops being true
+    minutes later: `auto_speaker_id.py` reads the same file and writes it back
+    with a plain `write_text`. Both writers are last-writer-wins, and
+    `os.replace` would discard theirs with no error and no trace (FR-2.9).
+
+    So the check is the file's whole content, not its mtime or size — a
+    same-size edit is exactly what a name substitution is, and mtime resolution
+    on a Drive mount is not something to bet a transcript on. The window
+    narrows to the re-read immediately below, which is as far as it can narrow
+    without a lock the other writer does not take; `rename_speaker` also keeps
+    the write narrow (FR-2.8) so an undetected interleaving costs one change
+    rather than the document.
+    """
+    if path.read_text(encoding="utf-8") != expected:
+        raise _ConcurrentWrite(path.name)
+    tmp = path.with_name(path.name + _PARTIAL_SUFFIX)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+        os.replace(tmp, path)
+    except OSError:
+        _safe_unlink(tmp)
+        raise
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write `text` to `path` via a neighbouring temp file and `os.replace`.
 
@@ -343,6 +395,12 @@ class LiveArchive:
         self._audio_path: Optional[Path] = None
         self._started_at: Optional[datetime] = None
         self._transcript_path: Optional[Path] = None
+        # What the transcript on disk was rendered FROM. Kept so a name typed
+        # after the session can work out the exact bold label the emitter put on
+        # the page — see `rename_speaker`, which substitutes rather than
+        # re-renders. Both are set together, only after a successful write.
+        self._rendered_response: Optional[dict] = None
+        self._rendered_names: Dict[str, str] = {}
         self._recording_stopped = False
         self._subscribed = False
         self._stopped = False
@@ -504,6 +562,110 @@ class LiveArchive:
                 return
             self._write_transcript(
                 audio_path, started_at, turns, samples, names=names_snapshot
+            )
+
+    def rename_speaker(self, label: str, name: Optional[str]) -> "RenameOutcome":
+        """Put a name typed AFTER the session into the archived transcript.
+
+        Never raises, and never re-renders the document. The distinction is the
+        whole design, not an optimisation: `auto_speaker_id.py` reads this same
+        file, substitutes `**Speaker N**` for a name out of the voice database
+        and writes it back, so re-rendering from our turns would silently
+        discard every identification that pipeline had made. We change only the
+        label being renamed and leave the rest of the file exactly as found
+        (FR-2.1, FR-2.2).
+
+        The anchor comes from `speaker_labels` — the emitter's own map, keyed by
+        the same provider keys we handed it — so it is the label the emitter
+        actually wrote, not a pattern guessed about its output.
+
+        In-session naming does not come through here. It reaches the document
+        through the snapshot `stop()` takes, which is also why a rename arriving
+        before the transcript exists is a no-op rather than a loss: the snapshot
+        has not been taken yet and will include it (FR-3.5).
+        """
+        key = _speaker_key(LiveChannel.FAR, label)
+        with self._finalise_lock:
+            target = self._transcript_path
+            response = self._rendered_response
+            if target is None or response is None:
+                # Either the session wrote no transcript at all, or `stop()` has
+                # not reached the write yet. Both are states where there is
+                # nothing on disk to change, and neither is a failure.
+                return RenameOutcome(applied=False, reason="no-transcript")
+
+            before = speaker_labels(response, self._rendered_names)
+            if key not in before:
+                # A label the document never carried: a speaker who appears in
+                # the surface's panel but produced no utterance in the rendered
+                # response.
+                return RenameOutcome(applied=False, reason="not-in-transcript")
+
+            updated = dict(self._rendered_names)
+            cleaned = (name or "").strip()
+            if cleaned:
+                updated[key] = cleaned
+            else:
+                updated.pop(key, None)
+            after = speaker_labels(response, updated)
+
+            old_anchor = f"**{before[key]}**"
+            new_anchor = f"**{after[key]}**"
+            if old_anchor == new_anchor:
+                # Renaming to what it already says. NFR-4: applying the same
+                # name twice must change nothing the second time, including not
+                # touching the file's mtime on a Drive mount.
+                self._rendered_names = updated
+                return RenameOutcome(applied=False, reason="unchanged")
+
+            try:
+                found = target.read_text(encoding="utf-8")
+            except OSError as exc:
+                return RenameOutcome(
+                    applied=False,
+                    reason="unreadable",
+                    message=self._rename_failed_message(target, exc),
+                )
+
+            if old_anchor not in found:
+                # FR-2.3. The label we wrote is not there any more, so something
+                # else renamed it — almost certainly the voice-ID pipeline. We
+                # do NOT guess which line is theirs and we do NOT fall back to a
+                # rewrite, because a rewrite is exactly what would destroy their
+                # work. Say so and stop.
+                return RenameOutcome(
+                    applied=False,
+                    reason="anchor-gone",
+                    message=self._rename_anchor_gone_message(
+                        target, before[key], cleaned
+                    ),
+                )
+
+            rewritten = found.replace(old_anchor, new_anchor)
+            try:
+                _rewrite_if_unchanged(target, found, rewritten)
+            except _ConcurrentWrite:
+                # FR-2.7. Someone wrote between our read and our write, and
+                # `os.replace` would have discarded it with no error at all. The
+                # operator keeps the name in the panel and can simply retype it.
+                return RenameOutcome(
+                    applied=False,
+                    reason="raced",
+                    message=self._rename_raced_message(target),
+                )
+            except OSError as exc:
+                return RenameOutcome(
+                    applied=False,
+                    reason="unwritable",
+                    message=self._rename_failed_message(target, exc),
+                )
+
+            self._rendered_names = updated
+            log.info("live: renamed a speaker in %s", target.name)
+            return RenameOutcome(
+                applied=True,
+                reason="applied",
+                message=self._renamed_message(target, before[key], after[key]),
             )
 
     # -- bus --------------------------------------------------------------
@@ -823,6 +985,8 @@ class LiveArchive:
             self._publish(self._transcript_failed_message(audio_path, exc), Severity.ERROR)
             return
         self._transcript_path = target
+        self._rendered_response = transcript
+        self._rendered_names = dict(speaker_names)
         log.info("live: transcript written for %s", audio_path.name)
         if conflict is not None:
             self._publish(conflict, Severity.WARNING)
@@ -1056,6 +1220,40 @@ class LiveArchive:
             f"The live transcript for {audio_path.name} could not be written: "
             f"{exc}. The recording itself is intact at {audio_path} and can be "
             "transcribed by the normal path."
+        )
+
+    def _renamed_message(self, target: Path, was: str, now: str) -> str:
+        return f"{target.name}: {was} is now {now}."
+
+    def _rename_anchor_gone_message(
+        self, target: Path, was: str, typed: str
+    ) -> str:
+        """FR-2.3. Say what was typed, and that the file changed elsewhere.
+
+        Names the other writer, because the operator can go and look: an
+        identified speaker in that document is the voice-ID pipeline's work and
+        overwriting it is precisely what this refusal exists to prevent.
+        """
+        wanted = f'"{typed}"' if typed else "a cleared name"
+        return (
+            f"{wanted} was not applied to {target.name}: it no longer contains "
+            f"{was}, so something else — most likely the speaker-identification "
+            "pipeline — has already renamed that speaker. The transcript was "
+            "left untouched rather than overwritten; open it to see the name "
+            "it carries now."
+        )
+
+    def _rename_raced_message(self, target: Path) -> str:
+        return (
+            f"{target.name} was being written by something else at that moment, "
+            "so the name was not applied — changing it would have discarded the "
+            "other change. The name is still in the panel; type it again."
+        )
+
+    def _rename_failed_message(self, target: Path, exc: OSError) -> str:
+        return (
+            f"The name could not be written to {target.name}: {exc}. It is "
+            "still in the panel, so it can be applied again once that is fixed."
         )
 
 

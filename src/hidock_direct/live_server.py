@@ -241,6 +241,16 @@ PAGE = """<!doctype html>
   #conn.ok { color: #6bbf73; }
   #conn.bad { color: #e0a33e; }
   #billed { font-size: .8rem; color: #98a0ab; }
+  /* Deliberately NOT styled like the live indicator: no red, no pulsing dot.
+     The two states must not be mistakable for one another at a glance, which
+     is the whole reason the indicator clears. */
+  #ended {
+    font-weight: 600; letter-spacing: .02em; color: #6bbf73;
+    display: inline-flex; align-items: center; gap: .45rem;
+  }
+  #panel-ended {
+    margin: 0 0 .6rem; font-size: .78rem; color: #6bbf73; line-height: 1.45;
+  }
   main { flex: 1; display: flex; min-height: 0; }
   #feed { flex: 1; overflow-y: auto; padding: 1rem 1.25rem; scroll-behavior: smooth; }
   aside {
@@ -268,6 +278,7 @@ PAGE = """<!doctype html>
 <body>
 <header>
   <span id="live-indicator"><span class="dot"></span>LIVE — audio is streaming to AssemblyAI</span>
+  <span id="ended" hidden>Call ended — names can still be changed</span>
   <span id="billed" hidden></span>
   <span id="conn">connecting</span>
 </header>
@@ -275,6 +286,8 @@ PAGE = """<!doctype html>
   <section id="feed" aria-label="transcript"></section>
   <aside aria-label="speakers">
     <h2>Speakers</h2>
+    <p id="panel-ended" hidden>The call is over. A name typed now is also written into the
+      saved transcript.</p>
     <p id="panel-empty">Rows appear here as people speak. Type a name to label every line
       that speaker has said, past and future.</p>
     <div id="rows"></div>
@@ -300,6 +313,8 @@ PAGE = """<!doctype html>
   var rowsBox = document.getElementById("rows");
   var panelEmpty = document.getElementById("panel-empty");
   var indicator = document.getElementById("live-indicator");
+  var ended = document.getElementById("ended");
+  var panelEnded = document.getElementById("panel-ended");
   var billed = document.getElementById("billed");
   var conn = document.getElementById("conn");
   var tpl = document.getElementById("speaker-row");
@@ -442,13 +457,25 @@ PAGE = """<!doctype html>
   function onStatus(status) {
     if (status.live) {
       indicator.hidden = false;
+      ended.hidden = true;
+      panelEnded.hidden = true;
       billed.hidden = true;
       return;
     }
     indicator.hidden = true;
-    billed.textContent = "Session ended — near " + seconds(status.near_seconds)
-      + ", far " + seconds(status.far_seconds);
-    billed.hidden = false;
+    ended.hidden = false;
+    panelEnded.hidden = false;
+    // Only the message that CARRIES the durations may write them. The end of a
+    // call produces two of these — the bridge's, with the billed seconds, and
+    // the controller's, without — in no guaranteed order, and a status that
+    // does not know the durations must not overwrite "near 612s" with
+    // "near unknown". A metered feature that reports "unknown" for a number it
+    // was told is worse than one that stays quiet.
+    if ("near_seconds" in status || "far_seconds" in status) {
+      billed.textContent = "near " + seconds(status.near_seconds)
+        + ", far " + seconds(status.far_seconds);
+      billed.hidden = false;
+    }
   }
 
   function onProblem(problem) {
@@ -933,6 +960,10 @@ class LiveSurface:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._session_live = False
+        # Where a name goes once the transcript exists on disk. Attached by the
+        # controller when it builds the recorder, and dropped on `stop()` so a
+        # torn-down surface can never call into a finalised archive.
+        self._rename_sink: Optional[Callable[[str, Optional[str]], None]] = None
         self._started_at = time.monotonic()
         self._seq = 0
 
@@ -974,6 +1005,41 @@ class LiveSurface:
         self._thread.start()
         return self.url
 
+    def attach_rename_sink(
+        self, sink: Optional[Callable[[str, Optional[str]], None]]
+    ) -> None:
+        """Where `set_name` forwards, so a name can reach the archived document.
+
+        Attached rather than constructed here because the recorder is optional —
+        a composition with no archive directory records nothing — and a surface
+        that had to know that would have to know about archives.
+        """
+        self._rename_sink = sink
+
+    def end_session(self) -> None:
+        """The call is over. The window stays up so names can still be changed.
+
+        This is the reversal argued in `post_session_naming_prd.md` §5, and the
+        narrower half of what `stop()` does: the live indicator clears, but the
+        server keeps serving, the ring is kept, the token stays valid and the
+        name map survives. The operator can still type, and what they type now
+        reaches the transcript on disk instead of a render that already
+        happened.
+
+        The indicator clearing is not cosmetic. It is a security control
+        (`live_surface_prd.md` FR-2.5) and leaving it lit while no audio is
+        streaming would be worse than shutting the window: an indicator that
+        lies about a metered third-party egress path trains the operator to
+        disbelieve it.
+
+        Idempotent, and never raises — it runs on the same teardown path as
+        `stop()`, where a raise would strand the offload worker suspended.
+        """
+        if not self._running or not self._session_live:
+            return
+        self._session_live = False
+        self._broadcast(self._status_payload())
+
     def stop(self) -> None:
         """Idempotent, and never raises.
 
@@ -986,6 +1052,7 @@ class LiveSurface:
             return
         self._running = False
         self._session_live = False
+        self._rename_sink = None
 
         with self._lock:
             subscribers = list(self._subscribers)
@@ -1162,6 +1229,12 @@ class LiveSurface:
         Never written into stored turns: the map is consulted when a turn is
         sent, which is what makes this reach lines already on screen and lets
         clearing revert to the provider's own label.
+
+        The page is updated FIRST and the archive second, on purpose. The page
+        is what the operator is looking at and it cannot fail; the archive is a
+        file on a Drive mount that can be busy, unwritable, or already changed
+        by another writer. Ordering it this way means a disk problem costs a
+        message, never the typed name.
         """
         with self._lock:
             cleaned = (name or "").strip()[:64]
@@ -1171,6 +1244,30 @@ class LiveSurface:
                 self._names.pop(label, None)
             payload = self._names_payload()
         self._broadcast(payload)
+
+        # OUTSIDE `_lock`, and that is a correctness requirement rather than
+        # tidiness. `LiveArchive.stop()` holds `_finalise_lock` while it renders,
+        # and rendering reads `speaker_names()`, which takes THIS lock. The sink
+        # takes `_finalise_lock`. Calling it from inside `_lock` would let the
+        # teardown thread hold `_finalise_lock` wanting `_lock` while this thread
+        # holds `_lock` wanting `_finalise_lock` — a deadlock between the
+        # operator's keystroke and the end of their call.
+        #
+        # It is called unconditionally, not only once the session has ended: the
+        # archive knows whether a transcript exists and the surface does not, and
+        # two components deciding separately when a call is "over" is how they
+        # come to disagree. Before the transcript is written this is a no-op, and
+        # correctly so — the snapshot `stop()` takes will carry the name instead.
+        sink = self._rename_sink
+        if sink is None:
+            return
+        try:
+            sink(label, cleaned or None)
+        except Exception as exc:  # noqa: BLE001 - a name is not worth a 500
+            log.warning(
+                "live: the archived transcript was not renamed (%s)",
+                type(exc).__name__,
+            )
 
     def speaker_names(self) -> Dict[str, str]:
         """The operator's `label -> name` map, as a snapshot.
@@ -1615,6 +1712,12 @@ class LiveSessionController:
         # down regardless. Cleared with the rest of the session state.
         self._archive = None
         self._thread: Optional[threading.Thread] = None
+        # The window that outlives the call. `_teardown` ends the SESSION and
+        # leaves the surface serving so late diarization labels can still be
+        # named; `close_window()` is what actually takes it down, from the next
+        # `l` or from app exit. Never two at once — see `start()`.
+        self._ended_surface = None
+        self._ended_archive = None
 
     # -- operator control -------------------------------------------------
 
@@ -1687,6 +1790,14 @@ class LiveSessionController:
         if refusal is not None:
             raise LiveSessionError(refusal)
 
+        # FR-1.4: the previous call's window goes down BEFORE this one comes up,
+        # and before anything subscribes to the bus. Two surfaces subscribed at
+        # once would put this session's turns on the last session's page — which
+        # is a transcript leaking across calls, not a cosmetic overlap. Done
+        # here rather than in `_teardown` because that is exactly the point:
+        # between the two, the operator still has a window to type into.
+        self.close_window()
+
         # Refused, never clamped, and refused HERE rather than only at the
         # prompt, because the prompt is not the only caller. Past the ceiling the
         # vendor MERGES additional speakers into the closest existing label, so a
@@ -1748,6 +1859,14 @@ class LiveSessionController:
             )
             archive = self._new_archive(surface)
             self._archive = archive
+            if archive is not None:
+                # A name typed after the call reaches the document through here.
+                # Attached only when there IS a recorder: a transcript-only
+                # session has nothing on disk for a rename to change, and a sink
+                # that silently discarded names would be worse than none.
+                surface.attach_rename_sink(
+                    lambda label, name: self._rename_in_archive(archive, label, name)
+                )
             thread = threading.Thread(
                 target=self._pump, args=(capture, transcriber, generation),
                 kwargs={"archive": archive},
@@ -1814,7 +1933,64 @@ class LiveSessionController:
             thread.join(timeout=5.0)
         self._teardown(generation)
 
+    def close_window(self) -> None:
+        """Take down the window a finished session left up. Never raises.
+
+        Separate from `stop()` because they answer to different events: `stop()`
+        is the operator ending a CALL, after which they may still want to name
+        the people on it; this is the window itself going away, which happens on
+        the next `l` and at app exit (FR-1.4) and at no other time. There is no
+        indefinite lifetime and nothing survives a restart.
+        """
+        with self._lock:
+            surface = self._ended_surface
+            self._ended_surface = None
+            self._ended_archive = None
+        if surface is None:
+            return
+        try:
+            surface.attach_rename_sink(None)
+            self._bus.unsubscribe(surface.publish)
+        except Exception as exc:  # noqa: BLE001 - the window still has to go
+            log.warning("live: unsubscribing the window failed (%s)", type(exc).__name__)
+        try:
+            surface.stop()
+        except Exception as exc:  # noqa: BLE001 - never raises out of teardown
+            log.warning("live: the window did not close cleanly (%s)", type(exc).__name__)
+
+    def shutdown(self, reason: str = "app shutting down") -> None:
+        """End any live session AND close the window. For app exit only.
+
+        `stop()` deliberately leaves the window up; on the way out there is
+        nothing left to leave it up for, and a served page outliving the process
+        that owns it is the disclosure surface `live_surface_prd.md` FR-1.6 was
+        written against. Safe with nothing running, and safe from a signal
+        handler: both halves return immediately when there is nothing to do.
+        """
+        self.stop(reason=reason)
+        self.close_window()
+
     # -- archival ---------------------------------------------------------
+
+    def _rename_in_archive(self, archive, label: str, name: Optional[str]) -> None:
+        """Put one post-session name into the archived transcript, and say so.
+
+        FR-3.3: the operator is changing a file the call-processing pipeline
+        reads, so the write is reported rather than silent. Reported on the bus,
+        which means it lands on the very page they typed it into.
+
+        Only `applied` is INFO. Every other outcome that carries a message is a
+        WARNING because it means the document on disk does NOT say what the
+        panel says — and the two that carry none (nothing written yet, already
+        says that) are not events at all.
+        """
+        outcome = archive.rename_speaker(label, name)
+        if outcome.message is None:
+            return
+        self._say(
+            outcome.message,
+            Severity.INFO if outcome.applied else Severity.WARNING,
+        )
 
     def _new_archive(self, surface):
         """This session's recorder, or None when the composition archives nothing.
@@ -2029,10 +2205,16 @@ class LiveSessionController:
             self._capture = None
             self._thread = None
 
-        # BEFORE the surface stops, because the recording's transcript is
-        # rendered from the operator's `label -> name` map and `LiveSurface.stop`
-        # clears it. Normally a no-op — the pump's `with` already finalised it —
-        # but `stop()` joins that pump for five seconds and then tears down
+        # BEFORE the surface's session ends, because the recording's transcript
+        # is rendered from the operator's `label -> name` map. `end_session`
+        # keeps that map now — `stop()` is what clears it, and that no longer
+        # runs here — but the ordering is kept deliberately: it is what makes
+        # the snapshot the LAST word on the names, so a rename arriving after
+        # this point finds a transcript on disk to substitute into rather than
+        # racing the render that produces it.
+        #
+        # Normally a no-op — the pump's `with` already finalised it — but
+        # `stop()` joins that pump for five seconds and then tears down
         # regardless, and a recording finalised without the map is a document of
         # `Speaker 1`s for a call whose speakers the operator had already named.
         #
@@ -2045,12 +2227,40 @@ class LiveSessionController:
             log.warning("live: the recording was not finalised (%s)", type(exc).__name__)
             saved = None
 
+        # The SESSION ends here; the WINDOW may not. This is the reversal argued
+        # in `post_session_naming_prd.md` §5. AssemblyAI's diarization improves
+        # as a call proceeds and revises labels late, so the speakers most worth
+        # naming are the ones that appear as the call ends — and taking the page
+        # down at exactly that moment is what made the operator type a name into
+        # a dead window and watch nothing happen.
+        #
+        # It is kept only when there is a TRANSCRIPT to name into, which is the
+        # thing the window is being kept FOR. A start that raised before the
+        # pump owned the session, a call where nobody spoke, an archive that
+        # could not be written — none of those produced a document, so naming
+        # would change nothing and a bound server serving an empty page is the
+        # disclosure surface FR-1.6 named with none of the benefit.
         try:
-            if surface is not None:
+            keep = archive is not None and archive.transcript_path is not None
+        except Exception as exc:  # noqa: BLE001 - an unreadable path is not a window
+            log.warning("live: could not read the transcript path (%s)", type(exc).__name__)
+            keep = False
+
+        # The bus subscription STAYS while the window does: `rename_speaker`'s
+        # result is published as a live-context event, and the page the operator
+        # is reading it on is this one. `close_window()` unsubscribes.
+        try:
+            if surface is not None and keep:
+                surface.end_session()
+                with self._lock:
+                    self._ended_surface = surface
+                    self._ended_archive = archive
+            elif surface is not None:
+                surface.attach_rename_sink(None)
                 self._bus.unsubscribe(surface.publish)
                 surface.stop()
         except Exception as exc:  # noqa: BLE001 - must not strand the claim
-            log.warning("live: surface did not stop cleanly (%s)", type(exc).__name__)
+            log.warning("live: surface did not end cleanly (%s)", type(exc).__name__)
         finally:
             self._resume()
 
@@ -2072,9 +2282,28 @@ class LiveSessionController:
         # claim is released so the log order matches the real order.
         reason = self._stop_reason
         if reason:
+            # Whether the window survived is the operator's next action, so it
+            # belongs in the line that tells them the call is over rather than
+            # in a second line they have to connect to this one.
+            #
+            # A FRESH ticket, because the one minted at session start has long
+            # expired and the most likely thing an operator does when a call
+            # ends is close the window. FR-5.4 already names this exactly —
+            # "the operator closes the window and the log is the only place the
+            # URL can come from" — and until now that was only true at the
+            # start of a call, which is the half where they still have it open.
+            tail = ""
+            if keep:
+                tail = " The window is still open — speaker names can still be changed."
+                try:
+                    tail += f" Reopen it at {surface.launch_url(_MANUAL_TICKET_TTL_SECONDS)}"
+                except Exception as exc:  # noqa: BLE001 - a URL is not the window
+                    log.warning(
+                        "live: could not mint a reopen ticket (%s)", type(exc).__name__
+                    )
             self._say_unless_stale(
                 generation,
-                f"Live transcription ended — {reason}. The transcript is kept.",
+                f"Live transcription ended — {reason}. The transcript is kept.{tail}",
                 Severity.INFO,
             )
 

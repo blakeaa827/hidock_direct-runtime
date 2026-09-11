@@ -108,7 +108,7 @@ import types
 import urllib.error
 import urllib.request
 import webbrowser
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import pytest
 
@@ -128,7 +128,7 @@ from hidock_direct.events import (
     LiveTurn,
     Severity,
 )
-from hidock_direct.live_archive import LiveArchive
+from hidock_direct.live_archive import LiveArchive, RenameOutcome
 from hidock_direct.live_server import (
     LAUNCH_TIMEOUT_SECONDS,
     LiveSessionController,
@@ -443,8 +443,16 @@ class FakeSurface:
         self.names: Dict[str, Optional[str]] = {}
         self.started = 0
         self.stopped = 0
+        self.ended = 0
+        # The sink currently attached, and every attach/detach in order. The
+        # real surface holds ONE, so a controller that attached a second without
+        # dropping the first would be writing a finished call's names into a
+        # live one's transcript.
+        self.rename_sink: Optional[Callable] = None
+        self.sink_history: List[str] = []
         self.start_error: Optional[BaseException] = None
         self.stop_error: Optional[BaseException] = None
+        self.end_error: Optional[BaseException] = None
         self.publish_error: Optional[BaseException] = None
         self._port = 54321
         self._token = "tok-fake-token"
@@ -480,6 +488,21 @@ class FakeSurface:
         self.launch_urls.append(made)
         return made
 
+    def end_session(self) -> None:
+        _bind_against(LiveSurface.end_session)
+        self.ended += 1
+        # Deliberately does NOT clear `names`, because the real one does not.
+        # That is the phase-1f change: the map survives the end of the call so
+        # the operator can still type into it. A double that cleared here would
+        # make post-session naming untestable by making it impossible.
+        if self.end_error is not None:
+            raise self.end_error
+
+    def attach_rename_sink(self, sink) -> None:
+        _bind_against(LiveSurface.attach_rename_sink, sink)
+        self.rename_sink = sink
+        self.sink_history.append("attach" if sink is not None else "detach")
+
     def stop(self) -> None:
         _bind_against(LiveSurface.stop)
         self.stopped += 1
@@ -489,6 +512,7 @@ class FakeSurface:
         # finalise the recording BEFORE the surface stops — unfalsifiable, since
         # the late read would still find the map populated.
         self.names = {}
+        self.rename_sink = None
         if self.stop_error is not None:
             raise self.stop_error
 
@@ -522,6 +546,8 @@ class FakeSurface:
 
     @property
     def running(self) -> bool:
+        # Keyed on stop, never on end_session: the whole point of phase 1f is
+        # that a surface whose SESSION has ended is still serving.
         return self.started > self.stopped
 
     @property
@@ -653,6 +679,14 @@ class FakeArchive:
         # The map as `names()` returned it at stop. The controller's whole reason
         # for passing a callable is that this is read LATE.
         self.names_at_stop: Optional[Dict[str, str]] = None
+        # Every post-session rename, and what this double answers with. The real
+        # class decides the outcome from the document on disk; a double that
+        # always reported success would make the controller's severity routing
+        # — which is how the operator learns their name did NOT land —
+        # unfalsifiable.
+        self.renames: List[tuple] = []
+        self.rename_result = RenameOutcome(applied=True, reason="applied")
+        self.rename_error: Optional[BaseException] = None
         self.timeline: List[str] = []
 
     @property
@@ -662,6 +696,13 @@ class FakeArchive:
     @property
     def transcript_path(self):
         return self._transcript_path
+
+    def rename_speaker(self, label, name) -> RenameOutcome:
+        _bind_against(LiveArchive.rename_speaker, label, name)
+        self.renames.append((label, name))
+        if self.rename_error is not None:
+            raise self.rename_error
+        return self.rename_result
 
     def __enter__(self) -> "FakeArchive":
         _bind_against(LiveArchive.__enter__)
@@ -5384,3 +5425,503 @@ def test_a_busy_device_opens_no_prompt_and_claims_nothing(controller):
     assert "offload" in joined or "transfer" in joined, (
         "the operator was not told why `l` did nothing"
     )
+
+
+# ---------------------------------------------------------------------------
+# Post-session naming (phase 1f) -- the window outlives the call
+# ---------------------------------------------------------------------------
+#
+# This reverses `live_surface_prd.md` FR-1.6, which made shutdown-at-session-end
+# a security property. The reversal is argued in `post_session_naming_prd.md`
+# §5: the labels most worth naming are the ones AssemblyAI revises in as a call
+# ends, and taking the page down at that instant is what made the operator type
+# a name into a dead window. Every control that made the live window safe is
+# retained, and the tests below assert that rather than assume it.
+
+
+def test_the_server_keeps_serving_after_the_session_ends(live):
+    """FR-1.1. The narrow half of `stop()`: the call is over, the page is not.
+
+    MUTATION: make `end_session` call `stop()`.
+    """
+    surface = live.surface()
+    surface.publish(LiveTurn(channel=LiveChannel.FAR, text="hello",
+                             speaker="A", turn_order=0, is_final=True))
+
+    surface.end_session()
+
+    assert surface.running is True
+    status, body, _headers = _get_as_page(surface)
+    assert status == 200
+    assert "<header>" in body
+
+
+def test_naming_still_works_after_the_session_ends(live):
+    """FR-1.3 and FR-3.1 -- the operator's actual complaint, as a test.
+
+    MUTATION: keep clearing `_names` in `end_session`; or refuse `/names` once
+    `_session_live` is False.
+    """
+    surface = live.surface()
+    surface.publish(LiveTurn(channel=LiveChannel.FAR, text="hello",
+                             speaker="A", turn_order=0, is_final=True))
+    surface.end_session()
+
+    status, _body = _post_as_page(surface, {"label": "A", "name": "Dana"})
+
+    assert status == 200
+    assert surface.speaker_names() == {"A": "Dana"}
+
+
+def test_names_typed_during_the_call_survive_the_call_ending(live):
+    """FR-1.1. The map is what the operator built WHILE the call ran.
+
+    Clearing it at the end would silently undo an hour of naming at the exact
+    moment they can no longer watch it happen: the panel empties, every line
+    reverts to `Speaker A`, and the archived transcript — rendered from this
+    same map — is the one that was already correct.
+
+    MUTATION: clear `_names` in `end_session`, which is what `stop()` does and
+    is the single most natural way to write this wrong.
+    """
+    surface = live.surface()
+    surface.publish(LiveTurn(channel=LiveChannel.FAR, text="hello",
+                             speaker="A", turn_order=0, is_final=True))
+    surface.set_name("A", "Dana")
+
+    surface.end_session()
+
+    assert surface.speaker_names() == {"A": "Dana"}
+    page = live.page(surface)
+    turns = [p for p in page.read(5, timeout=2.0) if p.get("kind") == "turn"]
+    assert [t["display_name"] for t in turns] == ["Dana"]
+
+
+def test_a_name_typed_after_the_session_reaches_lines_already_on_screen(live):
+    """FR-1.3. The projection is render-time, so it must still reach back.
+
+    A page opened AFTER the call gets the whole ring replayed through the new
+    map -- which is what makes naming a late-arriving speaker worth anything.
+    """
+    surface = live.surface()
+    surface.publish(LiveTurn(channel=LiveChannel.FAR, text="first",
+                             speaker="A", turn_order=0, is_final=True))
+    surface.publish(LiveTurn(channel=LiveChannel.FAR, text="second",
+                             speaker="A", turn_order=1, is_final=True))
+    surface.end_session()
+    surface.set_name("A", "Dana")
+
+    page = live.page(surface)
+    payloads = page.read(6, timeout=2.0)
+    turns = [p for p in payloads if p.get("kind") == "turn"]
+
+    assert len(turns) == 2
+    assert {t["display_name"] for t in turns} == {"Dana"}
+
+
+def test_the_session_token_still_authorises_after_the_session_ends(live):
+    """FR-1.1. The credential outlives the call because the page does.
+
+    Its lifetime is still bounded by the window's, not by a clock: `stop()`
+    retires it, and `close_window()` is the only thing that calls `stop()`.
+    """
+    surface = live.surface()
+    token = surface.token
+    surface.end_session()
+
+    assert surface.authorises(token) is True
+
+    surface.stop()
+
+    assert surface.authorises(token) is False
+
+
+def test_ending_the_session_clears_the_live_indicator(live):
+    """FR-1.2, and it is a SECURITY control, not decoration.
+
+    `live_surface_prd.md` FR-2.5 makes the indicator mean "audio is leaving this
+    machine". Leaving it lit with no stream would be worse than closing the
+    window: an indicator that lies about a metered egress path teaches the
+    operator to stop believing it, and this project has shipped that defect
+    once already.
+
+    MUTATION: have `end_session` broadcast `live: True`, or broadcast nothing.
+    """
+    surface = live.surface()
+    page = live.page(surface)
+    page.read(2, timeout=2.0)
+
+    surface.end_session()
+
+    statuses = [p for p in page.read(3, timeout=2.0) if p.get("kind") == "status"]
+    assert statuses, "the page was never told the session ended"
+    assert statuses[-1]["live"] is False
+
+
+def test_ending_the_session_twice_broadcasts_once(live):
+    """Idempotent. Teardown reaches here from more than one path."""
+    surface = live.surface()
+    page = live.page(surface)
+    page.read(2, timeout=2.0)
+
+    surface.end_session()
+    surface.end_session()
+    surface.end_session()
+
+    statuses = [p for p in page.read(4, timeout=1.0) if p.get("kind") == "status"]
+    assert len(statuses) == 1
+
+
+def test_the_page_renders_an_ended_state_that_is_not_the_live_state(page_source):
+    """FR-1.2. The two states must not be mistakable for one another.
+
+    Read off the served page: the ended badge exists, starts hidden, and says
+    naming still works -- so the operator is told the affordance is there rather
+    than having to discover it by trying.
+    """
+    assert 'id="ended"' in page_source
+    assert 'id="ended" hidden' in page_source
+    assert "names can still be changed" in page_source
+    assert 'id="panel-ended"' in page_source
+    # The live indicator keeps its own distinct identity and its pulsing dot.
+    assert 'id="live-indicator"' in page_source
+    assert "#ended" in page_source and "#live-indicator" in page_source
+
+
+def test_the_page_never_overwrites_billed_seconds_with_unknown(page_source):
+    """Two status messages arrive at the end of a call and only one carries the
+    durations. A metered feature reporting `unknown` for a number it was told is
+    worse than one that stays quiet.
+
+    MUTATION: drop the `in status` guard, which restores the old unconditional
+    write and makes the ordering of two payloads decide what the bill reads.
+    """
+    body = page_source.split("function onStatus")[1].split("function onProblem")[0]
+    assert '"near_seconds" in status' in body
+    assert '"far_seconds" in status' in body
+
+
+def test_set_name_forwards_to_the_rename_sink(live):
+    """FR-3.1's seam. The page is updated first; the archive second."""
+    surface = live.surface()
+    seen: List[tuple] = []
+    surface.attach_rename_sink(lambda label, name: seen.append((label, name)))
+
+    surface.set_name("A", "Dana")
+    surface.set_name("A", "")
+
+    assert seen == [("A", "Dana"), ("A", None)]
+    # Cleared is `None`, not `""`: the archive's "clear this name" branch keys
+    # on falsiness, but a caller passing the empty string through would make
+    # `rename_speaker`'s signature and the surface's disagree about the value
+    # that means "no name".
+
+
+def test_the_sink_receives_the_name_the_page_was_given_not_the_raw_input(live):
+    """FR-3.5's bound applies to the archive too. 64 chars, stripped.
+
+    MUTATION: forward `name` instead of `cleaned`, which would put an unbounded,
+    unstripped string into a document under YAML frontmatter.
+    """
+    surface = live.surface()
+    seen: List[tuple] = []
+    surface.attach_rename_sink(lambda label, name: seen.append((label, name)))
+
+    surface.set_name("A", "   " + "D" * 200 + "   ")
+
+    assert seen == [("A", "D" * 64)]
+    assert surface.speaker_names()["A"] == "D" * 64
+
+
+def test_a_sink_that_raises_costs_the_archive_and_not_the_name(live):
+    """FR-ERR-3. The page is what the operator is looking at; it cannot fail
+    because a file on a Drive mount did.
+
+    MUTATION: let the sink's exception propagate, which turns a name into a 500
+    and loses it.
+    """
+    surface = live.surface()
+
+    def exploding(label, name):
+        raise OSError("the mount went away")
+
+    surface.attach_rename_sink(exploding)
+
+    status, _body = _post_as_page(surface, {"label": "A", "name": "Dana"})
+
+    assert status == 200
+    assert surface.speaker_names() == {"A": "Dana"}
+
+
+def test_the_sink_is_called_without_holding_the_surface_lock(live):
+    """A deadlock, not a nicety.
+
+    `LiveArchive.stop()` holds `_finalise_lock` while it renders, and rendering
+    calls `speaker_names()`, which takes the surface lock. `rename_speaker`
+    takes `_finalise_lock`. If `set_name` called the sink while holding the
+    surface lock, the teardown thread would hold `_finalise_lock` wanting the
+    surface lock while the HTTP thread held the surface lock wanting
+    `_finalise_lock` -- the operator's keystroke deadlocked against the end of
+    their own call.
+
+    Asserted by having the sink do from ANOTHER thread exactly what the render
+    does: take the surface lock. If `set_name` still holds it, this blocks.
+
+    MUTATION: move the sink call inside the `with self._lock:` block.
+    """
+    surface = live.surface()
+    reached = threading.Event()
+
+    def sink(label, name):
+        def other_thread():
+            surface.speaker_names()
+            reached.set()
+
+        worker = threading.Thread(target=other_thread, daemon=True)
+        worker.start()
+        worker.join(timeout=2.0)
+
+    surface.attach_rename_sink(sink)
+    surface.set_name("A", "Dana")
+
+    assert reached.is_set(), "set_name held its lock across the sink call"
+
+
+def test_stopping_the_surface_drops_the_sink(live):
+    """A torn-down surface must not be able to call into a finalised archive."""
+    surface = live.surface()
+    seen: List[tuple] = []
+    surface.attach_rename_sink(lambda label, name: seen.append((label, name)))
+
+    surface.stop()
+    surface.set_name("A", "Dana")
+
+    assert seen == []
+
+
+# -- the controller's half ---------------------------------------------------
+
+
+def _ended_with_transcript(controller, tmp_path):
+    """A finished session that actually wrote a transcript, so the window stays."""
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.controller.start()
+    archive = harness.archive
+    archive._wav_path = tmp_path / "archive" / "call.mp3"
+    archive._transcript_path = tmp_path / "archive" / "call.md"
+    harness.controller.stop()
+    return harness
+
+
+def test_a_finished_call_leaves_the_window_open(controller, tmp_path):
+    """FR-1.1 at the controller. The session ends; the window does not.
+
+    MUTATION: call `surface.stop()` in `_teardown` as it did before phase 1f.
+    """
+    harness = _ended_with_transcript(controller, tmp_path)
+
+    assert harness.controller.is_live is False
+    assert harness.surface.ended == 1
+    assert harness.surface.stopped == 0
+    assert harness.resumes == 1, "the device claim must still be released"
+
+
+def test_the_reopen_url_is_offered_when_the_window_survives(controller, tmp_path):
+    """FR-5.4, applied to the half of the call it never covered.
+
+    The most likely thing an operator does when a call ends is close the window
+    — and the launch ticket minted at session start expired minutes ago. Without
+    a fresh one the feature is reachable only by whoever happened not to close a
+    tab, which is not a feature, it is luck.
+
+    MUTATION: reuse `surface.url` (credential-free, so it cannot open a first
+    window), or mint the SHORT launch TTL, which expires before the sentence
+    announcing it can be read.
+    """
+    harness = _ended_with_transcript(controller, tmp_path)
+
+    said = [e.message for e in harness.events
+            if isinstance(e, Error) and "still open" in e.message]
+    assert said, "the operator was never told the window survived"
+    assert "Reopen it at" in said[-1]
+    assert "?k=" in said[-1], "a credential-free URL cannot open a first window"
+    # Minted at the READABLE lifetime, not the 10s launch one.
+    assert harness.surface.ticket_ttls[-1] == 300.0
+
+
+def test_the_reopen_url_is_not_offered_when_the_window_closed(controller, tmp_path):
+    """Naming a URL that resolves to nothing is worse than naming none."""
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.controller.start()
+    harness.archive._wav_path = tmp_path / "archive" / "call.mp3"
+    harness.archive._transcript_path = None
+
+    harness.controller.stop()
+
+    said = [e.message for e in harness.events if isinstance(e, Error)]
+    assert not any("Reopen it at" in m for m in said)
+    assert not any("still open" in m for m in said)
+
+
+def test_a_session_that_wrote_no_transcript_closes_its_window(controller, tmp_path):
+    """The window is kept for a DOCUMENT to name into. With none there is
+    nothing to name, and a bound server serving an empty page is the disclosure
+    surface FR-1.6 named with none of the benefit.
+
+    MUTATION: keep the window unconditionally -- which also leaves one up after
+    a start that failed before the pump ever owned the session.
+    """
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.controller.start()
+    harness.archive._wav_path = tmp_path / "archive" / "call.mp3"
+    harness.archive._transcript_path = None
+
+    harness.controller.stop()
+
+    assert harness.surface.stopped >= 1
+    assert harness.surface.ended == 0
+
+
+def test_a_failed_start_never_leaves_a_window_serving(controller):
+    """A start that raised before the pump owned the session was never a call."""
+    harness = controller()
+
+    def refusing_subscribe(fn):
+        raise RuntimeError("subscriber table is full")
+
+    harness.bus.subscribe = refusing_subscribe
+
+    with pytest.raises(LiveSessionError):
+        harness.controller.start()
+
+    assert harness.surface.stopped >= 1
+    assert harness.surface.ended == 0
+
+
+def test_the_next_session_closes_the_previous_window_before_it_opens(
+    controller, tmp_path,
+):
+    """FR-1.4, and it is not tidiness.
+
+    Two surfaces subscribed to the bus at once would put this session's turns on
+    the LAST session's page -- a transcript leaking across calls. So the close
+    happens in `start()`, before anything subscribes.
+
+    MUTATION: close the old window in `_teardown` (which defeats the feature) or
+    after the new subscription (which leaks).
+    """
+    harness = _ended_with_transcript(controller, tmp_path)
+    first = harness.surface
+    assert first.stopped == 0
+
+    harness.controller.start()
+    second = harness.surface
+
+    assert second is not first
+    assert first.stopped == 1
+    assert first.rename_sink is None
+    # The old page is off the bus, so this session's turns cannot reach it.
+    first.published.clear()
+    harness.bus.publish(Error(message="after", severity=Severity.INFO, context="live"))
+    assert first.published == []
+
+
+def test_app_shutdown_closes_a_window_a_finished_call_left_open(
+    controller, tmp_path,
+):
+    """FR-1.4's other half. A page outliving the process that owns it is exactly
+    the disclosure surface the original FR-1.6 was written against.
+
+    MUTATION: make `shutdown()` an alias for `stop()`.
+    """
+    harness = _ended_with_transcript(controller, tmp_path)
+    assert harness.surface.stopped == 0
+
+    harness.controller.shutdown(reason="app shutting down")
+
+    assert harness.surface.stopped == 1
+
+
+def test_shutdown_is_safe_when_nothing_ever_ran(controller):
+    """It runs from a signal handler, so it must be a no-op rather than a raise."""
+    harness = controller()
+
+    harness.controller.shutdown(reason="app shutting down")
+
+    assert harness.controller.is_live is False
+
+
+def test_closing_the_window_twice_is_a_no_op(controller, tmp_path):
+    harness = _ended_with_transcript(controller, tmp_path)
+
+    harness.controller.close_window()
+    harness.controller.close_window()
+
+    assert harness.surface.stopped == 1
+
+
+def test_the_rename_sink_is_attached_only_when_there_is_a_recorder(
+    controller, tmp_path,
+):
+    """A transcript-only session has nothing on disk for a rename to change, and
+    a sink that silently discarded names would be worse than none at all."""
+    with_archive = controller(archive_dir=tmp_path / "archive")
+    with_archive.controller.start()
+    assert with_archive.surface.rename_sink is not None
+
+    without = controller(archive_dir=None)
+    without.controller.start()
+    assert without.surface.rename_sink is None
+
+
+def test_a_post_session_rename_is_reported_to_the_operator(controller, tmp_path):
+    """FR-3.3. The operator is changing a file the call-processing pipeline
+    reads; that write is announced, not silent.
+
+    MUTATION: drop the `_say`, or report every outcome at INFO -- which would
+    render "the transcript was changed elsewhere" in the same style as success.
+    """
+    harness = _ended_with_transcript(controller, tmp_path)
+    harness.archive.rename_result = RenameOutcome(
+        applied=True, reason="applied", message="call.md: Speaker 1 is now Dana."
+    )
+
+    harness.surface.rename_sink("A", "Dana")
+
+    said = [e for e in harness.events if isinstance(e, Error) and "Dana" in e.message]
+    assert said, "the archive write was never announced"
+    assert said[-1].severity is Severity.INFO
+    assert said[-1].context == "live"
+
+
+def test_a_refused_rename_is_reported_as_a_warning_not_as_success(
+    controller, tmp_path,
+):
+    """Every non-applied outcome that carries a message means the document does
+    NOT say what the panel says. That is a warning."""
+    harness = _ended_with_transcript(controller, tmp_path)
+    harness.archive.rename_result = RenameOutcome(
+        applied=False, reason="anchor-gone",
+        message="call.md: it no longer contains Speaker 1.",
+    )
+
+    harness.surface.rename_sink("A", "Dana")
+
+    said = [e for e in harness.events if isinstance(e, Error)
+            and "no longer contains" in e.message]
+    assert said
+    assert said[-1].severity is Severity.WARNING
+
+
+def test_an_outcome_with_no_message_says_nothing(controller, tmp_path):
+    """Nothing written yet, and already-says-that, are not events."""
+    harness = _ended_with_transcript(controller, tmp_path)
+    before = len([e for e in harness.events if isinstance(e, Error)])
+    harness.archive.rename_result = RenameOutcome(
+        applied=False, reason="no-transcript"
+    )
+
+    harness.surface.rename_sink("A", "Dana")
+
+    after = len([e for e in harness.events if isinstance(e, Error)])
+    assert after == before

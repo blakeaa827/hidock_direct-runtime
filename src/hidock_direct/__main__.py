@@ -242,7 +242,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         # no session is running, and its wait on the pump thread is capped at
         # 5s, so the handler is bounded rather than blocking indefinitely.
         try:
-            live.stop(reason="app shutting down")
+            # `shutdown`, not `stop`: `stop` deliberately leaves the naming
+            # window serving after a call so late diarization labels can still
+            # be named, and on the way out there is nothing left to leave it up
+            # for. A page outliving the process that owns it is the disclosure
+            # surface the surface PRD was written against.
+            live.shutdown(reason="app shutting down")
         finally:
             # Unconditional: a live teardown that failed must still end the
             # app, and this is the only call that releases `app.run()`.
@@ -272,8 +277,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         # lock file makes the NEXT launch fail, which is a worse failure than
         # the one being handled.
         try:
-            if live.is_live:
-                live.stop(reason="app shutting down")
+            # Unconditional, where this used to be gated on `is_live`: a
+            # session that has already ended can still be holding its naming
+            # window open, and that window is exactly what has to come down here.
+            # `shutdown` is a no-op when there is neither.
+            live.shutdown(reason="app shutting down")
         finally:
             tui.stop()
             lock.release()

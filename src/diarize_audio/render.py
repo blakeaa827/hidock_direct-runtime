@@ -72,13 +72,10 @@ def render_markdown(
     lines.append("")
     lines.append(f"# {heading_dt}")
     lines.append("")
-    speaker_map: dict[str, int] = {}
+    labels = speaker_labels(transcript, speaker_names)
     for u in utterances:
         raw_speaker = u.get("speaker") or "?"
-        if raw_speaker not in speaker_map:
-            speaker_map[raw_speaker] = len(speaker_map) + 1
-        num = speaker_map[raw_speaker]
-        label = _speaker_label(raw_speaker, num, speaker_names)
+        label = labels[raw_speaker]
         start_ms = int(u.get("start") or 0)
         mm, ss = divmod(start_ms // 1000, 60)
         text = (u.get("text") or "").strip()
@@ -87,6 +84,35 @@ def render_markdown(
     body = "\n".join(lines)
     # Ensure single trailing newline.
     return body.rstrip("\n") + "\n"
+
+
+def speaker_labels(
+    transcript: dict[str, Any],
+    speaker_names: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """The `raw provider key -> bold label text` map this document renders with.
+
+    Extracted so a caller that must find a label it already emitted — to
+    substitute a name into a document without re-rendering it — asks the
+    renderer what it wrote rather than reconstructing the rule. Two matching
+    expressions in two files is the arrangement that goes stale silently, and
+    the consequence here is a substitution anchored on a label the document
+    does not contain.
+
+    Numbering is first-appearance order over ALL speakers and is independent of
+    `speaker_names`, so naming one speaker never renumbers another.
+
+    Returns the label TEXT, without the surrounding `**`: the emphasis belongs
+    to the line format, which is this module's business and not the caller's.
+    """
+    labels: dict[str, str] = {}
+    for u in transcript.get("utterances") or []:
+        raw_speaker = u.get("speaker") or "?"
+        if raw_speaker not in labels:
+            labels[raw_speaker] = _speaker_label(
+                raw_speaker, len(labels) + 1, speaker_names
+            )
+    return labels
 
 
 # Characters that would end the current line. A name carrying one of these could
