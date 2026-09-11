@@ -237,7 +237,20 @@ PAGE = """<!doctype html>
     animation: pulse 1.6s ease-in-out infinite;
   }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .25 } }
-  #conn { margin-left: auto; font-size: .8rem; color: #98a0ab; }
+  #controls { margin-left: auto; display: flex; gap: .5rem; align-items: center; }
+  #controls button {
+    background: #22262c; border: 1px solid #3a4049; border-radius: 5px;
+    color: #e8eaed; font: inherit; font-size: .8rem; padding: .3rem .7rem;
+    cursor: pointer;
+  }
+  #controls button:hover:not(:disabled) { background: #2b3037; }
+  #controls button:disabled { opacity: .35; cursor: default; }
+  /* Armed is a WARNING colour, not a success one: the next click ends
+     something. The two states must not be mistakable at a glance. */
+  #controls button.armed {
+    background: #4a2f12; border-color: #e0a33e; color: #ffd79a; font-weight: 600;
+  }
+  #conn { font-size: .8rem; color: #98a0ab; }
   #conn.ok { color: #6bbf73; }
   #conn.bad { color: #e0a33e; }
   #billed { font-size: .8rem; color: #98a0ab; }
@@ -280,6 +293,10 @@ PAGE = """<!doctype html>
   <span id="live-indicator"><span class="dot"></span>LIVE — audio is streaming to AssemblyAI</span>
   <span id="ended" hidden>Call ended — names can still be changed</span>
   <span id="billed" hidden></span>
+  <span id="controls">
+    <button id="btn-stop" type="button" disabled>End recording</button>
+    <button id="btn-close" type="button" disabled>Close session</button>
+  </span>
   <span id="conn">connecting</span>
 </header>
 <main>
@@ -317,6 +334,8 @@ PAGE = """<!doctype html>
   var panelEnded = document.getElementById("panel-ended");
   var billed = document.getElementById("billed");
   var conn = document.getElementById("conn");
+  var btnStop = document.getElementById("btn-stop");
+  var btnClose = document.getElementById("btn-close");
   var tpl = document.getElementById("speaker-row");
   var names = {};
   var labels = [];
@@ -451,10 +470,79 @@ PAGE = """<!doctype html>
     return (value === null || value === undefined) ? "unknown" : Math.round(value) + "s";
   }
 
+  // ---- the two lifecycle buttons -------------------------------------------
+  // `closing` is the page's own memory of what it ASKED FOR, and it is the only
+  // thing that can tell a deliberate close from a dropped connection: both
+  // arrive at `stream.onerror` as an identical event. Without it a session the
+  // operator ended themselves reads as "reconnecting", forever -- a status line
+  // that lies about a server nobody is coming back to.
+  var closing = false;
+  var live = null;
+
+  // Two clicks, never one. A keystroke in a focused terminal is deliberate; a
+  // click in a browser window sitting over a video call is not, and ending a
+  // call by accident splits it into two recordings, two transcripts and a
+  // second billed transcription session.
+  function arm(button, label, action) {
+    var timer = null;
+    function disarm() {
+      button.classList.remove("armed");
+      button.textContent = label;
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+    }
+    button.addEventListener("click", function () {
+      if (button.disabled) { return; }
+      if (!button.classList.contains("armed")) {
+        button.classList.add("armed");
+        button.textContent = "Confirm: " + label.toLowerCase();
+        // Disarms itself, so a half-pressed button left behind another window
+        // is not still one click from ending a call an hour later.
+        timer = setTimeout(disarm, 5000);
+        return;
+      }
+      disarm();
+      button.disabled = true;
+      if (action === "close") { closing = true; }
+      fetch("/" + action, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      }).catch(function () {
+        // `/close` tears down the socket this request is riding on, so a
+        // rejected promise here is the EXPECTED outcome, not a failure.
+        if (action !== "close") { closing = false; }
+      });
+    });
+    return disarm;
+  }
+
+  var disarmStop = arm(btnStop, "End recording", "stop");
+  var disarmClose = arm(btnClose, "Close session", "close");
+
+  // Driven by the STATUS stream, never by what this page last clicked -- so a
+  // session ended from the `l` key updates these buttons without a reload, and
+  // two windows onto the same session agree.
+  function paintControls() {
+    if (closing) {
+      btnStop.disabled = true;
+      btnClose.disabled = true;
+      return;
+    }
+    btnStop.disabled = live !== true;
+    // Unavailable while live, so no single control can both end a call and
+    // destroy the only window its speakers could be named in.
+    btnClose.disabled = live !== false;
+    if (btnStop.disabled) { disarmStop(); }
+    if (btnClose.disabled) { disarmClose(); }
+  }
+
   // The indicator tracks the SESSION, not traffic (§5). A quiet call emits no
   // turns for minutes and the indicator must stay lit: audio is still leaving
   // the machine.
   function onStatus(status) {
+    live = !!status.live;
+    paintControls();
     if (status.live) {
       indicator.hidden = false;
       ended.hidden = true;
@@ -498,6 +586,23 @@ PAGE = """<!doctype html>
     conn.className = "ok";
   };
   stream.onerror = function () {
+    if (closing) {
+      // The operator closed this session. The server is gone on purpose, the
+      // browser will retry forever, and saying "reconnecting" would describe a
+      // recovery that is never coming.
+      stream.close();
+      conn.textContent = "session closed";
+      conn.className = "";
+      indicator.hidden = true;
+      ended.hidden = true;
+      panelEnded.hidden = true;
+      feed.setAttribute("aria-disabled", "true");
+      document.querySelectorAll("#rows input").forEach(function (el) {
+        el.disabled = true;
+      });
+      paintControls();
+      return;
+    }
     if (dropped !== null) { return; }
     dropped = setTimeout(function () {
       conn.textContent = "reconnecting";
@@ -643,7 +748,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             log.warning("live surface: rejected an unauthenticated request")
             self._refuse()
             return
-        if path != "/names":
+        if path not in ("/names", "/stop", "/close"):
             self._respond(404, b"not found", "text/plain; charset=utf-8")
             return
 
@@ -658,12 +763,34 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             # Named apart from the origin refusal because they are different
             # facts, and a log line that reports the wrong one sends the next
             # reader after the wrong thing.
-            log.warning("live surface: rejected a /names write with a non-JSON body")
+            log.warning("live surface: rejected a %s write with a non-JSON body", path)
             self._refuse()
             return
         if not self._same_origin_post():
-            log.warning("live surface: rejected a /names write from another origin")
+            log.warning("live surface: rejected a %s write from another origin", path)
             self._refuse()
+            return
+
+        if path in ("/stop", "/close"):
+            # No body is read at all. These carry no arguments, so reading one
+            # would be attack surface for nothing — and the two checks above,
+            # which are what make a cross-origin POST impossible, have already
+            # run. The response is sent BEFORE the transition (FR-2.3): the
+            # `/close` path shuts down this very socket, and `/stop` transcodes.
+            action = path.lstrip("/")
+            # Answered BEFORE dispatching, and the order is load-bearing rather
+            # than tidy: `/close` tears down the server this response has to
+            # travel on, so acting first would hand the operator a connection
+            # reset for an action that succeeded — which reads as a failure and
+            # invites a retry against a server that is already gone.
+            #
+            # No explicit flush, because there is nothing to flush: `wbufsize`
+            # is 0 on `BaseHTTPRequestHandler`, so `wfile` is a `_SocketWriter`
+            # that `sendall`s on every write. A `flush()` here would be a line
+            # that does nothing and a comment claiming it mattered. If that ever
+            # changes, this is the site that needs a real flush.
+            self._respond(200, b'{"status":"accepted"}', "application/json")
+            surface.request_control(action)
             return
 
         payload = self._body()
@@ -927,6 +1054,22 @@ def _split(target: str):
 # ---------------------------------------------------------------------------
 
 
+def _spawn_control(sink: Callable[[], None], name: str) -> None:
+    """Run one control action off the request thread, and never raise into it.
+
+    A daemon thread because the app must still be able to exit while one is in
+    flight; the transitions themselves are individually idempotent and
+    generation-stamped, so a half-run one cannot corrupt the next session.
+    """
+    def run() -> None:
+        try:
+            sink()
+        except Exception as exc:  # noqa: BLE001 - already reported on the bus
+            log.warning("live: a control action failed (%s)", type(exc).__name__)
+
+    threading.Thread(target=run, name=name, daemon=True).start()
+
+
 class LiveSurface:
     """The page, the SSE stream, the ring, and the operator's name map."""
 
@@ -964,6 +1107,13 @@ class LiveSurface:
         # controller when it builds the recorder, and dropped on `stop()` so a
         # torn-down surface can never call into a finalised archive.
         self._rename_sink: Optional[Callable[[str, Optional[str]], None]] = None
+        # The two lifecycle transitions, injected the same way and for the same
+        # reason: the surface must not know what a controller is. Neither is
+        # called on the request thread — see `request_control`.
+        self._control_sinks: Dict[str, Callable[[], None]] = {}
+        # How work leaves the request thread. Injectable so a test asserts the
+        # ORDER of "responded, then acted" instead of racing a real thread.
+        self._spawn_control = _spawn_control
         self._started_at = time.monotonic()
         self._seq = 0
 
@@ -1016,6 +1166,48 @@ class LiveSurface:
         """
         self._rename_sink = sink
 
+    def attach_control_sinks(
+        self,
+        *,
+        stop: Optional[Callable[[], None]] = None,
+        close: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Wire the page's two buttons to the controller's two transitions.
+
+        Attached rather than constructed here for the same reason as the rename
+        sink: a surface that could reach a `LiveSessionController` could not be
+        tested without one.
+        """
+        self._control_sinks = {
+            name: sink
+            for name, sink in (("stop", stop), ("close", close))
+            if sink is not None
+        }
+
+    def request_control(self, action: str) -> bool:
+        """Ask for a lifecycle transition. Returns whether one was dispatched.
+
+        Returns BEFORE the transition happens, and that is the requirement
+        rather than a convenience (FR-2.3). `controller.stop()` joins the
+        capture pump for five seconds and then transcodes the recording — tens
+        of seconds on a long call — and `close_window()` shuts down the very
+        socket the HTTP response has to travel on. Doing either inline is a
+        browser timeout at best and a response that never arrives at worst.
+
+        So the page is told "accepted" and learns what actually happened from
+        the SSE stream, which is the same route a stop from the `l` key takes.
+        One route, so the two cannot diverge.
+
+        `False` means nothing was wired — a composition with no controller —
+        and is NOT an error to the caller: the endpoint is still authorised and
+        still idempotent, there is simply nothing to do.
+        """
+        sink = self._control_sinks.get(action)
+        if sink is None:
+            return False
+        self._spawn_control(sink, f"hidock-live-{action}")
+        return True
+
     def end_session(self) -> None:
         """The call is over. The window stays up so names can still be changed.
 
@@ -1053,6 +1245,7 @@ class LiveSurface:
         self._running = False
         self._session_live = False
         self._rename_sink = None
+        self._control_sinks = {}
 
         with self._lock:
             subscribers = list(self._subscribers)
@@ -1860,6 +2053,15 @@ class LiveSessionController:
             self._capture = capture
             transcriber = self._transcriber_factory(
                 self._bus, api_key=self._api_key, max_speakers=session_max_speakers
+            )
+            # The page's two buttons, wired to the transitions that already
+            # own the device claim, the archive and the offload resumption —
+            # never to a second implementation of them (FR-2.2). `stop` names
+            # its reason the way the `l` key does, so the operator can tell
+            # where a stop came from in the log.
+            surface.attach_control_sinks(
+                stop=lambda: self.stop(reason="stopped from the live window"),
+                close=self.close_window,
             )
             archive = self._new_archive(surface)
             self._archive = archive

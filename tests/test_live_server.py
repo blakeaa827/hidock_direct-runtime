@@ -450,6 +450,10 @@ class FakeSurface:
         # live one's transcript.
         self.rename_sink: Optional[Callable] = None
         self.sink_history: List[str] = []
+        # The page's two lifecycle buttons. Held as a dict exactly like the real
+        # surface, so a controller that wired only one is visible.
+        self.control_sinks: Dict[str, Callable] = {}
+        self.control_requests: List[str] = []
         self.start_error: Optional[BaseException] = None
         self.stop_error: Optional[BaseException] = None
         self.end_error: Optional[BaseException] = None
@@ -498,6 +502,26 @@ class FakeSurface:
         if self.end_error is not None:
             raise self.end_error
 
+    def attach_control_sinks(self, *, stop=None, close=None) -> None:
+        _bind_against(LiveSurface.attach_control_sinks, stop=stop, close=close)
+        self.control_sinks = {
+            name: sink for name, sink in (("stop", stop), ("close", close))
+            if sink is not None
+        }
+
+    def request_control(self, action) -> bool:
+        _bind_against(LiveSurface.request_control, action)
+        self.control_requests.append(action)
+        sink = self.control_sinks.get(action)
+        if sink is None:
+            return False
+        # Called SYNCHRONOUSLY here on purpose: the real surface hands this to a
+        # thread, and a double that did the same would make every assertion
+        # about the effect a race. The off-thread requirement is asserted
+        # directly, against the real surface, by the ordering test.
+        sink()
+        return True
+
     def attach_rename_sink(self, sink) -> None:
         _bind_against(LiveSurface.attach_rename_sink, sink)
         self.rename_sink = sink
@@ -513,6 +537,7 @@ class FakeSurface:
         # the late read would still find the map populated.
         self.names = {}
         self.rename_sink = None
+        self.control_sinks = {}
         if self.stop_error is not None:
             raise self.stop_error
 
@@ -5934,3 +5959,382 @@ def test_an_outcome_with_no_message_says_nothing(controller, tmp_path):
 
     after = len([e for e in harness.events if isinstance(e, Error)])
     assert after == before
+
+
+# ---------------------------------------------------------------------------
+# Window controls (phase 1h) -- ending and closing from the page
+# ---------------------------------------------------------------------------
+
+
+def _ended_with_transcript_via_button(controller, tmp_path):
+    """A finished session ended from the PAGE rather than from the `l` key."""
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.controller.start()
+    harness.archive._wav_path = tmp_path / "archive" / "call.mp3"
+    harness.archive._transcript_path = tmp_path / "archive" / "call.md"
+    harness.surface.request_control("stop")
+    return harness
+
+
+def test_the_control_endpoints_reach_the_controllers_own_transitions(
+    controller, tmp_path,
+):
+    """FR-2.2. A route to the transitions, never a second implementation.
+
+    `stop` and `close_window` own the device claim, the archive finalisation
+    and the offload resumption. A button that reimplemented any of that would
+    be a second teardown to keep in agreement with the first.
+
+    MUTATION: have the endpoint set `_live = False` itself, or call
+    `surface.stop()` directly instead of `close_window()`.
+    """
+    harness = controller(archive_dir=tmp_path / "archive")
+    harness.controller.start()
+    assert set(harness.surface.control_sinks) == {"stop", "close"}
+    # A transcript exists, so the phase-1f rule applies and the window survives
+    # the stop -- which is what makes the second button reachable at all.
+    harness.archive._wav_path = tmp_path / "archive" / "call.mp3"
+    harness.archive._transcript_path = tmp_path / "archive" / "call.md"
+
+    harness.surface.request_control("stop")
+
+    assert harness.controller.is_live is False
+    assert harness.resumes == 1, "the device claim was not released"
+    assert harness.surface.ended == 1
+    assert harness.surface.stopped == 0, "the window went down with the session"
+
+
+def test_a_stop_from_the_window_says_where_it_came_from(controller, tmp_path):
+    """The operator can tell a button stop from an `l` stop in the log.
+
+    MUTATION: pass no reason, which collapses the two into one line -- the
+    defect `stop(reason=...)` was introduced to fix in the first place.
+    """
+    harness = _ended_with_transcript_via_button(controller, tmp_path)
+
+    said = [e.message for e in harness.events
+            if isinstance(e, Error) and "Live transcription ended" in e.message]
+    assert said, "the stop was never announced"
+    assert "live window" in said[-1], said[-1]
+
+
+def test_close_from_the_window_takes_the_surface_down(controller, tmp_path):
+    """FR-1.2. The third trigger for the same teardown, not a new lifetime."""
+    harness = _ended_with_transcript_via_button(controller, tmp_path)
+    assert harness.surface.stopped == 0
+
+    harness.surface.request_control("close")
+
+    assert harness.surface.stopped == 1
+
+
+def test_control_actions_are_idempotent(controller, tmp_path):
+    """FR-1.3/FR-1.4. A double click, a retry, or a click racing the `l` key.
+
+    MUTATION: drop the `if not self._live: return` guard in `stop`, or the
+    `_ended_surface is None` guard in `close_window`.
+    """
+    harness = _ended_with_transcript_via_button(controller, tmp_path)
+
+    harness.surface.request_control("stop")   # already ended
+    harness.surface.request_control("close")
+    harness.surface.request_control("close")
+
+    assert harness.surface.stopped == 1
+    assert harness.resumes == 1
+
+
+def test_a_composition_with_no_controller_refuses_nothing_and_does_nothing(live):
+    """FR: `request_control` returning False is not an error to the endpoint.
+
+    The route stays authorised and idempotent; there is simply nothing wired.
+    """
+    surface = live.surface()
+
+    assert surface.request_control("stop") is False
+    assert surface.request_control("close") is False
+
+
+def test_a_control_action_runs_OFF_the_request_thread(live):
+    """FR-2.3, and it is the load-bearing requirement of this whole PRD.
+
+    `controller.stop()` joins the capture pump for five seconds and then
+    transcodes; `close_window()` shuts down the socket the response has to
+    travel on. Doing either inline is a browser timeout at best and a response
+    that never arrives at worst.
+
+    Asserted on the THREAD, not on timing: the sink must not run on the thread
+    that asked for it.
+
+    MUTATION: call the sink directly in `request_control`.
+    """
+    surface = live.surface()
+    seen = {}
+    done = threading.Event()
+
+    def sink():
+        seen["thread"] = threading.current_thread()
+        done.set()
+
+    surface.attach_control_sinks(stop=sink)
+    caller = threading.current_thread()
+
+    assert surface.request_control("stop") is True
+    assert done.wait(timeout=3.0), "the action never ran"
+    assert seen["thread"] is not caller
+
+
+def test_the_response_is_sent_before_the_action_runs(live):
+    """FR-2.3 from the HTTP side: 'accepted' arrives, then the work happens."""
+    surface = live.surface()
+    release = threading.Event()
+    started = threading.Event()
+
+    def slow_sink():
+        started.set()
+        release.wait(timeout=5.0)
+
+    surface.attach_control_sinks(stop=slow_sink)
+
+    status, body = _post_as_page(surface, {}, path="/stop")
+
+    assert status == 200
+    assert "accepted" in body
+    assert started.wait(timeout=3.0), "the action never started"
+    release.set()
+
+
+def test_a_close_still_delivers_its_response_though_it_kills_the_socket(live):
+    """FR-2.3's actual failure mode, and the reason the order is not cosmetic.
+
+    `/close` tears down the server the response has to travel on. If the action
+    ran before the write, the operator's browser would get a connection reset
+    for an action that SUCCEEDED -- which reads as a failure and invites a
+    retry against a server that is already gone.
+
+    The sink here is the real teardown, so the race is genuine rather than
+    simulated: it stops this very surface.
+
+    MUTATION: move `request_control` above `_respond`.
+
+    No flush is involved and none is needed: `BaseHTTPRequestHandler.wbufsize`
+    is 0, so `wfile` is a `_SocketWriter` that `sendall`s on every write
+    (verified 2026-09-11). An explicit flush here was written, measured to be a
+    no-op by a mutation that no test could catch, and removed.
+    """
+    surface = live.surface()
+    gone = threading.Event()
+
+    def real_close():
+        surface.stop()
+        gone.set()
+
+    surface.attach_control_sinks(close=real_close)
+
+    status, body = _post_as_page(surface, {}, path="/close")
+
+    assert status == 200, "the response was lost to the teardown it triggered"
+    assert "accepted" in body
+    assert gone.wait(timeout=3.0), "the close never ran"
+    assert surface.running is False
+
+
+def test_the_handler_answers_a_control_route_before_dispatching_it(page_source):
+    """The ordering, read off the source.
+
+    The behavioural tests above cannot pin this on `/stop`: the dispatch is
+    asynchronous, so a handler that dispatched first would still answer
+    promptly and look identical. Only `/close` exposes it at runtime, and only
+    because it destroys its own socket. So the rule is also asserted directly,
+    where it is written.
+
+    MUTATION: move `request_control` above `_respond`.
+    """
+    source = (SRC / "live_server.py").read_text()
+    body = source.split('if path in ("/stop", "/close"):')[1].split("payload = self._body()")[0]
+    assert body.index("_respond(200") < body.index("request_control(action)"), (
+        "the action is dispatched before the request is answered"
+    )
+
+
+def test_a_control_sink_that_raises_never_reaches_the_request(live, caplog):
+    """FR-ERR-1/FR-ERR-2. The response is already sent; a raise must not escape
+    into the server's thread pool and must not take the surface with it."""
+    surface = live.surface()
+    ran = threading.Event()
+
+    def exploding():
+        ran.set()
+        raise RuntimeError("teardown blew up")
+
+    surface.attach_control_sinks(close=exploding)
+
+    with caplog.at_level(logging.WARNING):
+        status, _ = _post_as_page(surface, {}, path="/close")
+        assert ran.wait(timeout=3.0)
+        # The thread has to finish unwinding before its log record exists.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if any("control action failed" in r.getMessage() for r in caplog.records):
+                break
+            time.sleep(0.02)
+
+    assert status == 200
+    assert surface.running is True, "a failed action took the surface down"
+    # Caught and REPORTED, not merely survived. An exception left to escape a
+    # daemon thread prints to stderr, which no operator is reading, and this
+    # test would pass on "the surface is still up" alone.
+    assert any("control action failed" in r.getMessage() for r in caplog.records), (
+        "the failure was never reported: " + repr([r.getMessage() for r in caplog.records])
+    )
+    assert "teardown blew up" not in "\n".join(
+        r.getMessage() for r in caplog.records
+    ), "the log carries the raw exception text rather than its type"
+
+
+@pytest.mark.parametrize("path", ["/stop", "/close"])
+def test_a_control_post_without_the_cookie_is_refused(live, path):
+    """FR-ERR-3. These stop a capture session holding a USB device claim, so the
+    auth is exactly `/names`'s and is checked in the same order."""
+    surface = live.surface()
+    ran = threading.Event()
+    surface.attach_control_sinks(stop=ran.set, close=ran.set)
+
+    status, _ = _post(_url(surface, path), {}, cookie=None)
+
+    assert status == 403
+    assert not ran.is_set(), "an unauthenticated request performed the action"
+
+
+@pytest.mark.parametrize("path", ["/stop", "/close"])
+def test_a_control_post_from_another_origin_is_refused(live, path):
+    """The cookie is ambient: `SameSite` is computed on scheme+host and ignores
+    the PORT, so any other loopback page can attach it. This is the defect a
+    previous fix introduced, and the control routes must not reintroduce it.
+
+    MUTATION: check the origin after dispatching, or not at all.
+    """
+    surface = live.surface()
+    ran = threading.Event()
+    surface.attach_control_sinks(stop=ran.set, close=ran.set)
+
+    status, _ = _post(
+        _url(surface, path), {},
+        cookie=_session_cookie(surface),
+        headers={"Origin": "http://127.0.0.1:9"},
+    )
+
+    assert status == 403
+    assert not ran.is_set()
+
+
+@pytest.mark.parametrize("path", ["/stop", "/close"])
+def test_a_control_post_with_a_non_json_content_type_is_refused(live, path):
+    """A cross-origin form post cannot set this header; that is why it is checked."""
+    surface = live.surface()
+    ran = threading.Event()
+    surface.attach_control_sinks(stop=ran.set, close=ran.set)
+
+    status, _ = _post(
+        _url(surface, path), {},
+        cookie=_session_cookie(surface),
+        headers={"Content-Type": "text/plain"},
+    )
+
+    assert status == 403
+    assert not ran.is_set()
+
+
+def test_an_unknown_control_path_is_still_not_found(live):
+    """MUTATION: widen the path check to a prefix or a `startswith`."""
+    surface = live.surface()
+
+    status, _ = _post_as_page(surface, {}, path="/stop-everything")
+
+    assert status == 404
+
+
+def test_stopping_the_surface_drops_the_control_sinks(live):
+    """A torn-down surface must not be able to drive a finished controller."""
+    surface = live.surface()
+    surface.attach_control_sinks(stop=lambda: None, close=lambda: None)
+
+    surface.stop()
+
+    assert surface.request_control("stop") is False
+
+
+def test_no_log_record_carries_the_token_when_a_control_is_refused(live, caplog):
+    """NFR-3. The refusal is logged; the credential never is."""
+    surface = live.surface()
+    with caplog.at_level(logging.DEBUG):
+        _post(_url(surface, "/stop"), {}, cookie=None)
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert surface.token not in blob
+
+
+# -- the page's half ---------------------------------------------------------
+
+
+def test_the_page_carries_both_buttons_disabled_until_status_says_otherwise(
+    page_source,
+):
+    """FR-1.5. Painted from the stream, never from what the page last clicked."""
+    assert 'id="btn-stop"' in page_source
+    assert 'id="btn-close"' in page_source
+    assert page_source.count("disabled>") >= 2, "a button ships enabled"
+    assert "paintControls" in page_source
+
+
+def test_close_is_unavailable_while_the_session_is_live(page_source):
+    """FR-2.9. No single control may both end a call and destroy the window its
+    speakers could be named in.
+
+    MUTATION: `btnClose.disabled = false`, or key it on the same flag as stop.
+    """
+    body = page_source.split("function paintControls")[1].split("function ")[0]
+    assert "btnStop.disabled = live !== true" in body
+    assert "btnClose.disabled = live !== false" in body
+
+
+def test_each_button_needs_two_clicks(page_source):
+    """FR-2.8. A click in a browser over a video call is not a deliberate act.
+
+    MUTATION: fire on the first click; or never disarm, leaving a button one
+    click from ending a call an hour later.
+    """
+    body = page_source.split("function arm(")[1].split("var disarmStop")[0]
+    assert 'classList.contains("armed")' in body
+    assert "Confirm: " in body
+    assert "setTimeout(disarm" in body
+
+
+def test_a_deliberate_close_does_not_render_as_reconnecting(page_source):
+    """FR-2.6/FR-2.7, and the same class of defect as an indicator that will not
+    clear: a status line that lies about a server nobody is coming back to.
+
+    The discriminator is the page's own memory of what it asked for, because a
+    close and a drop arrive at `onerror` as an identical event.
+
+    MUTATION: drop the `closing` guard, or set it for `/stop` as well -- which
+    would make an ordinary end-of-call look like a closed session.
+    """
+    body = page_source.split("stream.onerror = function")[1].split("stream.onmessage")[0]
+    assert "if (closing)" in body
+    assert "session closed" in body
+    assert 'conn.textContent = "reconnecting"' in body, (
+        "a real drop must still say reconnecting"
+    )
+    # Structural, not textual: the closing branch must short-circuit BEFORE the
+    # reconnect timer is ever armed. Comparing substring positions would compare
+    # prose, since both words appear in the comments explaining them.
+    guard = body.index("if (closing)")
+    timer = body.index("dropped = setTimeout")
+    assert guard < timer
+    assert "return;" in body[guard:timer], (
+        "the closing branch falls through into the reconnect timer"
+    )
+    # Only `/close` arms it.
+    armed = page_source.split('if (action === "close")')[1][:60]
+    assert "closing = true" in armed
