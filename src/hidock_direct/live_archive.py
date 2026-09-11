@@ -404,10 +404,15 @@ class LiveArchive:
         operator_name: str,
         names: Optional[Callable[[], Mapping[str, str]]] = None,
         clock: Callable[[], datetime] = datetime.now,
+        keep_wav_dir: Optional[Path] = None,
     ):
         self._archive_dir = Path(archive_dir)
         self._bus = bus
         self._operator_name = operator_name or ""
+        # Diagnostic retention, off unless a path is named (FR-1.1). Read ONCE
+        # here rather than per frame (FR-1.6), and deliberately NOT defaulted to
+        # anywhere inside the archive — see `_keep_wav`.
+        self._keep_wav_dir = Path(keep_wav_dir) if keep_wav_dir else None
         self._names = names
         self._clock = clock
 
@@ -976,14 +981,64 @@ class LiveArchive:
             return wav_path, self._transcode_failed_message(wav_path, str(exc))
 
         # Both files exist at this instant, which is the point: only now is the
-        # WAV redundant.
+        # WAV redundant — and only now may it be kept, so the FR-2.2d invariant
+        # (never a moment with neither file) is untouched by retention.
+        kept, notice = self._keep_wav(wav_path)
+        if kept is not None:
+            log.info("live: archived %s as %s", wav_path.name, target.name)
+            return target, notice
+
         try:
             wav_path.unlink()
         except OSError as exc:
             log.warning("live: the intermediate WAV could not be removed: %s", exc)
             return target, self._stray_wav_message(wav_path, target)
         log.info("live: archived %s as %s", wav_path.name, target.name)
-        return target, None
+        return target, notice
+
+    def _keep_wav(self, wav_path: Path) -> Tuple[Optional[Path], Optional[str]]:
+        """Move the intermediate WAV out for diagnosis. `(kept_path, notice)`.
+
+        Returns `(None, ...)` when retention is off or could not be done, and
+        the caller then deletes the WAV exactly as it always has — a failure
+        here must not leave a `.wav` in the archive (FR-ERR-2), which is the
+        state `_stray_wav_message` exists to report and which voice-print
+        matching cannot locate.
+
+        **Out of the archive, always.** `config.diarize_config_for_archive`
+        binds the archive as `inbox_dirs` and `diarize_audio.inbox.walk_wavs`
+        yields every `.wav` beneath it, so a WAV kept in place is a candidate
+        for a PAID second transcription of a call already billed live. Today
+        that is suppressed only because `find_candidates` skips a file with a
+        sibling `<stem>.aai.json` and we happen to write one at the same stem —
+        a coincidence that fails in exactly the de-conflicted `-1` case. The
+        archive is also a Drive mount and this file is 230 MB/hour.
+
+        The bytes are moved, never re-encoded: the whole diagnostic question is
+        what capture produced BEFORE the encoder touched it (FR-2.4).
+        `shutil.move` rather than `os.replace` because the archive is a network
+        mount and the keep-dir will usually be local, which is `EXDEV` — an
+        expected case here, not a failure.
+        """
+        keep_dir = self._keep_wav_dir
+        if keep_dir is None:
+            return None, None
+        try:
+            # De-conflicted and laid out by the archive's OWN convention —
+            # `YYYY/MM/`, with the `-1` suffix on a same-second collision —
+            # rather than a second scheme invented here. It creates the
+            # directory, so an uncreatable keep-dir raises here and is reported
+            # rather than silently doing nothing. Never overwrites: two sessions
+            # in the same second are the `-1` case, and the evidence is the
+            # whole point of keeping the file.
+            target = _unique_archive_path(
+                keep_dir, wav_path.name, self._started_at or self._clock()
+            )
+            shutil.move(str(wav_path), str(target))
+        except OSError as exc:
+            return None, self._keep_wav_failed_message(keep_dir, exc)
+        log.info("live: kept the intermediate WAV for diagnosis")
+        return target, self._kept_wav_message(target)
 
     # -- transcript -------------------------------------------------------
 
@@ -1245,6 +1300,31 @@ class LiveArchive:
             f"is archived as {wav_path.name}. The recording and its transcript "
             "are both intact; the file is larger than the archive's usual ones "
             "and voice-print matching will not identify anyone on this call."
+        )
+
+    def _kept_wav_message(self, target: Path) -> str:
+        """FR-1.5. Names the path, every session it is on.
+
+        Deliberately repeated rather than said once at startup: this is an
+        unencrypted recording of a real conversation accumulating outside the
+        archive, and the worst outcome for this feature is being left on
+        quietly. A line per session is the cost of that being visible.
+        """
+        return (
+            f"Diagnostic copy kept: {target}. This is raw call audio "
+            "(~230 MB/hour) outside the archive — unset HIDOCK_LIVE_KEEP_WAV_DIR "
+            "when you are done collecting it."
+        )
+
+    def _keep_wav_failed_message(self, keep_dir: Path, exc: OSError) -> str:
+        """FR-ERR-1/FR-ERR-3. The recording is fine; only the diagnostic copy is not."""
+        if exc.errno == errno.ENOSPC:
+            detail = f"the disk holding {keep_dir} is full"
+        else:
+            detail = f"{keep_dir} could not be written ({exc})"
+        return (
+            f"The live recording and transcript are saved normally, but the "
+            f"diagnostic WAV copy was not kept: {detail}."
         )
 
     def _stray_wav_message(self, wav_path: Path, mp3_path: Path) -> str:

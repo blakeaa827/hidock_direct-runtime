@@ -175,6 +175,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept fo
         adapter=adapter,
         api_key=config.assemblyai_api_key,
         operator_name=config.operator_name,
+        keep_wav_dir=config.live_keep_wav_dir,
         # The PREPOPULATED speaker count, not a fixed ceiling: the controller
         # exposes it as `default_max_speakers`, the `l` prompt opens with it, and
         # the operator can override it for that call alone. Supplied here rather

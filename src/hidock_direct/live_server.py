@@ -1669,6 +1669,7 @@ class LiveSessionController:
         # passes the archive, and the composition-root sweep in
         # `test_live_server.py` fails the moment it stops.
         archive_dir=None,
+        keep_wav_dir=None,
         suspend_polling: Optional[Callable[[], None]] = None,
         resume_polling: Optional[Callable[[], None]] = None,
         busy_predicate: Optional[Callable[[], bool]] = None,
@@ -1684,6 +1685,9 @@ class LiveSessionController:
         self._operator_name = operator_name
         self._max_speakers = max_speakers
         self._archive_dir = archive_dir
+        # Diagnostic WAV retention, handed straight through to the recorder.
+        # None — the default — is "delete the intermediate as always".
+        self._keep_wav_dir = keep_wav_dir
         self._suspend = suspend_polling or _noop
         self._resume = resume_polling or _noop
         self._busy = busy_predicate or _never_busy
@@ -2014,6 +2018,7 @@ class LiveSessionController:
                 bus=self._bus,
                 operator_name=self._operator_name,
                 names=surface.speaker_names,
+                keep_wav_dir=self._keep_wav_dir,
             )
         except Exception as exc:  # noqa: BLE001 - transcript-only, not no session
             self._say(

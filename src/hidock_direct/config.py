@@ -86,6 +86,10 @@ class Config:
     log_level: str
     source: str  # "env" or "<path>" — for diagnostics
     operator_name: str  # HIDOCK_OPERATOR_NAME — the live surface's near-channel identity
+    # HIDOCK_LIVE_KEEP_WAV_DIR — where a live session's intermediate WAV is kept
+    # for diagnosis instead of being deleted. `None` is the default and means
+    # "delete it", which is the behaviour every clone gets.
+    live_keep_wav_dir: Optional[Path]
     live_max_speakers: int  # HIDOCK_LIVE_MAX_SPEAKERS — the `l` prompt's prepopulated value
     # Never in the repr: `Config` is printed in diagnostics, and a live key
     # reached a session transcript that way on 2026-08-22. No field carries a
@@ -272,6 +276,15 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     # sits where the vendor's guidance points, a little headroom above a typical
     # call. 6 was live on the 10-person call that collapsed 2-3 people into one
     # label.
+    # Diagnostic only, and off unless a path is named. It is a PATH rather than
+    # a boolean because there is no safe default location: inside the archive is
+    # the one place it must never go — `diarize_config_for_archive` binds that
+    # directory as `inbox_dirs` and `diarize_audio/inbox.py` scans for `.wav`
+    # specifically, so a kept WAV there is a paid duplicate transcription of a
+    # call already billed live — and anywhere else would be a directory this app
+    # invented on someone's disk without asking. Making the operator name it
+    # also means they know where the raw call audio is accumulating.
+    keep_wav = _resolve("HIDOCK_LIVE_KEEP_WAV_DIR", "", env_values, overlay).strip()
     speakers = _resolve("HIDOCK_LIVE_MAX_SPEAKERS", "8", env_values, overlay)
     api_key = _resolve("ASSEMBLYAI_API_KEY", "", env_values, overlay)
 
@@ -302,6 +315,7 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
 
     return Config(
         archive_dir=Path(archive).expanduser(),
+        live_keep_wav_dir=Path(keep_wav).expanduser() if keep_wav else None,
         poll_interval_seconds=poll_int,
         delete_from_device_after_offload=delete_bool,
         transcribe_on_offload=transcribe_bool,

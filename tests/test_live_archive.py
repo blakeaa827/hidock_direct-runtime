@@ -160,6 +160,8 @@ from hidock_direct.events import (
 )
 from hidock_direct.offload import (
     LIVE_SESSION_HISTORY,
+    MP3_EXTENSION,
+    WAV_EXTENSION,
     LIVE_SESSION_LEAD_TOLERANCE,
     LiveSessionLog,
     LiveSessionWindow,
@@ -553,8 +555,12 @@ def _no_mp3_encoder_unless_a_test_installs_one(monkeypatch):
 # Behaviours a shim encoder can have. Each one is a real failure mode
 # `_finalise_audio` names, and each is unreachable with a real encoder.
 _SHIM = {
-    # Writes plausible bytes and succeeds.
-    "ok": "printf 'ID3\\3\\0\\0\\0fake mp3 payload' > \"$TARGET\"\nexit 0\n",
+    # Writes plausible bytes and succeeds. Also keeps a copy of its INPUT, so a
+    # caller can prove the file it kept is the one the encoder read rather than
+    # a re-derived equivalent -- which is the whole point of WAV retention.
+    "ok": ('eval "SOURCE=\\${$(($#-1))}"\n'
+           'cp "$SOURCE" "$SOURCE.asread"\n'
+           "printf 'ID3\\3\\0\\0\\0fake mp3 payload' > \"$TARGET\"\nexit 0\n"),
     # Succeeds and produces a zero-byte file. The WAV is deleted on the strength
     # of the non-empty check, so this is the shape that would cost the recording.
     "empty": ": > \"$TARGET\"\nexit 0\n",
@@ -605,6 +611,17 @@ class Encoder:
     def invocations(self) -> int:
         """How many times the encoder ran. `--quiet` opens every lame argv."""
         return sum(1 for arg in self.argv() if arg in ("--quiet", "-nostdin"))
+
+    def source_bytes(self) -> bytes:
+        """Exactly the bytes the encoder READ, captured by the `ok` shim.
+
+        Recorded by the double rather than re-read from the archive, because the
+        archive copy is gone by the time a caller asks -- moved out, or deleted.
+        """
+        assert self.name, "no encoder was installed"
+        copies = sorted(Path(self.argv()[-2] + ".asread").parent.glob("*.asread"))
+        assert copies, "the shim recorded no input; was behaviour 'ok'?"
+        return copies[-1].read_bytes()
 
 
 @pytest.fixture
@@ -712,17 +729,20 @@ class Harness:
 
     def __init__(self, archive_dir: Path, *, names: Dict[str, str],
                  operator_name: str, clock: Callable[[], datetime],
-                 bus: EventBus, events: List[object]):
+                 bus: EventBus, events: List[object],
+                 keep_wav_dir: Optional[Path] = None):
         self.dir = archive_dir
         self.names = names
         self.bus = bus
         self.events = events
+        self.keep_wav_dir = keep_wav_dir
         self.rec = LiveArchive(
             archive_dir,
             bus=bus,
             operator_name=operator_name,
             names=lambda: self.names,
             clock=clock,
+            keep_wav_dir=keep_wav_dir,
         )
         self._seq = 0
         self._orders: Dict[str, int] = {"near": 0, "far": 0}
@@ -789,6 +809,7 @@ def sessions(tmp_path):
     def build(*, archive_dir: Optional[Path] = None,
               names: Optional[Dict[str, str]] = None,
               operator_name: str = OPERATOR,
+              keep_wav_dir: Optional[Path] = None,
               clock: Optional[Callable[[], datetime]] = None) -> Harness:
         counter["n"] += 1
         if archive_dir is None:
@@ -803,6 +824,7 @@ def sessions(tmp_path):
             clock=clock or (lambda: FIXED_START),
             bus=bus,
             events=events,
+            keep_wav_dir=keep_wav_dir,
         )
         made.append(harness)
         return harness
@@ -4108,3 +4130,281 @@ def test_a_real_encoder_delivers_the_declared_bitrate_and_clamps_above_it(
         "asking for more than the format allows produced a DIFFERENT file, so "
         "the ceiling this constant is pinned to has moved -- re-derive it"
     )
+
+
+# ---------------------------------------------------------------------------
+# Diagnostic WAV retention (phase 1g) -- evidence, kept OUT of the archive
+# ---------------------------------------------------------------------------
+#
+# The constraint that shapes every test below is that the archive is the
+# transcription pipeline's own scan root. `config.diarize_config_for_archive`
+# binds `inbox_dirs=[archive_dir]`, and `diarize_audio/inbox.py:27`, read
+# 2026-09-11, is:
+#
+#     if not name.endswith(".wav"):
+#         continue
+#
+# So a `.wav` left anywhere under the archive is a candidate for a SECOND,
+# PAID transcription of a call that was already transcribed live. Today the only
+# thing preventing that is `find_candidates` skipping a file with a sibling
+# `<stem>.aai.json` -- a coincidence that fails in exactly the de-conflicted
+# `-1` case. None of these tests rely on it.
+
+
+def test_by_default_the_intermediate_wav_is_still_deleted(sessions, encoder):
+    """FR-1.1's off state. A clone that never sets the variable is unchanged.
+
+    MUTATION: default `keep_wav_dir` to the archive, or to a path.
+    """
+    encoder.install("ok")
+    harness = sessions()
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("no retention", label="A")
+
+    assert harness.suffixed(WAV_EXTENSION) == []
+    assert len(harness.suffixed(MP3_EXTENSION)) == 1
+
+
+def test_a_keep_dir_moves_the_wav_out_and_leaves_the_archive_alone(
+    sessions, encoder, tmp_path,
+):
+    """FR-1.1/FR-2.3. The evidence is kept; the archive is what it always was.
+
+    MUTATION: copy instead of move (which leaves the `.wav` in the archive and
+    re-creates the duplicate-transcription hazard), or skip the move entirely.
+    """
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    kept = sorted(keep.rglob(f"*{WAV_EXTENSION}"))
+    assert len(kept) == 1, f"expected one kept WAV, found {kept}"
+    # The archive is untouched: the MP3 is there, and no WAV is.
+    assert harness.suffixed(WAV_EXTENSION) == []
+    assert len(harness.suffixed(MP3_EXTENSION)) == 1
+    assert len(harness.suffixed(TRANSCRIPT_SUFFIX)) == 1
+
+
+def test_the_kept_wav_is_not_under_the_pipelines_scan_root(
+    sessions, encoder, tmp_path, monkeypatch,
+):
+    """The requirement stated as the consumer sees it, not as a path convention.
+
+    Asserted by asking the REAL binding what it would scan, rather than by
+    eyeballing that one path is not a prefix of the other.
+
+    MUTATION: default the keep-dir to `archive_dir / "wav"`, which passes every
+    other test in this section and silently doubles the AssemblyAI bill.
+    """
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    # The real binding reads the real config, which requires a key to build at
+    # all. Set through monkeypatch so it is undone with the test -- this file's
+    # environment-mutation invariant is not being spent on a convenience.
+    monkeypatch.setenv("ASSEMBLYAI_API_KEY", "k-not-used-no-call-is-made")
+
+    from hidock_direct.config import diarize_config_for_archive
+    from diarize_audio.inbox import walk_wavs
+
+    scanned = list(walk_wavs(diarize_config_for_archive(harness.dir).inbox_dirs))
+    assert scanned == [], (
+        f"the pipeline would ingest {scanned} -- a second paid transcription "
+        "of a call already billed live"
+    )
+    assert sorted(keep.rglob(f"*{WAV_EXTENSION}")), "nothing was kept at all"
+
+
+def test_the_kept_bytes_are_what_the_encoder_was_given(
+    sessions, encoder, tmp_path,
+):
+    """FR-2.4, and the whole reason the feature exists.
+
+    The question is what CAPTURE produced, before the encoder touched it. A
+    re-derived or re-written WAV answers a different question, so the bytes are
+    compared against what the encoder was actually handed.
+
+    MUTATION: re-open and rewrite the WAV through `wave` on the way out, which
+    normalises the header and makes a header-level capture defect invisible.
+    """
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    source = Path(encoder.argv()[-2])
+    kept = sorted(keep.rglob(f"*{WAV_EXTENSION}"))[0]
+    assert kept.name == source.name
+    assert kept.read_bytes() == encoder.source_bytes(), (
+        "the kept file is not the bytes the encoder was given"
+    )
+
+
+def test_the_keep_dir_is_created_when_it_does_not_exist(
+    sessions, encoder, tmp_path,
+):
+    """FR-1.2. Naming a directory is the whole opt-in; making it should not be
+    a second step the operator discovers by losing a session's evidence."""
+    keep = tmp_path / "not" / "there" / "yet"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    assert keep.is_dir()
+    assert sorted(keep.rglob(f"*{WAV_EXTENSION}"))
+
+
+def test_an_occupied_name_in_the_keep_dir_is_never_overwritten(
+    sessions, encoder, tmp_path,
+):
+    """FR-1.4. Two sessions in the same second are the archive's `-1` case, and
+    the evidence is the thing being collected -- losing the earlier one to the
+    later one defeats the feature quietly.
+
+    MUTATION: `shutil.move` straight onto `keep_dir / name`, which overwrites.
+    """
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("first", label="A")
+
+    first = sorted(keep.rglob(f"*{WAV_EXTENSION}"))[0]
+    first.write_bytes(b"EARLIER EVIDENCE")
+
+    second = sessions(keep_wav_dir=keep)
+    with second.rec:
+        second.write(1.0)
+        second.turn("second", label="A")
+
+    kept = sorted(keep.rglob(f"*{WAV_EXTENSION}"))
+    assert len(kept) == 2, f"a session's evidence was overwritten: {kept}"
+    assert first.read_bytes() == b"EARLIER EVIDENCE"
+
+
+def test_the_operator_is_told_where_the_wav_went(sessions, encoder, tmp_path):
+    """FR-1.5, plus §5: an accumulating pile of raw call audio must not be
+    quietly forgotten, so the path and the cost are said every session."""
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    kept = sorted(keep.rglob(f"*{WAV_EXTENSION}"))[0]
+    messages = harness.messages()
+    assert str(kept) in messages, f"the path was never named: {messages!r}"
+    assert "MB/hour" in messages or "MB per hour" in messages
+    assert "HIDOCK_LIVE_KEEP_WAV_DIR" in messages
+
+
+def test_an_unwritable_keep_dir_costs_the_copy_and_nothing_else(
+    sessions, encoder, tmp_path, monkeypatch,
+):
+    """FR-ERR-1/FR-ERR-2. The recording is the artifact that cannot be
+    reconstructed; the diagnostic copy is a convenience.
+
+    And critically the WAV must NOT be left in the archive as a consolation --
+    that is the state the duplicate-transcription hazard lives in.
+
+    MUTATION: return the WAV as the survivor on failure (leaving a `.wav` in the
+    archive), or let the OSError propagate and lose the session.
+    """
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+    monkeypatch.setattr(
+        live_archive_module.shutil, "move",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError(13, "Permission denied")),
+    )
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    monkeypatch.undo()
+    assert len(harness.suffixed(MP3_EXTENSION)) == 1
+    assert len(harness.suffixed(TRANSCRIPT_SUFFIX)) == 1
+    assert harness.suffixed(WAV_EXTENSION) == [], (
+        "a WAV was left in the archive, where the pipeline will transcribe it"
+    )
+    assert "Permission denied" in harness.messages()
+    assert "saved normally" in harness.messages()
+
+
+def test_a_full_disk_at_the_keep_dir_is_named_as_disk_full(
+    sessions, encoder, tmp_path, monkeypatch,
+):
+    """FR-ERR-3. `ENOSPC` is operator-actionable and is said as itself."""
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+    monkeypatch.setattr(
+        live_archive_module.shutil, "move",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError(errno.ENOSPC, "No space")),
+    )
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    monkeypatch.undo()
+    assert "is full" in harness.messages()
+    assert len(harness.suffixed(MP3_EXTENSION)) == 1
+
+
+def test_retention_does_not_change_the_transcode_failure_path(
+    sessions, encoder, tmp_path,
+):
+    """FR-2.5/U-11. A failed transcode already keeps the WAV in the archive and
+    says so; this feature does not touch that, because the WAV is then the only
+    audio that exists rather than a redundant intermediate."""
+    keep = tmp_path / "diagnostics"
+    encoder.install("fail")
+    harness = sessions(keep_wav_dir=keep)
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("kept", label="A")
+
+    assert len(harness.suffixed(WAV_EXTENSION)) == 1, "the only audio was lost"
+    assert harness.suffixed(MP3_EXTENSION) == []
+    assert sorted(keep.rglob(f"*{WAV_EXTENSION}")) == []
+
+
+def test_no_log_record_carries_audio_bytes_when_a_wav_is_kept(
+    sessions, encoder, tmp_path, caplog,
+):
+    """NFR-4. The retention log line describes a file, never its contents."""
+    keep = tmp_path / "diagnostics"
+    encoder.install("ok")
+    harness = sessions(keep_wav_dir=keep)
+
+    with caplog.at_level(logging.DEBUG):
+        with harness.rec:
+            harness.write(1.0, near=0x1234, far=0x5678)
+            harness.turn("kept", label="A")
+
+    blob = "\n".join(r.getMessage() for r in caplog.records)
+    assert "\\x34\\x12" not in blob and "4660" not in blob

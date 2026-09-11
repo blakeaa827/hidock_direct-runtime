@@ -657,15 +657,22 @@ class FakeArchive:
     cannot falsify one.
     """
 
-    def __init__(self, archive_dir, *, bus, operator_name, names=None, clock=None):
+    def __init__(self, archive_dir, *, bus, operator_name, names=None, clock=None,
+                 keep_wav_dir=None):
         kwargs = dict(bus=bus, operator_name=operator_name, names=names)
         if clock is not None:
             kwargs["clock"] = clock
+        if keep_wav_dir is not None:
+            kwargs["keep_wav_dir"] = keep_wav_dir
         _bind_against(LiveArchive.__init__, archive_dir, **kwargs)
         self.archive_dir = archive_dir
         self.bus = bus
         self.operator_name = operator_name
         self.names = names
+        # Recorded, not merely accepted: the diagnostic keep-dir must reach the
+        # recorder, and a double that swallowed it would make the composition
+        # root's wiring unfalsifiable.
+        self.keep_wav_dir = keep_wav_dir
         self.written: List[Frame] = []
         self.entered = 0
         self.stops = 0
@@ -4116,6 +4123,7 @@ def test_main_builds_a_controller_and_hands_it_to_the_tui(tmp_path, monkeypatch)
             log_level="info",
             source="test",
             operator_name="Dana",
+            live_keep_wav_dir=None,
             live_max_speakers=4,
             assemblyai_api_key="k-from-config",
         ),
@@ -4227,6 +4235,7 @@ def _main_capturing_the_signal_handler(tmp_path, monkeypatch, order: List[str]):
             log_level="info",
             source="test",
             operator_name="Dana",
+            live_keep_wav_dir=None,
             live_max_speakers=4,
             assemblyai_api_key="k-from-config",
         ),
