@@ -61,7 +61,6 @@ ARCHIVE_BASENAME_FORMAT = "%Y-%m-%d_%H%M%S"
 ARCHIVE_STEM_PATTERN = re.compile(
     r"(?P<timestamp>\d{4}-\d{2}-\d{2}_\d{6})(?:-\d+)?"
 )
-MP3_SYNC_WORD = b"\xff\xfb"
 # Sibling directory under the archive root for operator-offloaded whispers.
 # Lazily created on first whisper offload; absence is normal.
 WHISPERS_SUBDIR = "whispers"
@@ -118,17 +117,55 @@ def _chunked_sha256_of_file(path: os.PathLike[str] | str, chunk: int = 1 << 20) 
     return h.hexdigest()
 
 
-def _detect_real_extension(staged_path: Path) -> str:
-    """Sniff the first 2 bytes of a staged file to detect MP3-in-.hda-clothing.
+def _is_mpeg_audio_frame_header(h: bytes) -> bool:
+    """True when `h` (4 bytes) is a valid MPEG audio frame header.
 
-    HiDock P1 stores recordings as MP3 with a `.hda` extension. Older H1
-    models use a genuine proprietary HTA container. We check the sync word
-    to tell them apart so the archive filename reflects the real format.
+    Byte 1 is `111 VV LL P` and byte 2 is `BBBB SS p x` (ISO/IEC 11172-3,
+    13818-3). Every reserved value is rejected, not only the sync bits. That
+    matters because an 11-bit-sync-only check would read `FF FF FF FF` as
+    MPEG-1 Layer I, which is what a genuine-container fixture looks like.
+    """
+    if len(h) < 4 or h[0] != 0xFF or (h[1] & 0xE0) != 0xE0:
+        return False
+    version = (h[1] >> 3) & 0b11
+    layer = (h[1] >> 1) & 0b11
+    bitrate_index = (h[2] >> 4) & 0b1111
+    sample_rate_index = (h[2] >> 2) & 0b11
+    return (
+        version != 0b01             # reserved
+        and layer != 0b00           # reserved
+        and bitrate_index != 0b1111                 # reserved (0000 = free format, legal)
+        and sample_rate_index != 0b11               # reserved
+    )
+
+
+def _detect_real_extension(staged_path: Path) -> str:
+    """Tell an MP3-in-`.hda`-clothing apart from a genuine HTA container.
+
+    HiDock P1 and P1 Mini store recordings as a bare MPEG audio stream under a
+    `.hda` extension; older H1 models are documented as using a proprietary HTA
+    container. This used to compare the first two bytes against the single
+    literal `FF FB` -- MPEG-1 Layer III without CRC, the only one of the six
+    Layer III shapes MPEG-1's 32/44.1/48 kHz rates produce unprotected. It held
+    for the P1, which records at 48 kHz, and misrouted everything else: any
+    sub-32 kHz recording (MPEG-2 / 2.5), any CRC-protected stream, and any file
+    with an ID3v2 tag.
+
+    Now: skip an ID3v2 tag if present, then validate a full frame header.
+    Anything unreadable or unrecognised falls through to `.wav`, the HTA path.
     """
     try:
         with open(staged_path, "rb") as f:
-            header = f.read(2)
-        if header == MP3_SYNC_WORD:
+            head = f.read(10)
+            offset = 0
+            if len(head) == 10 and head[:3] == b"ID3":
+                # Syncsafe size: 7 bits per byte. The 10-byte header and the
+                # optional 10-byte footer (flags bit 4) are not counted in it.
+                size = (head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9]
+                offset = 10 + size + (10 if head[5] & 0x10 else 0)
+            f.seek(offset)
+            frame = f.read(4)
+        if _is_mpeg_audio_frame_header(frame):
             return MP3_EXTENSION
     except OSError:
         pass

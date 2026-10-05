@@ -409,3 +409,133 @@ def test_offload_collision_gets_suffix(offloader, mock_device: MockDevice, archi
     out = [offloader.offload(device_key=DEVICE_KEY, file=f).archive_path for f in files]
     assert out[0] == archive_dir / "2026" / "04" / "2026-04-12_120000.wav"
     assert out[1] == archive_dir / "2026" / "04" / "2026-04-12_120000-1.wav"
+
+
+# ---------------------------------------------------------------------------
+# _detect_real_extension must recognise every MPEG Layer III shape, not just
+# MPEG-1 without CRC. Bug report:
+# planning/bug_report_mp3_sniff_recognises_only_mpeg1.md
+#
+# Header byte 1 is `111 VV LL P`: VV = version (11 MPEG-1, 10 MPEG-2,
+# 00 MPEG-2.5, 01 reserved), LL = layer (01 = Layer III, 00 reserved),
+# P = 1 when there is NO CRC. Byte 2 is `BBBB SS p x`: bitrate index (0000 free,
+# 1111 reserved), sample-rate index (11 reserved). 0x50 = bitrate index 5,
+# sample-rate index 0 -- valid under every version. Values hand-derived from
+# ISO/IEC 11172-3 / 13818-3, not from offload.py.
+# ---------------------------------------------------------------------------
+
+_VALID_B2_B3 = b"\x50\xc4"
+
+_LAYER3_FIRST_TWO = {
+    "mpeg1_nocrc (32/44.1/48 kHz)": b"\xff\xfb",
+    "mpeg1_crc": b"\xff\xfa",
+    "mpeg2_nocrc (16/22.05/24 kHz)": b"\xff\xf3",
+    "mpeg2_crc": b"\xff\xf2",
+    "mpeg25_nocrc (8/11.025/12 kHz)": b"\xff\xe3",
+    "mpeg25_crc": b"\xff\xe2",
+}
+
+
+def _sniff(tmp_path: Path, content: bytes) -> str:
+    from hidock_direct.offload import _detect_real_extension
+
+    p = tmp_path / "staged.hda.partial"
+    p.write_bytes(content)
+    return _detect_real_extension(p)
+
+
+def _id3v2(body_len: int, *, footer: bool = False) -> bytes:
+    """An ID3v2.4 tag with a syncsafe size; `footer` sets flag bit 4 and
+    appends the 10-byte footer the size field does not count."""
+    size = bytes([(body_len >> 21) & 0x7F, (body_len >> 14) & 0x7F,
+                  (body_len >> 7) & 0x7F, body_len & 0x7F])
+    flags = b"\x10" if footer else b"\x00"
+    tag = b"ID3\x04\x00" + flags + size + b"\x00" * body_len
+    if footer:
+        tag += b"3DI\x04\x00" + flags + size
+    return tag
+
+
+@pytest.mark.parametrize("first_two", list(_LAYER3_FIRST_TWO.values()),
+                         ids=list(_LAYER3_FIRST_TWO.keys()))
+def test_detect_real_extension_accepts_every_layer3_variant(tmp_path: Path, first_two: bytes):
+    assert _sniff(tmp_path, first_two + _VALID_B2_B3 + b"\x00" * 512) == ".mp3"
+
+
+def test_detect_real_extension_accepts_free_format_bitrate(tmp_path: Path):
+    """Bitrate index 0000 is free format: legal per ISO/IEC 11172-3, and the
+    shape of the suite's existing `FF FB 00 ...` MP3 fixtures."""
+    assert _sniff(tmp_path, b"\xff\xfb\x00\xc4" + b"\x00" * 512) == ".mp3"
+
+
+@pytest.mark.parametrize("footer", [False, True], ids=["no_footer", "footer"])
+def test_detect_real_extension_skips_id3v2_tag(tmp_path: Path, footer: bool):
+    # 300-byte body: an off-by-ten in the size arithmetic lands on zero
+    # padding, which fails the sync check rather than passing by luck.
+    content = _id3v2(300, footer=footer) + b"\xff\xf3" + _VALID_B2_B3 + b"\x00" * 512
+    assert _sniff(tmp_path, content) == ".mp3"
+
+
+@pytest.mark.parametrize("header", [
+    b"\xff\xeb\x50\xc4",   # version 01 (reserved), Layer III
+    b"\xff\xf9\x50\xc4",   # MPEG-1, layer 00 (reserved)
+    b"\xff\xfb\xf0\xc4",   # bitrate index 1111 (reserved)
+    b"\xff\xfb\x5c\xc4",   # sample-rate index 11 (reserved)
+    b"\xff\xff\xff\xff",   # the HTA-branch fixture the existing tests rely on
+    b"\xfe\xfb\x50\xc4",   # sync broken in byte 0
+    b"\xff\xdb\x50\xc4",   # sync broken in byte 1
+], ids=["reserved_version", "reserved_layer", "reserved_bitrate",
+        "reserved_samplerate", "all_ff", "bad_sync_b0", "bad_sync_b1"])
+def test_detect_real_extension_rejects_reserved_fields(tmp_path: Path, header: bytes):
+    assert _sniff(tmp_path, header + b"\x00" * 512) == ".wav"
+
+
+@pytest.mark.parametrize("content", [
+    b"", b"\xff", b"\xff\xf3", b"\xff\xf3\x50", b"\x00" * 12, b"ID3\x04\x00\x00",
+    _id3v2(300)[:20],   # tag claims 300 bytes, file ends inside it
+], ids=["empty", "one_byte", "two_bytes", "three_bytes", "rec33_stub",
+        "truncated_id3_header", "truncated_id3_body"])
+def test_detect_real_extension_rejects_short_and_empty_files(tmp_path: Path, content: bytes):
+    assert _sniff(tmp_path, content) == ".wav"
+
+
+def test_offload_hda_mpeg2_frame_archives_as_mp3(archive_dir: Path, mock_device: MockDevice, state_store, event_sink):
+    """The Mini's case end to end. No hta_converter is injected: a regression
+    that re-enters the HTA branch hits the REAL converter and fails loudly."""
+    from hidock_direct.offload import Offloader
+
+    bus, _ = event_sink
+    content = b"\xff\xf3" + _VALID_B2_B3 + b"\x00" * 4092
+    mock_device.connect()
+    mock_device.add_file(MockFile(name="2026Jan08-203612-Rec01.hda", content=content,
+                                  device_mtime=datetime(2026, 1, 8, 20, 36, 12)))
+    offloader = Offloader(
+        adapter=mock_device, store=state_store, bus=bus,
+        archive_dir=archive_dir, tmp_dir=archive_dir / ".tmp",
+        delete_after_offload=False, sleep=lambda *_a, **_k: None,
+    )
+    [f] = offloader.scan_new_files(DEVICE_KEY)
+    result = offloader.offload(device_key=DEVICE_KEY, file=f)
+    assert result.archive_path.suffix == ".mp3"
+    assert result.converted_from_hda is False
+    assert result.archive_path.read_bytes() == content
+
+
+def test_offload_hda_genuine_container_still_converts(archive_dir: Path, mock_device: MockDevice, state_store, event_sink):
+    """The widened detector must not swallow the HTA branch."""
+    from hidock_direct.offload import Offloader
+
+    bus, _ = event_sink
+    mock_device.connect()
+    mock_device.add_file(MockFile(name="REC_Y.hda", content=b"\xff" * 4096,
+                                  device_mtime=datetime(2026, 4, 12, 11, 5, 0)))
+    offloader = Offloader(
+        adapter=mock_device, store=state_store, bus=bus,
+        archive_dir=archive_dir, tmp_dir=archive_dir / ".tmp",
+        delete_after_offload=False, hta_converter=FakeHTAConverter(make_wav_bytes()),
+        sleep=lambda *_a, **_k: None,
+    )
+    [f] = offloader.scan_new_files(DEVICE_KEY)
+    result = offloader.offload(device_key=DEVICE_KEY, file=f)
+    assert result.archive_path.suffix == ".wav"
+    assert result.converted_from_hda is True
