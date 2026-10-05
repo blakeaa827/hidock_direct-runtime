@@ -147,9 +147,11 @@ class KeyboardReader:
             try:
                 self._on_key(ch)
             except Exception:
-                # A crashing key handler must never kill the reader — the
-                # TUI log has already surfaced the error via `Error` events
-                # from the App layer.
+                # A crashing key handler must never kill the reader. Note the
+                # App layer is responsible for publishing an `Error` event
+                # before anything reaches here — this swallow is a backstop,
+                # not the reporting path. It silently ate `OffloadError` on the
+                # w/u route until app.py grew an explicit handler for it.
                 continue
 
 

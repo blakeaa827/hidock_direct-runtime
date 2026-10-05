@@ -600,3 +600,265 @@ class TestSpuriousDetachSuppressed:
         finally:
             app.stop()
             runner.join(timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 tests: an OffloadError must not kill the worker, must not strand the
+# state machine in DRAINING, and must not abandon the rest of the batch.
+#
+# OffloadError descends from RuntimeError, NOT from DeviceError, so neither the
+# drain loop's `except TransferAborted` / `except DeviceError` (app.py:593/602)
+# nor `_worker_loop`'s `except (DeviceNotConnected, ConnectionError)` /
+# `except DeviceError` (app.py:394/397) catches it. The same family as the
+# ConnectionError bugs above, one exception type further out.
+#
+# Bug report: planning/bug_report_offload_error_kills_worker_and_wedges_draining.md
+# ---------------------------------------------------------------------------
+
+from hidock_direct.classify import RecordingKind  # noqa: E402
+from hidock_direct.device import TransferAborted  # noqa: E402
+from hidock_direct.events import Error  # noqa: E402
+from hidock_direct.offload import OffloadError  # noqa: E402
+
+
+class _StampThroughHTA:
+    """Canned converter: the mock device serves WAV bytes under `.hda` meeting
+    names, so stamp them through unconverted. Same shape as the converter in
+    tests/test_state_machine.py:80.
+    """
+
+    def convert_hta_to_wav(self, hta_path: str, output_path=None) -> str:
+        out = Path(hta_path).with_suffix(".wav")
+        out.write_bytes(Path(hta_path).read_bytes())
+        return str(out)
+
+
+class _FailingOffloader(Offloader):
+    """Real offloader that raises a chosen exception for named device files.
+
+    Everything not named in `failures` runs the genuine pipeline, so "the rest
+    of the batch was archived" is an assertion about real files on disk.
+    """
+
+    def __init__(self, *args, failures: Optional[dict] = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._failures = failures or {}
+        self.attempted: List[str] = []
+
+    def offload(self, *, device_key, file, cancel_event=None, kind=RecordingKind.MEETING):
+        self.attempted.append(file.name)
+        exc = self._failures.get(file.name)
+        if exc is not None:
+            raise exc
+        return super().offload(
+            device_key=device_key, file=file, cancel_event=cancel_event, kind=kind
+        )
+
+
+def _meeting(n: int, day: int) -> MockFile:
+    """A meeting-pattern file (PRD 2.1) the classifier routes to auto-offload."""
+    return MockFile(
+        name=f"202604{day:02d}-1000{n:02d}-Rec{n}.hda",
+        content=make_wav_bytes(),
+        device_mtime=datetime(2026, 4, day, 10, 0, n),
+    )
+
+
+def _build_drain_app(tmp_path: Path, *, files: List[MockFile], failures: Optional[dict] = None):
+    archive = tmp_path / "arch"
+    (archive / ".state").mkdir(parents=True, exist_ok=True)
+    (archive / ".tmp").mkdir(parents=True, exist_ok=True)
+    bus = EventBus()
+    events: List[Event] = []
+    bus.subscribe(events.append)
+    store = StateStore(archive / ".state" / "offload_state.json")
+    mock = MockDevice(files=files)
+    watcher = FakeWatcher()
+    offloader = _FailingOffloader(
+        adapter=mock, store=store, bus=bus,
+        archive_dir=archive, tmp_dir=archive / ".tmp",
+        delete_after_offload=False, hta_converter=_StampThroughHTA(),
+        sleep=lambda *a, **k: None, failures=failures,
+    )
+    app = App(
+        adapter=mock, watcher=watcher, offloader=offloader, store=store, bus=bus,
+        poll_interval_seconds=1, sleep=lambda *a, **k: None,
+    )
+    return app, bus, events, mock, watcher, offloader, archive
+
+
+class TestWorkerSurvivesOffloadError:
+    """An unarchivable file must not disable the application."""
+
+    def test_worker_survives_offload_error_during_drain(self, tmp_path: Path):
+        """Headline invariant, mirroring line 231 above: the worker thread
+        must still be alive after an OffloadError during a real drain."""
+        files = [_meeting(1, 12), _meeting(2, 12)]
+        app, _bus, _events, _mock, watcher, offloader, _arch = _build_drain_app(
+            tmp_path, files=files,
+            failures={files[0].name: OffloadError("hta conversion produced no output")},
+        )
+        runner = threading.Thread(target=app.run, daemon=True)
+        runner.start()
+        try:
+            _wait_until(lambda: watcher.started)
+            watcher.fire_attach()
+            _wait_until(lambda: offloader.attempted, timeout=5.0,
+                        msg="drain never attempted the first file")
+            _wait_until(lambda: app.state != AppState.DRAINING, timeout=5.0,
+                        msg=f"state never left DRAINING; last={app.state}")
+            assert app._worker is not None and app._worker.is_alive(), \
+                "worker thread died after OffloadError"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+    def test_worker_survives_unexpected_exception_during_drain(self, tmp_path: Path):
+        """Defense in depth: the fourth exception type nobody has named yet."""
+        files = [_meeting(1, 13), _meeting(2, 13)]
+        app, _bus, _events, _mock, watcher, offloader, _arch = _build_drain_app(
+            tmp_path, files=files, failures={files[0].name: ValueError("nobody named me")},
+        )
+        runner = threading.Thread(target=app.run, daemon=True)
+        runner.start()
+        try:
+            _wait_until(lambda: watcher.started)
+            watcher.fire_attach()
+            _wait_until(lambda: offloader.attempted, timeout=5.0,
+                        msg="drain never attempted the first file")
+            _wait_until(lambda: app.state != AppState.DRAINING, timeout=5.0,
+                        msg=f"state never left DRAINING; last={app.state}")
+            assert app._worker is not None and app._worker.is_alive(), \
+                "worker thread died after an unmodelled exception"
+        finally:
+            app.stop()
+            runner.join(timeout=3.0)
+
+
+class TestDrainAlwaysLeavesDrainingState:
+    """`_transition(CONNECTED_IDLE)` at app.py:607 is reachable only when the
+    loop runs to completion. Every non-success exit must still leave DRAINING.
+    """
+
+    @pytest.mark.parametrize("exc", [
+        OffloadError("hta conversion produced no output"),
+        TransferAborted("cable nudged"),
+        DeviceError("device went away"),
+    ])
+    def test_failed_drain_leaves_draining_state(self, tmp_path: Path, exc):
+        files = [_meeting(1, 14), _meeting(2, 14)]
+        app, _bus, _events, _mock, _watcher, _off, _arch = _build_drain_app(
+            tmp_path, files=files, failures={files[0].name: exc},
+        )
+        app._handle_attach()
+        assert app.state == AppState.CONNECTED_IDLE
+        app._run_scan_and_drain()
+        assert app.state == AppState.CONNECTED_IDLE, \
+            f"{type(exc).__name__} stranded the state machine at {app.state}"
+
+    def test_retry_key_available_after_failed_drain(self, tmp_path: Path):
+        """The operator's actual symptom: `key 'r' ignored: state=DRAINING`."""
+        from hidock_direct.tui_handlers import retry_key_active_in_state
+
+        files = [_meeting(1, 15), _meeting(2, 15)]
+        app, _bus, _events, _mock, _watcher, _off, _arch = _build_drain_app(
+            tmp_path, files=files,
+            failures={files[0].name: OffloadError("hta conversion produced no output")},
+        )
+        app._handle_attach()
+        app._run_scan_and_drain()
+        assert retry_key_active_in_state(app.state.value), \
+            f"'r' still refused after a failed drain; state={app.state.value}"
+
+
+class TestOffloadErrorIsPerFileNotPerBatch:
+    """One unarchivable file must not abandon the other 31."""
+
+    def test_offload_error_skips_file_and_continues_batch(self, tmp_path: Path):
+        files = [_meeting(1, 16), _meeting(2, 16), _meeting(3, 16)]
+        app, _bus, _events, _mock, _watcher, offloader, archive = _build_drain_app(
+            tmp_path, files=files,
+            failures={files[0].name: OffloadError("hta conversion produced no output")},
+        )
+        app._handle_attach()
+        app._run_scan_and_drain()
+
+        assert offloader.attempted == [f.name for f in files], \
+            f"batch abandoned after the first failure; attempted={offloader.attempted}"
+        archived = sorted(p.name for p in archive.rglob("*.wav"))
+        assert len(archived) == 2, \
+            f"the two good files were not archived; found {archived}"
+
+    def test_device_error_during_drain_aborts_batch_and_exits_draining(self, tmp_path: Path):
+        """The other side of the abort-vs-skip line: a DeviceError means the
+        device is gone, so abandoning the batch is correct -- but the state
+        must still leave DRAINING."""
+        files = [_meeting(1, 17), _meeting(2, 17), _meeting(3, 17)]
+        app, _bus, _events, _mock, _watcher, offloader, _arch = _build_drain_app(
+            tmp_path, files=files, failures={files[0].name: DeviceError("device went away")},
+        )
+        app._handle_attach()
+        app._run_scan_and_drain()
+
+        assert offloader.attempted == [files[0].name], \
+            f"DeviceError should abort the batch; attempted={offloader.attempted}"
+        assert app.state == AppState.CONNECTED_IDLE, \
+            f"DeviceError stranded the state machine at {app.state}"
+
+    def test_offload_error_publishes_operator_error_event(self, tmp_path: Path):
+        files = [_meeting(1, 18), _meeting(2, 18)]
+        app, _bus, events, _mock, _watcher, _off, _arch = _build_drain_app(
+            tmp_path, files=files,
+            failures={files[0].name: OffloadError("hta conversion produced no output")},
+        )
+        app._handle_attach()
+        app._run_scan_and_drain()
+
+        errors = [e for e in events if isinstance(e, Error) and e.context == files[0].name]
+        assert errors, (
+            "no Error event named the failed file; contexts seen: "
+            f"{[getattr(e, 'context', None) for e in events if isinstance(e, Error)]}"
+        )
+        assert "hta conversion produced no output" in errors[0].message, \
+            f"Error event did not carry the reason: {errors[0].message!r}"
+
+
+class TestSingleFileOffloadErrorPath:
+    """The `w`/`u` keys raise the same OffloadError through a different door."""
+
+    def test_single_file_offload_error_publishes_error_and_returns_false(self, tmp_path: Path):
+        whisper = MockFile(
+            name="20260419-100000-Wip1.hda",
+            content=make_wav_bytes(),
+            device_mtime=datetime(2026, 4, 19, 10, 0, 0),
+        )
+        app, _bus, events, _mock, _watcher, offloader, _arch = _build_drain_app(
+            tmp_path, files=[whisper],
+            failures={whisper.name: OffloadError("hta conversion produced no output")},
+        )
+        app._handle_attach()
+        app._run_scan_and_drain()
+        assert any(f.name == whisper.name for f in app._pending_whispers), \
+            "the whisper never reached the pending bucket"
+
+        result = app.offload_whisper(whisper.name)
+
+        assert result is False, "offload_whisper reported success after OffloadError"
+        errors = [e for e in events if isinstance(e, Error) and e.context == "whisper_offload"]
+        assert errors, "no operator-actionable Error published on the w/u path"
+        assert any(whisper.name in e.message for e in errors), \
+            f"Error did not name the file: {[e.message for e in errors]}"
+        assert any(f.name == whisper.name for f in app._pending_whispers), \
+            "file was dropped from the pending bucket despite not being offloaded"
+
+
+def test_offload_error_is_not_a_device_error():
+    """Pins the taxonomy decision so a future reader cannot 'simplify' the
+    explicit handlers away by re-basing OffloadError onto DeviceError."""
+    assert not issubclass(OffloadError, DeviceError), (
+        "OffloadError was re-based onto DeviceError. That makes an unarchivable "
+        "file indistinguishable from an unusable device at the one call site "
+        "that must tell them apart -- see the bug report's Option A."
+    )
+    assert issubclass(TransferAborted, DeviceError)
+    assert issubclass(DeviceNotConnected, DeviceError)

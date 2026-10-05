@@ -68,7 +68,22 @@ WHISPERS_SUBDIR = "whispers"
 
 
 class OffloadError(RuntimeError):
-    pass
+    """One recording could not be archived. Deliberately NOT a `DeviceError`.
+
+    `DeviceError` means the device itself is unusable, so the correct response
+    is to abandon the batch and drop the connection. `OffloadError` means the
+    opposite: the device is fine and the next file may well succeed. A failed
+    format conversion, a size or SHA mismatch, a read-only archive mount -- none
+    of those say anything about file N+1.
+
+    Because the two classes are siblings rather than parent and child, handlers
+    must name `OffloadError` explicitly; an `except DeviceError` will not catch
+    it. That is intentional and load-bearing -- it is what lets the drain loop
+    skip a file rather than abandon the batch. It is also how this escaped three
+    rounds of worker-thread hardening and killed the worker outright:
+    `tests/test_connection_error_handling.py::test_offload_error_is_not_a_device_error`
+    pins the decision so it cannot be "simplified" away.
+    """
 
 
 @dataclass(frozen=True)

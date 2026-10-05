@@ -28,7 +28,7 @@ from .events import (
     IdleWaiting,
     Severity,
 )
-from .offload import Offloader
+from .offload import OffloadError, Offloader
 from .state import DeviceKey, StateStore
 from .usb_watcher import USBWatcherProtocol
 
@@ -398,6 +398,24 @@ class App:
                 self._bus.publish(Error(message=str(exc), severity=Severity.ERROR, context="worker_loop"))
                 self._handle_disconnect()
                 continue
+            except Exception as exc:  # noqa: BLE001 -- deliberate last line of defense
+                # Defense in depth. Enumerating known exception types has now
+                # failed three times on this thread: ConnectionError twice, then
+                # OffloadError (a bare RuntimeError) -- each escape killed the
+                # worker while the TUI kept rendering a dead state machine. The
+                # handlers above stay precise because the abort-vs-skip
+                # distinction depends on the type; this clause exists so the
+                # fourth type is a loud error rather than a silent death.
+                self._bus.publish(Error(
+                    message=(
+                        f"Unexpected {type(exc).__name__} in the device worker: {exc}. "
+                        "Dropping the connection; replug the device to resume."
+                    ),
+                    severity=Severity.ERROR,
+                    context="worker_loop",
+                ))
+                self._handle_disconnect()
+                continue
 
             if self._detach_signal.is_set():
                 self._handle_disconnect()
@@ -491,6 +509,26 @@ class App:
                     kind=kind,
                     cancel_event=self._cancel_transfer,
                 )
+        except OffloadError as exc:
+            # Same escape as the drain loop, through a different door. Without
+            # this clause the exception unwinds into `KeyboardReader._run`'s
+            # blanket `except Exception` (tui.py:147-153), which swallows it --
+            # leaving the operator a bare `x <file>: <reason>` bus line with no
+            # remediation and no signal that the keypress aborted rather than
+            # completed. The file stays in the pending bucket, which is correct:
+            # it is still on the device.
+            action = "meeting offload" if kind is RecordingKind.MEETING else "whisper offload"
+            self._bus.publish(Error(
+                message=(
+                    f"{action.capitalize()} failed: {exc}. "
+                    f"{device_filename} could not be archived and is still on the "
+                    "device. If it keeps failing, the recording's format may be "
+                    "unsupported."
+                ),
+                severity=Severity.ERROR,
+                context=failure_context,
+            ))
+            return False
         except TransferAborted as exc:
             # A transfer-aborted mid-stream is the only class that leaves the
             # file on the device in a retriable state. The operator should be
@@ -579,29 +617,62 @@ class App:
             return
 
         self._transition(AppState.DRAINING)
-        for file in scan.meetings:
-            if self._cancel_transfer.is_set() or self._stop_signal.is_set():
-                return
-            try:
-                with self._device_command():
-                    self._offloader.offload(
-                        device_key=self._device_key,
-                        file=file,
-                        cancel_event=self._cancel_transfer,
-                        kind=RecordingKind.MEETING,
+        # The exit transition lives in a `finally` rather than after the loop.
+        # The bug this guards is structurally "an exit path was added without
+        # updating the exit transition" -- three of them accumulated (cancel,
+        # TransferAborted, DeviceError), each leaving `DRAINING` set with no
+        # code path able to clear it, which locks out every state-gated key for
+        # the life of the process. A `finally` cannot be skipped by a `return`,
+        # a `break`, an exception, or a future edit that adds a fourth exit.
+        try:
+            for file in scan.meetings:
+                if self._cancel_transfer.is_set() or self._stop_signal.is_set():
+                    return
+                try:
+                    with self._device_command():
+                        self._offloader.offload(
+                            device_key=self._device_key,
+                            file=file,
+                            cancel_event=self._cancel_transfer,
+                            kind=RecordingKind.MEETING,
+                        )
+                except OffloadError as exc:
+                    # Per-file, not per-batch. `OffloadError` means "this
+                    # recording could not be archived" -- a converter that
+                    # cannot handle file 1 says nothing about file 2, and a
+                    # failed integrity check on one download says nothing about
+                    # the next. Abandoning the batch here is what left 31 of 32
+                    # recordings on the device. `continue`, do not `return`.
+                    self._bus.publish(
+                        Error(
+                            message=(
+                                f"Offload failed: {exc}. {file.name} is still on "
+                                "the device; the rest of this batch continues."
+                            ),
+                            severity=Severity.ERROR,
+                            context=file.name,
+                        )
                     )
-            except TransferAborted as exc:
-                self._bus.publish(
-                    Error(
-                        message=f"Transfer aborted: {exc.reason}",
-                        severity=Severity.WARNING,
-                        context=file.name,
+                    continue
+                except TransferAborted as exc:
+                    self._bus.publish(
+                        Error(
+                            message=f"Transfer aborted: {exc.reason}",
+                            severity=Severity.WARNING,
+                            context=file.name,
+                        )
                     )
-                )
-                return
-            except DeviceError as exc:
-                self._bus.publish(
-                    Error(message=str(exc), severity=Severity.ERROR, context=file.name)
-                )
-                return
-        self._transition(AppState.CONNECTED_IDLE)
+                    return
+                except DeviceError as exc:
+                    # Batch-fatal, deliberately: the device is gone or unusable,
+                    # so attempting file N+1 would fail the same way. This is the
+                    # other side of the abort-vs-skip line from `OffloadError`.
+                    self._bus.publish(
+                        Error(message=str(exc), severity=Severity.ERROR, context=file.name)
+                    )
+                    return
+        finally:
+            # Not on shutdown: `stop()` is already tearing the state machine
+            # down and a transition here would race it.
+            if not self._stop_signal.is_set():
+                self._transition(AppState.CONNECTED_IDLE)
