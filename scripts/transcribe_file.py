@@ -9,8 +9,11 @@ recorded file paths as arguments:
 
 For each file it:
 
-1. Copies (never moves) it into the archive as `YYYY/MM/YYYY-MM-DD_HHMMSS.<ext>`,
-   named from the recording START. That basename is what the ledger and the
+1. Moves it into the archive as `YYYY/MM/YYYY-MM-DD_HHMMSS.<ext>` (`--keep-source`
+   copies instead). The original is deleted only after the archived copy is
+   complete and its size matches, or when identical bytes are already archived.
+   The name is
+   taken from the recording START. That basename is what the ledger and the
    transcript frontmatter read the recording time back out of.
 2. Runs the same `transcribe_file` bridge the offload worker calls, so the
    ledger entry, the `.md` and the `.aai.json` land where an offload's would.
@@ -84,8 +87,8 @@ def recording_start(path: Path) -> datetime:
     return datetime.fromtimestamp(born if born else st.st_mtime)
 
 
-def import_into_archive(src: Path, archive_dir: Path, when: datetime) -> tuple[Path, bool]:
-    """Copy `src` into the archive. Returns (archive_path, already_present)."""
+def import_into_archive(src: Path, archive_dir: Path, when: datetime, *, keep_source: bool = False) -> tuple[Path, bool]:
+    """Move (or copy) `src` into the archive. Returns (archive_path, already_present)."""
     if src.suffix.lower() in REFUSED_SUFFIXES:
         raise ImportRefused(
             f"{src.name}: .wav is refused -- the archive is the pipeline's scan root "
@@ -103,12 +106,22 @@ def import_into_archive(src: Path, archive_dir: Path, when: datetime) -> tuple[P
     if subdir.is_dir():
         for existing in sorted(subdir.glob(f"{stem}*{ext}")):
             if existing.stat().st_size == src.stat().st_size and _chunked_sha256_of_file(existing) == digest:
+                if not keep_source:
+                    src.unlink()
                 return existing, True
 
     dest = _unique_archive_path(archive_dir, f"{stem}{ext}", when)
     partial = dest.with_name(dest.name + ".partial")
+    # Copy-then-delete rather than rename: the archive is usually a cloud-storage
+    # mount on another volume, and a half-finished cross-device move must never
+    # leave the recording in neither place.
     shutil.copy2(src, partial)
+    if partial.stat().st_size != src.stat().st_size:
+        partial.unlink()
+        raise OSError(f"{src.name}: archived copy is short; original kept")
     os.replace(partial, dest)
+    if not keep_source:
+        src.unlink()
     return dest, False
 
 
@@ -175,7 +188,9 @@ def main(argv: Optional[list[str]] = None, *, transcribe=None, status=ledger_sta
     parser.add_argument("--reuse", action="store_true",
                         help="re-render from an existing paid transcript instead of paying again")
     parser.add_argument("--dry-run", action="store_true",
-                        help="report where each file would go; copy and transcribe nothing")
+                        help="report where each file would go; move and transcribe nothing")
+    parser.add_argument("--keep-source", action="store_true",
+                        help="copy into the archive and leave the original in place")
     parser.add_argument("--no-notify", action="store_true")
     args = parser.parse_args(argv)
 
@@ -213,7 +228,7 @@ def main(argv: Optional[list[str]] = None, *, transcribe=None, status=ledger_sta
         for src in args.files:
             src = src.expanduser().resolve()
             try:
-                dest, present = import_into_archive(src, archive_dir, recording_start(src))
+                dest, present = import_into_archive(src, archive_dir, recording_start(src), keep_source=args.keep_source)
             except (ImportRefused, OSError) as exc:
                 failures += 1
                 log.error("refused %s: %s", src, exc)

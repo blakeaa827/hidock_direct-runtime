@@ -69,19 +69,37 @@ def fixed_start(mod, monkeypatch):
 
 def test_imports_under_recording_start_name_and_transcribes(mod, archive, tmp_path):
     src = _recording(tmp_path)
+    data = src.read_bytes()
     fake = FakeTranscribe()
     assert _run(mod, [src], fake) == 0
     dest = archive / "2026" / "10" / "2026-10-13_093005.mp3"
-    assert dest.read_bytes() == src.read_bytes()
-    assert src.exists(), "source must be copied, never moved"
+    assert dest.read_bytes() == data
+    assert not src.exists(), "source must be moved, not copied (operator is short on disk)"
     assert fake.calls == [(dest, False)]
+
+
+def test_keep_source_copies(mod, archive, tmp_path):
+    src = _recording(tmp_path)
+    assert _run(mod, [src], FakeTranscribe(), extra=["--keep-source"]) == 0
+    assert src.exists()
+    assert (archive / "2026" / "10" / "2026-10-13_093005.mp3").read_bytes() == src.read_bytes()
+
+
+def test_short_copy_keeps_original(mod, archive, tmp_path, monkeypatch):
+    src = _recording(tmp_path)
+    monkeypatch.setattr(mod.shutil, "copy2", lambda a, b: Path(b).write_bytes(b"x"))
+    fake = FakeTranscribe()
+    assert _run(mod, [src], fake) == 1
+    assert src.exists() and fake.calls == []
+    assert list((archive / "2026" / "10").iterdir()) == []
 
 
 def test_same_bytes_twice_reuses_path_and_skips_when_ledger_done(mod, archive, tmp_path):
     src = _recording(tmp_path)
     fake = FakeTranscribe()
-    _run(mod, [src], fake)
+    _run(mod, [src], fake, extra=["--keep-source"])
     assert _run(mod, [src], fake, status=lambda p, a: "done") == 0
+    assert not src.exists(), "a duplicate of archived bytes is deleted, not left behind"
     assert len(fake.calls) == 1, "a done ledger entry must never be billed again"
     assert sorted(p.name for p in (archive / "2026" / "10").iterdir()) == ["2026-10-13_093005.mp3"]
 
@@ -89,7 +107,7 @@ def test_same_bytes_twice_reuses_path_and_skips_when_ledger_done(mod, archive, t
 def test_saved_aai_json_forces_free_rerender(mod, archive, tmp_path):
     src = _recording(tmp_path)
     fake = FakeTranscribe(ok=False)
-    _run(mod, [src], fake)
+    _run(mod, [src], fake, extra=["--keep-source"])
     (archive / "2026" / "10" / "2026-10-13_093005.aai.json").write_text("{}")
     fake.ok = True
     assert _run(mod, [src], fake, status=lambda p, a: "error") == 0
