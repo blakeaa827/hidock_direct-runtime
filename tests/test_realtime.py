@@ -89,7 +89,10 @@ class FakeAdapter:
         return self._connected
 
 
-def payload(near: List[int], far: List[int], header: bytes = b"\x00\x00\x00\x00") -> bytes:
+def payload(near: List[int], far: List[int], header: bytes = b"\x00" * 8) -> bytes:
+    """Header + audio. The header is 8 bytes as measured (two u32s); this helper
+    used to default to 4, a wire format the device never sent."""
+    assert len(header) == 8, "the transfer header is 8 bytes"
     return header + interleave(near, far)
 
 
@@ -261,20 +264,22 @@ def test_channel_order_is_not_reversed():
     assert set(frame.far) != {0}, "far channel is silent -- channels are swapped"
 
 
-def test_four_byte_header_is_discarded():
-    j = FakeJensen(transfers=[payload([7], [8], header=b"\xde\xad\xbe\xef"), b""])
+def test_eight_byte_header_is_discarded():
+    j = FakeJensen(transfers=[payload([7], [8], header=b"\xde\xad\xbe\xef\xfe\xed\xfa\xce"), b""])
     with session(j) as s:
         frame = next(iter(s.frames()))
     assert b"\xde\xad\xbe\xef" not in frame.near + frame.far
+    assert b"\xfe\xed\xfa\xce" not in frame.near + frame.far
+    assert frame.near == struct.pack("<h", 7) and frame.far == struct.pack("<h", 8)
 
 
 def test_header_value_does_not_drive_flow_control():
     """Observed header values cycle 0/1/2, contradicting upstream's 'bytes
     remaining' claim. A reader that trusted it would stop early."""
     frames_in = [
-        payload([1], [1], header=struct.pack(">I", 0)),
-        payload([2], [2], header=struct.pack(">I", 0)),
-        payload([3], [3], header=struct.pack(">I", 0)),
+        payload([1], [1], header=struct.pack(">I", 0) + b"\x00" * 4),
+        payload([2], [2], header=struct.pack(">I", 0) + b"\x00" * 4),
+        payload([3], [3], header=struct.pack(">I", 0) + b"\x00" * 4),
         b"",
     ]
     j = FakeJensen(transfers=frames_in)
@@ -301,7 +306,9 @@ def test_frame_carries_no_timestamp():
 # -- response-variant matrix (PRD §6) ------------------------------------
 
 
-@pytest.mark.parametrize("body", [b"", b"\x00\x00\x00\x00"], ids=["empty", "header-only"])
+@pytest.mark.parametrize(
+    "body", [b"", b"\x00" * 4, b"\x00" * 8], ids=["empty", "half-header", "header-only"]
+)
 def test_short_bodies_yield_no_frame(body):
     j = FakeJensen(transfers=[body, payload([5], [6]), b""])
     with session(j) as s:
@@ -311,7 +318,7 @@ def test_short_bodies_yield_no_frame(body):
 
 def test_misaligned_payload_is_dropped_not_realigned(caplog):
     """Realigning silently swaps the channels. Drop and warn instead."""
-    bad = b"\x00\x00\x00\x00" + b"\x01\x02\x03"  # 3 bytes: not a whole stereo frame
+    bad = b"\x00" * 8 + b"\x01\x02\x03"  # 3 bytes: not a whole stereo frame
     j = FakeJensen(transfers=[bad, payload([4], [5]), b""])
     with session(j) as s:
         frames = list(s.frames())
@@ -515,3 +522,78 @@ def test_settle_pacing_survives_a_fresh_session_object(monkeypatch):
     second.start()
 
     assert slept and slept[-1] > 0, "the restart was not paced at all"
+
+
+# -- the measured 6408-byte body (bug_report_realtime_header_leaks_zero_frame_per_chunk)
+
+
+def _tone(start: int, count: int, amp: int, hz: int) -> List[int]:
+    import math
+
+    out = [int(amp * math.sin(2 * math.pi * hz * (start + k) / 16000)) for k in range(count)]
+    return [v or 1 for v in out]
+
+
+def device_body(i: int, word2: bytes = b"\x00\x00\x00\x00") -> bytes:
+    """One CMD 34 body as the P1 actually sends it: 6408 bytes = an 8-byte header
+    (u32 cycling 0/1/2, then a u32 observed zero in 1037/1037 chunks of a real
+    capture) + 1600 stereo frames, exactly 100 ms at 16 kHz. Every sample is
+    non-zero, so a leaked header word shows up as a zero."""
+    near = _tone(i * 1600, 1600, 3000, 440)
+    far = _tone(i * 1600, 1600, 2000, 300)
+    body = struct.pack("<I", i % 3) + word2 + interleave(near, far)
+    assert len(body) == 6408
+    return body
+
+
+def test_real_transfer_body_yields_exactly_100ms():
+    j = FakeJensen(transfers=[device_body(i) for i in range(3)] + [b""])
+    with session(j) as s:
+        frames = list(s.frames())
+    assert len(frames) == 3
+    for i, f in enumerate(frames):
+        assert len(f.near) // 2 == 1600 and len(f.far) // 2 == 1600
+        assert struct.unpack("<h", f.near[:2])[0] == _tone(i * 1600, 1, 3000, 440)[0]
+        assert struct.unpack("<h", f.far[:2])[0] == _tone(i * 1600, 1, 2000, 300)[0]
+        assert 0 not in struct.unpack("<1600h", f.near), "a header word leaked into the audio"
+
+
+def test_header_word_two_never_reaches_audio():
+    j = FakeJensen(transfers=[device_body(0, word2=b"\xde\xad\xbe\xef"), b""])
+    with session(j) as s:
+        frame = next(iter(s.frames()))
+    assert b"\xde\xad" not in frame.near and b"\xbe\xef" not in frame.far
+    assert b"\xbe\xef" not in frame.near and b"\xde\xad" not in frame.far
+
+
+def test_sample_rate_is_16000_over_many_chunks():
+    """50 chunks = 5 s = exactly 80,000 samples per channel. The leak measured
+    as a '16,010 Hz' device rate; count, not value, catches any per-chunk leak."""
+    j = FakeJensen(transfers=[device_body(i) for i in range(50)] + [b""])
+    with session(j) as s:
+        frames = list(s.frames())
+    assert sum(len(f.near) for f in frames) // 2 == 80_000
+    assert sum(len(f.far) for f in frames) // 2 == 80_000
+
+
+def test_unmeasured_body_shapes_are_reported_once_and_audio_unchanged(caplog):
+    """A backlog body (two chunks' audio behind one header) and a non-zero second
+    header word have never been captured. Report each once; slice exactly as for
+    a single chunk rather than guess a layout."""
+    odd = device_body(0, word2=b"\x01\x00\x00\x00") + device_body(1)[8:]
+    j = FakeJensen(transfers=[odd, odd, b""])
+    with caplog.at_level("WARNING", logger="hidock_direct.realtime"):
+        with session(j) as s:
+            frames = list(s.frames())
+    assert [len(f.near) // 2 for f in frames] == [3200, 3200]
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum("not 8 + 6400*k" in m for m in msgs) == 0, "6400*2 is a whole number of chunks"
+    assert sum("header word 2 is 01000000" in m for m in msgs) == 1
+
+
+def test_non_chunk_length_reported_once(caplog):
+    j = FakeJensen(transfers=[payload([1], [2]), payload([3], [4]), b""])
+    with caplog.at_level("WARNING", logger="hidock_direct.realtime"):
+        with session(j) as s:
+            list(s.frames())
+    assert sum("is not 8 + 6400*k" in r.getMessage() for r in caplog.records) == 1

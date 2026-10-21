@@ -13,6 +13,13 @@ four places (see the note below)::
     TRANSFER  CMD 34  body <empty>             -> 6408 B chunks, ~10/sec
     STOP      CMD 33  body 00000000 00000000   -> ack 00
 
+A transfer body is an **8-byte header** then 6400 bytes of audio: 1600 stereo
+frames, exactly 100 ms at 16 kHz. The header is two u32s — the first cycles
+0/1/2, the second has been zero in every chunk measured. Stripping only the
+first leaked the zero word into the audio as one stereo frame per chunk: the
+10 Hz click every live recording carried, and the "16,010 Hz" the feasibility
+study recorded as a device rate (bug_report_realtime_header_leaks_zero_frame_per_chunk).
+
 Stream: 16 kHz, 16-bit, **stereo**. Channel 1 is the near end, channel 2 the
 far end — proven by playing a 1 kHz tone out through the P1 and observing a
 38 dB peak in channel 2 only, while channel 1 *fell* (the device's echo
@@ -55,7 +62,8 @@ _CMD_REALTIME_TRANSFER = 34
 # rapid start/stop cycling is the observed cause of device wedging.
 _last_stop_at_process: Optional[float] = None
 
-_HEADER_BYTES = 4       # leading 4 bytes of each transfer body; NOT audio
+_HEADER_BYTES = 8       # two u32s leading each transfer body; NOT audio
+_AUDIO_BYTES_PER_CHUNK = 6400  # 1600 stereo frames = 100 ms at 16 kHz
 _BYTES_PER_FRAME = 4    # stereo * int16
 SAMPLE_RATE_HZ = 16000
 CHANNELS = 2
@@ -138,6 +146,9 @@ class RealtimeSession:
         self._poll_interval = max(0.0, poll_interval_seconds)
         self._sleep = sleep
         self._usb_errors = tuple(usb_errors) if usb_errors is not None else _default_usb_errors()
+        # Once per session each: new information about the wire, not an error.
+        self._reported_unusual_length = False
+        self._reported_header_word2 = False
         self._active = False
         self._seq = 0
         self._stop_requested = False
@@ -278,10 +289,10 @@ class RealtimeSession:
                     self._sleep(self._poll_interval)
                 continue
 
-            # The leading 4 bytes are a header whose meaning is UNKNOWN:
-            # observed values cycle 0/1/2, which contradicts upstream's "bytes
-            # remaining" claim. Discarded, and deliberately not used for flow
-            # control.
+            # 8-byte header, discarded and deliberately not used for flow
+            # control: the first u32 cycles 0/1/2 (contradicting upstream's
+            # "bytes remaining" claim); the second has only ever been zero.
+            self._note_unusual_header(response)
             split = _deinterleave(response[_HEADER_BYTES:])
             if split is None:
                 error_streak += 1
@@ -300,6 +311,27 @@ class RealtimeSession:
             near, far = split
             self._seq += 1
             yield Frame(near=near, far=far, seq=self._seq)
+
+    def _note_unusual_header(self, response: bytes) -> None:
+        """Log, once each, a body shape never measured. Never changes the audio.
+
+        A backlog reply longer than one chunk has not been captured, so whether
+        it carries one header or one per 6400-byte unit is unknown; guessing a
+        multi-unit layout would trade a known artifact for an invented one.
+        """
+        audio_len = len(response) - _HEADER_BYTES
+        if not self._reported_unusual_length and audio_len % _AUDIO_BYTES_PER_CHUNK:
+            self._reported_unusual_length = True
+            log.warning(
+                "realtime body of %d bytes is not 8 + 6400*k; layout unmeasured",
+                len(response),
+            )
+        if not self._reported_header_word2 and response[4:_HEADER_BYTES] != b"\x00\x00\x00\x00":
+            self._reported_header_word2 = True
+            log.warning(
+                "realtime header word 2 is %s (only ever measured as zero)",
+                response[4:_HEADER_BYTES].hex(),
+            )
 
     # -- transport -------------------------------------------------------
 
