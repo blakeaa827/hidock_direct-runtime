@@ -88,7 +88,9 @@ def publish_retry_candidate_count(bus: EventBus, provider) -> None:
             )
         )
         return
-    bus.publish(RetryCandidatesDetected(count=len(candidates)))
+    from .retry import retryable_count
+
+    bus.publish(RetryCandidatesDetected(count=retryable_count(candidates)))
 
 
 def main(argv: list[str] | None = None) -> int:  # noqa: ARG001 — argv kept for future flags

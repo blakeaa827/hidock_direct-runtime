@@ -19,8 +19,18 @@ import pytest
 from rich.console import Console
 
 from hidock_direct import transcribe as transcribe_mod
-from hidock_direct.events import Error, EventBus, RetryFinished, RetryProgress, Severity
-from hidock_direct.retry import RetryCandidate, format_retry_confirm, summarize
+from hidock_direct.events import (
+    Error,
+    EventBus,
+    RetryCandidatesDetected,
+    RetryFinished,
+    RetryProgress,
+    Severity,
+    TranscribeComplete,
+    TranscribeFailed,
+    TranscribeSkipped,
+)
+from hidock_direct.retry import RetryCandidate, format_retry_confirm, retryable_count, summarize
 from hidock_direct.tui import TUI
 from tests.conftest import faithful
 
@@ -315,6 +325,164 @@ def test_badge_is_refreshed_from_the_ledger_after_the_batch():
     tui._run_retry_batch([_cand()])  # inline; the thread hop is covered separately
 
     assert tui._failed_count == 0, "badge still advertises the pre-run count"
+
+
+_NO_SPEECH = (
+    "AssemblyAI returned status=error: language_detection cannot be performed "
+    "on files with no spoken audio."
+)
+
+
+def test_post_batch_badge_counts_only_what_y_would_retry():
+    """Both publish sites share one population. After a batch that left a
+    no-speech file, a missing file and one transient failure, the badge is 1."""
+    remaining = [
+        _cand("2026/10/t.mp3"),
+        _cand("2026/10/n.mp3", error=_NO_SPEECH),
+        _cand("2026/10/g.mp3", exists=False),
+        _cand("2026/10/p.mp3", status="error_permanent"),
+    ]
+    bus = EventBus()
+    tui = TUI(bus=bus, retry_candidates_provider=lambda: list(remaining), retry_runner=lambda sel: None)
+    tui._failed_count = 9
+
+    tui._run_retry_batch([_cand()])
+
+    assert tui._failed_count == 1
+
+
+def _wait_for(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        TranscribeFailed(device_filename="2026Oct22-090058-Rec02.hda", reason="pipeline status='error'"),
+        TranscribeComplete(device_filename="2026Oct22-090058-Rec02.hda", drive_file_id=None),
+        TranscribeSkipped(device_filename="2026Oct22-090058-Rec02.hda", reason="diarize_audio not importable"),
+    ],
+    ids=["failed", "complete", "skipped"],
+)
+def test_badge_follows_the_ledger_after_every_transcription_outcome(outcome):
+    """The offload path produces most failures, and it never ran a retry batch,
+    so the badge sat at its startup value all session. Every terminal
+    transcription event re-reads the ledger."""
+    ledger = [_cand("2026/10/a.mp3")]
+    bus = EventBus()
+    tui = TUI(bus=bus, retry_candidates_provider=lambda: list(ledger))
+    bus.publish(RetryCandidatesDetected(count=1))
+
+    ledger.extend([_cand("2026/10/b.mp3"), _cand("2026/10/c.mp3")])
+    bus.publish(outcome)
+
+    assert _wait_for(lambda: tui._failed_count == 3), f"badge stayed at {tui._failed_count}"
+
+
+def test_outcome_refresh_runs_off_the_publishing_thread():
+    """`find_retry_candidates` reads every candidate's audio duration from a
+    Drive mount. Doing that inside the publisher's `bus.publish` would stall the
+    offload worker that published the event."""
+    seen_on: list = []
+    done = threading.Event()
+
+    def provider():
+        seen_on.append(threading.current_thread())
+        done.set()
+        return []
+
+    bus = EventBus()
+    TUI(bus=bus, retry_candidates_provider=provider)
+    bus.publish(TranscribeFailed(device_filename="x.hda", reason="r"))
+
+    assert done.wait(timeout=5), "the badge was never refreshed"
+    assert seen_on[0] is not threading.current_thread()
+
+
+def test_an_outcome_during_a_refresh_is_not_dropped():
+    """A second file finishing while the first refresh is still reading must
+    still be reflected: requests coalesce, they are never discarded."""
+    ledger = [_cand("2026/10/a.mp3")]
+    first_read_started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def provider():
+        calls.append(len(ledger))
+        if len(calls) == 1:
+            first_read_started.set()
+            release.wait(timeout=5)
+            return [_cand("2026/10/a.mp3")]  # the snapshot taken before b failed
+        return list(ledger)
+
+    bus = EventBus()
+    tui = TUI(bus=bus, retry_candidates_provider=provider)
+    bus.publish(TranscribeFailed(device_filename="a.hda", reason="r"))
+    assert first_read_started.wait(timeout=5)
+
+    ledger.append(_cand("2026/10/b.mp3"))
+    bus.publish(TranscribeFailed(device_filename="b.hda", reason="r"))
+    release.set()
+
+    assert _wait_for(lambda: tui._failed_count == 2), f"badge stayed at {tui._failed_count}"
+
+
+def test_outcome_refresh_survives_an_unreadable_ledger():
+    """An unreadable ledger after a transcription is logged, never raised, and
+    the badge keeps its last known value rather than reading as zero."""
+    def boom():
+        raise RuntimeError("ledger vanished")
+
+    bus = EventBus()
+    tui = TUI(bus=bus, retry_candidates_provider=boom)
+    bus.publish(RetryCandidatesDetected(count=2))
+    bus.publish(TranscribeFailed(device_filename="x.hda", reason="r"))
+
+    assert _wait_for(lambda: any("not refreshed" in m for _, m, _ in tui._log))
+    assert tui._failed_count == 2
+
+
+def test_badge_y_and_the_confirm_agree_on_what_is_retryable():
+    """Three readings of "retryable" exist: the badge count, the set `y` starts,
+    and the confirm's `selected`. They drifted once (the badge counted every
+    failure); this pins all three to one answer on a ledger holding every
+    exclusion reason."""
+    ledger = [
+        _cand("2026/10/t1.mp3"),
+        _cand("2026/10/t2.mp3", paid=True),
+        _cand("2026/10/n.mp3", error=_NO_SPEECH),
+        _cand("2026/10/g.mp3", exists=False),
+        _cand("2026/10/p.mp3", status="error_permanent"),
+    ]
+    started: list = []
+    tui = TUI(bus=EventBus(), retry_candidates_provider=lambda: list(ledger))
+    tui._state = "IDLE_DISCONNECTED"
+    tui._start_retry_batch = started.append
+    tui._on_key("r")
+    tui._on_key("y")
+
+    assert retryable_count(ledger) == summarize(ledger)["selected"] == len(started[0]) == 2
+
+
+def test_r_still_reaches_unretryable_entries_when_the_badge_is_zero():
+    """Taking unretryable entries out of the COUNT must not hide them: `r` still
+    lists them and `f` can still force the one whose audio exists."""
+    ledger = [_cand("2026/10/n.mp3", error=_NO_SPEECH), _cand("2026/04/g.mp3", exists=False, error=_NO_SPEECH)]
+    started: list = []
+    bus = EventBus()
+    tui = TUI(bus=bus, retry_candidates_provider=lambda: list(ledger), retry_runner=started.append)
+    tui._state = "IDLE_DISCONNECTED"
+    tui._start_retry_batch = started.append
+
+    tui._on_key("r")
+    assert [c.state_key for c in tui._retry_confirm] == ["2026/10/n.mp3", "2026/04/g.mp3"]
+    tui._on_key("f")
+    assert [[c.state_key for c in sel] for sel in started] == [["2026/10/n.mp3"]]
 
 
 def test_badge_refresh_failure_does_not_crash_the_batch_thread():

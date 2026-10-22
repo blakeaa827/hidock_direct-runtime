@@ -165,6 +165,52 @@ def test_startup_publishes_the_retry_candidate_count(tmp_path):
     assert counts == [2]
 
 
+# Verbatim from the live ledger on blakes-macbook-pro-2 (2026-10-22): the text
+# AssemblyAI returns for a recording with nothing to transcribe.
+_NO_SPEECH = (
+    "AssemblyAI returned status=error: language_detection cannot be performed "
+    "on files with no spoken audio."
+)
+
+
+def _startup_counts(tmp_path, entries: dict, on_disk: tuple) -> list:
+    for key in on_disk:
+        (tmp_path / key).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / key).write_bytes(b"\x00")
+    bus = EventBus()
+    seen: list = []
+    bus.subscribe(seen.append)
+    main_mod.publish_retry_candidate_count(
+        bus, lambda: main_mod.load_retry_candidates(tmp_path, state=_FakeState(entries))
+    )
+    return [e.count for e in seen if isinstance(e, RetryCandidatesDetected)]
+
+
+def test_startup_badge_counts_only_what_y_would_retry(tmp_path):
+    """The badge says `[press r to retry]`, so its number is the number `y`
+    starts. One of each exclusion reason alongside one retryable entry: only
+    the retryable one counts (bug_report_retry_badge_counts_unretryable_and_goes_stale)."""
+    entries = {
+        "2026/10/transient.mp3": _errored("pipeline status='error' upload timeout"),
+        "2026/10/no_speech.mp3": _errored(_NO_SPEECH),
+        "2026/10/exhausted.mp3": {"status": "error_permanent", "error": "boom", "retry_count": 3},
+        "2026/10/gone.mp3": _errored("boom"),
+    }
+    on_disk = ("2026/10/transient.mp3", "2026/10/no_speech.mp3", "2026/10/exhausted.mp3")
+
+    assert _startup_counts(tmp_path, entries, on_disk) == [1]
+
+
+def test_startup_badge_is_zero_for_the_2026_10_22_ledger(tmp_path):
+    """The shape the operator could not clear: six no-speech clips whose audio
+    is gone, plus one (a cable-touch recording) still on disk. Nothing for `y`
+    to do, so nothing to advertise."""
+    entries = {f"2026/04/2026-04-17_17210{i}.mp3": _errored(_NO_SPEECH) for i in range(6)}
+    entries["2026/10/2026-10-22_100619.mp3"] = {"status": "error", "error": _NO_SPEECH, "retry_count": 1}
+
+    assert _startup_counts(tmp_path, entries, ("2026/10/2026-10-22_100619.mp3",)) == [0]
+
+
 def test_startup_surfaces_an_unreadable_ledger_instead_of_reporting_zero():
     """The distinction the 2026-08-13 recovery run got wrong: 'I could not read
     your data' must never render as a confident all-clear. An unreadable ledger

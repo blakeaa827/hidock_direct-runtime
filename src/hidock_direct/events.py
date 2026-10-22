@@ -116,12 +116,18 @@ class WhispersDetected(Event):
 
 @dataclass(frozen=True)
 class RetryCandidatesDetected(Event):
-    """How many archived recordings have a failed transcription.
+    """How many failed transcriptions `y` would retry right now.
 
-    Published at startup and after every retry batch so the footer can tell the
-    operator there is something to retry. Without it, `r` is discoverable only
-    by already knowing it exists — a failure is otherwise one line in a
-    ten-entry log deque that scrolls away.
+    Published at startup, after every retry batch, and after every terminal
+    transcription event, so the footer can tell the operator there is something
+    to retry. Without it, `r` is discoverable only by already knowing it exists —
+    a failure is otherwise one line in a ten-entry log deque that scrolls away.
+
+    The count is `retry.retryable_count`, NOT every ledger failure: the footer
+    says `[press r to retry]`, so a number that includes what retrying cannot fix
+    (no speech in the audio, audio gone, budget spent) is a badge that never
+    clears. Those entries still appear in the `r` confirm, where `f` can force
+    the ones still on disk.
     """
 
     count: int

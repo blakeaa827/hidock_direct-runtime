@@ -325,6 +325,11 @@ class TUI:
         self._whisper_count = 0
         self._unknown_count = 0
         self._failed_count = 0
+        # Badge refreshes after transcription outcomes run on one worker at a
+        # time; a request that lands mid-refresh sets `_again` instead of
+        # starting a second reader, so a burst of offloads costs two reads.
+        self._badge_refresh_running = False
+        self._badge_refresh_again = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -400,14 +405,17 @@ class TUI:
                 self._log.append(
                     (datetime.now(), f"⎋ transcribe ✓ {event.device_filename} drive={drive}", Severity.INFO)
                 )
+                self._request_badge_refresh()
             elif isinstance(event, TranscribeSkipped):
                 self._log.append(
                     (datetime.now(), f"⎋ transcribe SKIPPED {event.device_filename}: {event.reason}", Severity.WARNING)
                 )
+                self._request_badge_refresh()
             elif isinstance(event, TranscribeFailed):
                 self._log.append(
                     (datetime.now(), f"⎋ transcribe FAILED {event.device_filename}: {event.reason}", Severity.ERROR)
                 )
+                self._request_badge_refresh()
             elif isinstance(event, WhispersDetected):
                 self._whisper_count = event.count
                 if event.count > 0:
@@ -619,17 +627,53 @@ class TUI:
                     context="retry",
                 )
             )
-        # Refresh the badge from the ledger — the contract `RetryCandidatesDetected`
-        # documents is "at startup and after every retry batch". Without this the
-        # footer keeps advertising the pre-run count, so a batch that fixed
-        # everything still reads as N failed. Runs after a failed batch too: the
-        # count is whatever the ledger now says, which is the point.
+        # Refresh the badge from the ledger. Without this the footer keeps
+        # advertising the pre-run count, so a batch that fixed everything still
+        # reads as N failed. Runs after a failed batch too: the count is
+        # whatever the ledger now says, which is the point.
+        self._refresh_failed_count()
+
+    def _refresh_failed_count(self) -> None:
+        """Re-read the ledger and publish what `y` would retry now.
+
+        An unreadable ledger is logged and the badge keeps its last value: a
+        read failure must not render as "nothing to retry".
+        """
+        from .retry import retryable_count
+
         try:
-            self._bus.publish(
-                RetryCandidatesDetected(count=len(self._retry_candidates_provider()))
-            )
+            count = retryable_count(self._retry_candidates_provider())
         except Exception as exc:  # LedgerUnavailable and anything below it
             self._log_key_ignored(f"retry count not refreshed: {exc}")
+            return
+        self._bus.publish(RetryCandidatesDetected(count=count))
+
+    def _request_badge_refresh(self) -> None:
+        """Refresh the badge after a transcription outcome, off the caller's thread.
+
+        Called from `_on_event`, i.e. inside whichever thread published the
+        event — usually the offload worker. Reading candidates touches every
+        failed file's audio on a Drive mount, so it must not run there.
+        """
+        with self._lock:
+            if self._badge_refresh_running:
+                self._badge_refresh_again = True
+                return
+            self._badge_refresh_running = True
+        threading.Thread(target=self._badge_refresh_loop, name="hidock-badge", daemon=True).start()
+
+    def _badge_refresh_loop(self) -> None:
+        while True:
+            try:
+                self._refresh_failed_count()
+            finally:
+                with self._lock:
+                    again = self._badge_refresh_again
+                    self._badge_refresh_again = False
+                    if not again:
+                        self._badge_refresh_running = False
+            if not again:
+                return
 
     # -- keyboard input -------------------------------------------------
 

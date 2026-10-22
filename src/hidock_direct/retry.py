@@ -145,6 +145,17 @@ class RetryCandidate:
         return None
 
 
+def retryable_count(candidates: Iterable[RetryCandidate]) -> int:
+    """How many candidates `y` would start: the number the footer badge shows.
+
+    Every publisher of `RetryCandidatesDetected` goes through here, so the badge
+    and the action it advertises cannot count different sets again. They did:
+    the badge counted every ledger failure, so on 2026-10-22 it read 7 with
+    nothing for `y` to do (bug_report_retry_badge_counts_unretryable_and_goes_stale).
+    """
+    return sum(1 for c in candidates if c.default_selected)
+
+
 class LedgerUnavailable(RuntimeError):
     """The archive or its ledger could not be read.
 
