@@ -69,6 +69,45 @@ def test_every_tui_provider_kwarg_is_supplied_by_main():
     )
 
 
+def _tui_call_kwarg_source(name: str) -> str:
+    tree = ast.parse((SRC / "__main__.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "TUI":
+            for kw in node.keywords:
+                if kw.arg == name:
+                    return ast.unparse(kw.value)
+    raise AssertionError(f"__main__ never passes {name} to the TUI")
+
+
+@pytest.mark.parametrize(
+    "kwarg, attr",
+    [
+        ("pending_whispers_provider", "_pending_whispers"),
+        ("pending_unknowns_provider", "_pending_unknowns"),
+    ],
+)
+def test_pending_providers_read_the_app_bucket_at_call_time(kwarg, attr):
+    """The whisper/unknown badges read these providers on every frame
+    (bug_report_whisper_unknown_badges_never_decrease.md). The sweep above
+    proves the keyword is passed; this proves what it reads.
+
+    The app REPLACES the bucket on a scan and on detach (`self._pending_* = ...`)
+    rather than mutating it, so a provider that captured the list once --
+    `lambda w=app._pending_whispers: w` -- would draw the first scan forever and
+    still pass every behavioural test, all of which build their own TUI.
+    """
+    # MUTATION: `lambda: []`, or `lambda w=app._pending_whispers: w`.
+    from types import SimpleNamespace
+
+    source = _tui_call_kwarg_source(kwarg)
+    app = SimpleNamespace(**{attr: ["first.hda"]})
+    provider = eval(source, {"app": app})  # noqa: S307 -- our own source, read by AST
+
+    assert list(provider()) == ["first.hda"], f"{kwarg} does not read app.{attr}"
+    setattr(app, attr, [])  # what _handle_disconnect and a zero scan do
+    assert list(provider()) == [], f"{kwarg} captured app.{attr} once: {source}"
+
+
 def test_every_consumed_event_has_a_production_publisher():
     """Structural sweep over the bus. An event the TUI handles but nothing
     publishes is a dead branch: `RetryCandidatesDetected` was imported, handled,

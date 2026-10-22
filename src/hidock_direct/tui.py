@@ -322,8 +322,10 @@ class TUI:
         self._log: deque[tuple[datetime, str, Severity]] = deque(maxlen=RECENT_LOG_LIMIT)
         self._session_files = 0
         self._session_bytes = 0
-        self._whisper_count = 0
-        self._unknown_count = 0
+        # No whisper/unknown counters: the footer reads the pending buckets
+        # themselves on every frame. A count fed by `WhispersDetected` is the
+        # last non-zero scan's snapshot -- a pick, a detach and a scan that
+        # finds none all change the bucket and publish nothing.
         self._failed_count = 0
         # Badge refreshes after transcription outcomes run on one worker at a
         # time; a request that lands mid-refresh sets `_again` instead of
@@ -417,7 +419,6 @@ class TUI:
                 )
                 self._request_badge_refresh()
             elif isinstance(event, WhispersDetected):
-                self._whisper_count = event.count
                 if event.count > 0:
                     self._log.append(
                         (datetime.now(), f"{event.count} whisper(s) on device — press w to review", Severity.INFO)
@@ -433,7 +434,6 @@ class TUI:
                 self._retry_progress = None
                 self._retry_summary = event
             elif isinstance(event, UnknownsDetected):
-                self._unknown_count = event.count
                 if event.count > 0:
                     self._log.append(
                         (datetime.now(), f"{event.count} unknown file(s) — press u to route", Severity.WARNING)
@@ -915,6 +915,11 @@ class TUI:
     # -- rendering ------------------------------------------------------
 
     def _render(self) -> Layout:
+        # The queues `w` and `u` act on, read as they are now -- the same
+        # providers the key handlers use, so the badge and the selector cannot
+        # name different sets. Outside the TUI lock: they are the app's lists.
+        whispers = len(self._pending_whispers_provider())
+        unknowns = len(self._pending_unknowns_provider())
         with self._lock:
             state = self._state
             device = self._device
@@ -922,8 +927,6 @@ class TUI:
             log_snapshot = list(self._log)
             files = self._session_files
             bytes_ = self._session_bytes
-            whispers = self._whisper_count
-            unknowns = self._unknown_count
             failed = self._failed_count
             retry_confirm = self._retry_confirm
             speaker_prompt = self._speaker_prompt

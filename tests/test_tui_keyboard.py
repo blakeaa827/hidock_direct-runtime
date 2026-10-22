@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
+import pytest
+
 from hidock_direct.app import App
 from hidock_direct.classify import RecordingKind
 from hidock_direct.events import Event, EventBus
@@ -40,9 +42,11 @@ class _FakeWatcher:
     def stop(self): pass
     def on_attach(self, fn): self._attach.append(fn)
     def on_degraded(self, fn): self._degraded = getattr(self, "_degraded", []) + [fn]
-    def on_detach(self, fn): pass
+    def on_detach(self, fn): self._detach = getattr(self, "_detach", []) + [fn]
     def fire_attach(self, vid=0x10D6, pid=0xAF0C):
         for fn in self._attach: fn(vid, pid)
+    def fire_detach(self, vid=0x10D6, pid=0xAF0C):
+        for fn in getattr(self, "_detach", []): fn(vid, pid)
 
 
 class _NoopKeyboard:
@@ -372,3 +376,124 @@ def test_a_successful_reopen_logs_no_refusal():
     assert [m for _, m, _ in tui._log] == [], (
         "a successful reopen wrote to the operator's log"
     )
+
+
+# -- the whisper/unknown badges must follow the queue they count -------------
+#
+# Regression tests for bug_report_whisper_unknown_badges_never_decrease.md.
+# The footer rendered a snapshot taken by the last NON-ZERO scan, while three
+# other writers of the pending buckets (a pick, a detach, a rescan that finds
+# none) published nothing -- so "3 whispers on device [press w to pick]"
+# outlived every whisper, and the device itself. These run the real App, so
+# every bucket writer is the production one, and assert on the drawn frame.
+
+from tests.test_tui_render import _frame_text  # noqa: E402
+
+_REC = MockFile(name="20260414-100000-Rec1.hda", content=make_wav_bytes(), device_mtime=datetime(2026, 4, 14, 10, 0, 0))
+_WIP = "20260414-110000-Wip1.hda"
+_WIP2 = "20260414-111500-Wip2.hda"
+_UNK = "20260414-120000-FooBar7.hda"
+
+
+def _mock(name):
+    """A device file whose mtime matches the clock in its name, as the P1 writes them."""
+    return MockFile(name=name, content=make_wav_bytes(), device_mtime=datetime.strptime(name[:15], "%Y%m%d-%H%M%S"))
+
+
+# kind -> (device file, the fragment the badge draws, keys that clear it, where it lands)
+_KINDS = {
+    "whisper": (_WIP, "1 whisper on device [press w to pick]", ["w", " ", "\r"],
+                ("whispers", "2026", "04", "2026-04-14_110000.wav")),
+    "unknown": (_UNK, "1 unknown [press u to review]", ["u", "m"],
+                ("2026", "04", "2026-04-14_120000.wav")),
+}
+
+
+def _attached(tmp_path, files):
+    app, tui, store, archive, watcher = _build(tmp_path, files)
+    runner = threading.Thread(target=app.run, daemon=True)
+    runner.start()
+    _wait_until(lambda: watcher.started, msg="watcher never started")
+    watcher.fire_attach()
+    _wait_until(lambda: tui._state == "CONNECTED_IDLE", timeout=5.0, msg="never idle")
+    return app, tui, archive, watcher, runner
+
+
+def _stop(app, runner):
+    app.stop()
+    runner.join(timeout=3.0)
+
+
+@pytest.mark.parametrize("kind", sorted(_KINDS))
+def test_badge_clears_after_the_last_one_is_handled(tmp_path: Path, kind):
+    name, fragment, keys, landed = _KINDS[kind]
+    app, tui, archive, watcher, runner = _attached(tmp_path, [_REC, _mock(name)])
+    try:
+        _wait_until(lambda: fragment in _frame_text(tui), timeout=5.0, msg=f"badge never drawn: {fragment}")
+        for ch in keys:
+            tui._on_key(ch)
+        _wait_until(lambda: archive.joinpath(*landed).exists(), timeout=5.0, msg="never offloaded")
+
+        _wait_until(
+            lambda: fragment not in _frame_text(tui), timeout=2.0,
+            msg=f"badge outlived its queue: {fragment!r} still drawn after the {kind} was offloaded",
+        )
+    finally:
+        _stop(app, runner)
+
+
+def test_whisper_badge_counts_down_with_each_pick_and_agrees_with_w(tmp_path: Path):
+    """The population half: after one of two whispers is picked, the badge and
+    the `w` selector must name the same queue -- one whisper, the one left."""
+    app, tui, archive, watcher, runner = _attached(tmp_path, [_REC, _mock(_WIP), _mock(_WIP2)])
+    try:
+        _wait_until(lambda: "2 whispers on device" in _frame_text(tui), timeout=5.0, msg="badge never drawn")
+        tui._on_key("w")
+        tui._on_key(" ")      # select the first (oldest) whisper only
+        tui._on_key("\r")
+        _wait_until(lambda: len(app._pending_whispers) == 1, timeout=5.0, msg="pick never completed")
+
+        _wait_until(lambda: "1 whisper on device" in _frame_text(tui), timeout=2.0,
+                    msg=f"badge did not count down: {_frame_text(tui)!r}")
+        tui._on_key("w")
+        assert tui._whisper_modal is not None
+        assert len(tui._whisper_modal.filenames) == 1, "the badge and `w` disagree on the queue"
+    finally:
+        _stop(app, runner)
+
+
+def test_badges_clear_on_detach(tmp_path: Path):
+    app, tui, archive, watcher, runner = _attached(tmp_path, [_REC, _mock(_WIP), _mock(_UNK)])
+    try:
+        _wait_until(lambda: "press u to review" in _frame_text(tui), timeout=5.0, msg="badges never drawn")
+        assert "press w to pick" in _frame_text(tui)
+
+        watcher.fire_detach()
+        _wait_until(lambda: tui._state == "IDLE_DISCONNECTED", timeout=5.0, msg="never detached")
+
+        frame = _frame_text(tui)
+        assert "press w to pick" not in frame, "whisper badge outlived the device"
+        assert "press u to review" not in frame, "unknown badge outlived the device"
+    finally:
+        _stop(app, runner)
+
+
+@pytest.mark.parametrize("kind", sorted(_KINDS))
+def test_a_rescan_that_finds_none_clears_a_previous_count(tmp_path: Path, kind):
+    """The file leaves the device by some other route (deleted in HiNotes); the
+    count changes, the app rescans and finds zero -- and a zero scan publishes
+    no count event at all."""
+    name, fragment, _keys, _landed = _KINDS[kind]
+    app, tui, archive, watcher, runner = _attached(tmp_path, [_REC, _mock(name)])
+    try:
+        _wait_until(lambda: fragment in _frame_text(tui), timeout=5.0, msg="badge never drawn")
+        with app._device_command():
+            app._adapter.delete_file(name)
+        _wait_until(
+            lambda: not (app._pending_whispers if kind == "whisper" else app._pending_unknowns),
+            timeout=5.0, msg="the app never rescanned",
+        )
+
+        assert fragment not in _frame_text(tui), f"a zero-{kind} rescan left {fragment!r} drawn"
+    finally:
+        _stop(app, runner)

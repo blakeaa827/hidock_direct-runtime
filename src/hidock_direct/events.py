@@ -111,6 +111,14 @@ class IdleWaiting(Event):
 
 @dataclass(frozen=True)
 class WhispersDetected(Event):
+    """A scan found `count` whispers. Published only when `count > 0`.
+
+    Drives the activity-log line, NOT the footer badge. The badge reads
+    `app._pending_whispers` on every frame, because a pick, a detach and a scan
+    that finds none all change that queue and publish nothing -- a badge fed
+    by this event counted the last non-zero scan forever.
+    """
+
     count: int
 
 
@@ -165,6 +173,12 @@ class RetryFinished(Event):
 
 @dataclass(frozen=True)
 class UnknownsDetected(Event):
+    """A scan found `count` unknown-kind files. Published only when `count > 0`.
+
+    Log line only; the footer reads `app._pending_unknowns`, for the reason
+    given on `WhispersDetected`.
+    """
+
     count: int
     filenames: List[str]
 
