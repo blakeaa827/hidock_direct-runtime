@@ -46,16 +46,30 @@ def _text_of(renderable, width: int = 100, height: int = 40) -> str:
     return buf.getvalue()
 
 
-def _tui_at_width(width: int, height: int = 40) -> tuple[TUI, io.StringIO]:
+def _tui_at_width(
+    width: int, height: int = 40, *, whispers: int = 0, unknowns: int = 0
+) -> tuple[TUI, io.StringIO]:
     """A TUI whose own console has a known size.
 
     The TUI must measure and render against the SAME console — in production
     that is the one `Live` draws with. Injecting it here keeps the test faithful
     and lets each case pick a width, which matters: the pending line wraps, so
     the footer's height is width-dependent.
+
+    `whispers` / `unknowns` queue that many files in the pending buckets, the
+    way a real scan does (`app._pending_whispers`). Publishing
+    `WhispersDetected` alone is a state production never reaches: a scan sets
+    the bucket AND publishes the count, and the badge must follow the bucket.
     """
     buf = io.StringIO()
-    tui = TUI(bus=EventBus(), console=Console(file=buf, width=width, height=height))
+    queued_w = [f"w{i}.hda" for i in range(whispers)]
+    queued_u = [f"u{i}.hda" for i in range(unknowns)]
+    tui = TUI(
+        bus=EventBus(),
+        console=Console(file=buf, width=width, height=height),
+        pending_whispers_provider=lambda: queued_w,
+        pending_unknowns_provider=lambda: queued_u,
+    )
     return tui, buf
 
 
@@ -214,19 +228,19 @@ def test_render_reads_failed_count_under_the_lock():
 
 
 @pytest.mark.parametrize(
-    "event, fragment",
+    "event, queued, fragment",
     [
-        (WhispersDetected(count=2), "2 whispers on device [press w to pick]"),
-        (UnknownsDetected(count=1, filenames=["mystery.hda"]), "1 unknown [press u to review]"),
-        (RetryCandidatesDetected(count=3), "3 failed transcriptions [press r to retry]"),
+        (WhispersDetected(count=2), (2, 0), "2 whispers on device [press w to pick]"),
+        (UnknownsDetected(count=1, filenames=["mystery.hda"]), (0, 1), "1 unknown [press u to review]"),
+        (RetryCandidatesDetected(count=3), (0, 0), "3 failed transcriptions [press r to retry]"),
     ],
     ids=["whispers", "unknowns", "failed"],
 )
-def test_pending_badge_is_visible_in_the_rendered_frame(event, fragment):
+def test_pending_badge_is_visible_in_the_rendered_frame(event, queued, fragment):
     """Every badge kind, asserted against the displayed frame. The whisper and
     unknown badges have been cropped since 2026-04-23, so this is not a
     retry-only regression — all three shipped invisible."""
-    tui, _ = _tui_at_width(140)
+    tui, _ = _tui_at_width(140, whispers=queued[0], unknowns=queued[1])
 
     tui._bus.publish(event)
 
@@ -243,7 +257,7 @@ def test_footer_pane_is_tall_enough_for_every_fragment_combination(whispers, unk
     Asserted as an invariant rather than against a literal height so it still
     holds when a fourth fragment is added — the failure mode that produced this
     bug was a constant that stopped matching the content."""
-    tui, _ = _tui_at_width(140)
+    tui, _ = _tui_at_width(140, whispers=whispers, unknowns=unknowns)
     tui._bus.publish(WhispersDetected(count=whispers))
     tui._bus.publish(UnknownsDetected(count=unknowns, filenames=["m.hda"] * unknowns))
     tui._bus.publish(RetryCandidatesDetected(count=failed))
@@ -266,7 +280,7 @@ def test_badge_survives_narrow_terminals_where_the_pending_line_wraps(width):
     panel needs 6 rows at width 60, 5 at 80-100 and 4 at 140+. A constant is
     correct at one width and wrong at the others, which is why the pane is
     measured against the console it will be drawn on."""
-    tui, _ = _tui_at_width(width)
+    tui, _ = _tui_at_width(width, whispers=2, unknowns=1)
     tui._bus.publish(WhispersDetected(count=2))
     tui._bus.publish(UnknownsDetected(count=1, filenames=["m.hda"]))
     tui._bus.publish(RetryCandidatesDetected(count=3))
