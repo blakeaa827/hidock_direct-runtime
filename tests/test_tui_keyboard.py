@@ -78,6 +78,10 @@ def _build(tmp_path: Path, files):
         delete_after_offload=False,
         hta_converter=_FakeHTAConverter(),
         sleep=lambda *_a, **_k: None,
+        # These tests drive real offloads. With transcription on, each one calls
+        # AssemblyAI -- billed -- whenever ASSEMBLYAI_API_KEY is in the
+        # environment; only its absence kept that from happening.
+        transcribe_on_offload=False,
     )
     app = App(
         adapter=mock, watcher=watcher, offloader=offloader, store=store, bus=bus,
