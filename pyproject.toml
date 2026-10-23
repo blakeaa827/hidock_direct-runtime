@@ -24,13 +24,19 @@ dependencies = [
     # decorative. The previous `>=0.30` was not merely loose, it was wrong:
     # `assemblyai.streaming.v3` does not exist at 0.30, so a resolver honouring
     # that floor produces an install where live transcription cannot import.
-    # 0.64.21 is the version this suite runs against.
     #
-    # The ceiling excludes 1.0.0, which is published and unreviewed. This is a
+    # 1.6.1 is the floor because it is the first release exposing
+    # `speaker_labels_revision_interval_ms` (absent at 1.5.2), which live
+    # transcription now sends so speakers are re-clustered DURING the call
+    # (live_speaker_revisions_sdk_upgrade_prd.md). Below it, pydantic silently
+    # drops the field. The suite runs against both 1.6.1 and the newest 1.x.
+    #
+    # The ceiling excludes 2.0, which is unpublished and unreviewed. This is a
     # public clone-and-run app: an unbounded major means a stranger's fresh
     # `pip install` silently picks up an API we have never executed. Raise it
-    # deliberately, against the streaming surface in live_transcribe.py.
-    "assemblyai>=0.64.21,<1",
+    # deliberately, against the streaming surface in live_transcribe.py and the
+    # batch surface in the vendored diarize_audio/assemblyai_client.py.
+    "assemblyai>=1.6.1,<2",
 ]
 
 [project.optional-dependencies]

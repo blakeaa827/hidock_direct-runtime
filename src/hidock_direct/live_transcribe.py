@@ -91,6 +91,29 @@ def _provider_label(label: Optional[str]) -> Optional[str]:
     return None if label in _PLACEHOLDER_LABELS else label
 
 
+# How often the provider re-clusters the far channel's speakers DURING the call.
+# The operator names speakers while watching them talk; with the provider default
+# (0) the only re-clustering is at session end, after the naming is done, so a
+# label born on one voice can carry another for the whole call. 120000 ms is the
+# vendor's documented minimum ("Min 120000; recommended 300000") and the
+# operator's "every couple of minutes" (live_speaker_revisions_sdk_upgrade_prd.md
+# FR-2.1/2.2). The minimum is an authored copy of a vendor doc: it is not
+# readable at runtime, and is deletable once the SDK exposes it.
+SPEAKER_REVISION_INTERVAL_MS = 120_000
+_REVISION_INTERVAL_FIELD = "speaker_labels_revision_interval_ms"
+
+
+def _revision_interval_supported() -> bool:
+    """Whether the INSTALLED SDK can send the interval at all.
+
+    Read from the SDK's own model rather than its version string: below 1.6.1
+    the field does not exist, and pydantic silently IGNORES an unknown kwarg
+    (0.64.21's `model_config` is `{}`), so the session would run with no mid-call
+    revisions and no error.
+    """
+    return _REVISION_INTERVAL_FIELD in StreamingParameters.model_fields
+
+
 class LiveTranscriptionError(RuntimeError):
     """A live session could not be started, or died mid-call."""
 
@@ -162,9 +185,19 @@ class _ChannelSession:
     def _handle_revision(self, _client, event) -> None:
         # `revisions` is a LIST — one provider event corrects N earlier turns.
         for item in getattr(event, "revisions", None) or []:
+            turn_order = getattr(item, "turn_order", None)
+            if turn_order is None or not hasattr(item, "speaker_label"):
+                # Enrichment, not the transcript: skip this one item, keep the
+                # rest and the session. Name the TYPE only — an item carries
+                # words from the conversation.
+                log.warning(
+                    "live: skipping a malformed speaker revision item (%s) on the %s channel",
+                    type(item).__name__, self.channel.value,
+                )
+                continue
             self._on_event(LiveSpeakerRevision(
                 channel=self.channel,
-                turn_order=item.turn_order,
+                turn_order=turn_order,
                 speaker=_provider_label(item.speaker_label),
             ))
 
@@ -276,7 +309,25 @@ class LiveTranscriber:
                     f"({assemblyai.__version__}) is too old for speaker revisions — "
                     f"names will not be corrected if the provider re-clusters. "
                     f"Fix: ./scripts/bootstrap.sh, or "
-                    f"pip install -U 'assemblyai>=0.64.21,<1' in the venv you launch from."
+                    f"pip install -U 'assemblyai>=1.6.1,<2' in the venv you launch from."
+                ),
+                severity=Severity.WARNING,
+                context="live",
+            ))
+        elif not _revision_interval_supported():
+            # The SDK knows the revision EVENT but not the interval PARAMETER
+            # (0.64.x-1.5.x): the provider then re-clusters only at session end,
+            # and the kwarg in `_params` was dropped without an error. Same
+            # remedy, said once, so the operator knows why names lag.
+            import assemblyai
+            self._bus.publish(Error(
+                message=(
+                    f"Live transcription is running, but this AssemblyAI SDK "
+                    f"({assemblyai.__version__}) cannot ask for speakers to be "
+                    f"re-checked every {SPEAKER_REVISION_INTERVAL_MS // 60_000} "
+                    f"minutes — labels will only be corrected when the call ends. "
+                    f"Fix: ./scripts/bootstrap.sh, or "
+                    f"pip install -U 'assemblyai>=1.6.1,<2' in the venv you launch from."
                 ),
                 severity=Severity.WARNING,
                 context="live",
@@ -392,6 +443,9 @@ class LiveTranscriber:
             encoding=Encoding.pcm_s16le,
             speaker_labels=True if diarize else None,
             max_speakers=self._max_speakers if diarize else None,
+            speaker_labels_revision_interval_ms=(
+                SPEAKER_REVISION_INTERVAL_MS if diarize else None
+            ),
             redact_pii=True if self._redact_pii else None,
             redact_pii_policies=self._redact_pii_policies if self._redact_pii else None,
         )

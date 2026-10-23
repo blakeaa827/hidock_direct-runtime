@@ -751,3 +751,148 @@ def test_an_sdk_without_speaker_revisions_degrades_visibly_instead_of_dying():
     said = warnings[0].message
     assert "assemblyai" in said.lower()
     assert "bootstrap.sh" in said or "pip install" in said
+
+
+# --------------------------------------------------------------------------
+# 1j-b — mid-call speaker revisions (live_speaker_revisions_sdk_upgrade_prd.md)
+# --------------------------------------------------------------------------
+
+
+def test_far_session_requests_speaker_revisions_every_two_minutes():
+    """FR-2.1. The operator names speakers DURING the call; without an interval
+    the provider re-clusters only once, at session end, after the naming is done.
+    120000 ms is the vendor's minimum and the operator's "every couple of minutes".
+
+    MUTATION: drop the kwarg from `_params` (the provider default 0 = end-only).
+    """
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    assert h.far.params.speaker_labels_revision_interval_ms == 120_000
+
+
+def test_near_session_requests_no_speaker_revisions():
+    """The near channel is one person and requests no diarization (1b FR-4.3);
+    a revision interval there is meaningless at best.
+
+    MUTATION: pass the interval unconditionally.
+    """
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    assert h.near.params.speaker_labels_revision_interval_ms is None
+
+
+def test_the_revision_interval_reaches_the_wire():
+    """The MODEL holding the field is not the request carrying it. Built through
+    the SDK's own URI builder — the exact string the websocket opens — so a field
+    the SDK accepts but does not serialise would fail here.
+
+    MUTATION: drop the kwarg from `_params`.
+    """
+    from assemblyai.streaming.v3 import client as sdk_client
+
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    uri = sdk_client._build_uri("streaming.assemblyai.com", h.far.params)
+    assert "speaker_labels_revision_interval_ms=120000" in uri, uri
+
+
+def test_an_sdk_without_the_revision_interval_warns_once_and_the_session_runs(monkeypatch):
+    """FR-2.3. On an SDK older than 1.6.1 `StreamingParameters` has no such field
+    and pydantic IGNORES the unknown kwarg (measured: 0.64.21's model_config is
+    `{}`), so the session would run with no mid-call revisions and no error. An
+    operator whose venv predates the upgrade must be told, with the fix.
+
+    MUTATION: remove the check — nothing is published and the degraded session
+    is indistinguishable from a working one.
+    """
+    import hidock_direct.live_transcribe as module
+
+    monkeypatch.setattr(module, "_revision_interval_supported", lambda: False)
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    warnings = [
+        e for e in h.of(Error)
+        if e.context == "live" and "bootstrap.sh" in e.message and "every" in e.message
+    ]
+    assert len(warnings) == 1, [e.message for e in h.of(Error)]
+    assert warnings[0].severity is Severity.WARNING
+    assert len(h.of(LiveTranscriptionStarted)) == 1
+
+
+def test_a_current_sdk_publishes_no_revision_interval_warning():
+    """The warning's other half: silent when the field exists, or it becomes
+    noise the operator learns to ignore.
+
+    MUTATION: publish the warning unconditionally.
+    """
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    assert not [e for e in h.of(Error) if "bootstrap.sh" in e.message]
+
+
+def test_the_installed_sdk_actually_supports_the_revision_interval():
+    """The guard's real input, not a monkeypatch: the venv this suite runs in must
+    carry the field, or every test above passes against a session that would
+    silently drop it.
+
+    MUTATION: lower the pyproject floor below 1.6.1 and install it.
+    """
+    import hidock_direct.live_transcribe as module
+
+    assert module._revision_interval_supported()
+
+
+def test_the_sdk_floor_is_the_first_release_with_the_revision_interval():
+    """FR-1.1. The floor is load-bearing: 1.6.1 is the first release exposing
+    `speaker_labels_revision_interval_ms` (probed 2026-10-23: absent at 1.5.2,
+    present at 1.6.1 and 1.6.5). A lower floor would admit an install where
+    FR-2.3's warning fires on every call.
+
+    MUTATION: `assemblyai>=0.64.21,<1` (the pre-1j-b range).
+    """
+    import tomllib
+    from pathlib import Path
+
+    pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with pyproject.open("rb") as handle:
+        deps = tomllib.load(handle)["project"]["dependencies"]
+    spec = next(d for d in deps if d.startswith("assemblyai"))
+
+    assert spec == "assemblyai>=1.6.1,<2", spec
+
+
+def test_a_malformed_revision_item_is_skipped_and_the_rest_still_apply(caplog):
+    """FR-ERR-1. Revisions are enrichment: one bad item must not drop the rest of
+    the event's list or end the session, and the warning names the TYPE only —
+    an item is conversation content.
+
+    MUTATION: read `item.turn_order` unguarded — AttributeError escapes the
+    provider callback and the good item after it is never published.
+    """
+    import types
+
+    from assemblyai.streaming.v3 import SpeakerRevisionEvent, SpeakerRevisionItem
+
+    h = Harness()
+    event = SpeakerRevisionEvent(revisions=[
+        SpeakerRevisionItem(turn_order=0, speaker_label="B"),
+    ])
+    # A shape the SDK model cannot express, so it is injected after validation.
+    bad = types.SimpleNamespace(speaker_label="C", words=SECRET_TEXT)
+    event.revisions.insert(0, bad)
+    with caplog.at_level(logging.WARNING), h.transcriber:
+        h.far.emit(StreamingEvents.SpeakerRevision, event)
+
+    assert [(r.turn_order, r.speaker) for r in h.of(LiveSpeakerRevision)] == [(0, "B")]
+    assert any("SimpleNamespace" in r.getMessage() for r in caplog.records)
+    assert not any(SECRET_TEXT in r.getMessage() for r in caplog.records)
