@@ -71,7 +71,7 @@ import webbrowser
 from collections import deque
 from typing import Callable, Dict, List, Optional
 
-from .config import parse_speaker_count
+from .config import SPEAKER_COUNT_DEFAULT, parse_speaker_count
 from .events import (
     Error,
     EventBus,
@@ -94,11 +94,12 @@ DEFAULT_RING_SIZE = 2000
 # transcript.
 DEFAULT_OPERATOR_NAME = "Me"
 
-# The ceiling a composition that supplies none falls back to — 1b's value,
-# carried through so the two phases cannot disagree. NOT what the operator
-# sees: `__main__` always passes `config.live_max_speakers`, which is what
-# the `l` prompt prepopulates with.
-DEFAULT_MAX_SPEAKERS = 6
+# The ceiling a composition that supplies none falls back to. Imported, never
+# restated, so a library default cannot disagree with the app default (it was a
+# stale 6 here and in `live_transcribe` until 1j-a). NOT what the operator sees:
+# `__main__` always passes `config.live_max_speakers`, which is what the `l`
+# prompt prepopulates with.
+DEFAULT_MAX_SPEAKERS = SPEAKER_COUNT_DEFAULT
 
 # How long the launcher waits on a browser process before deciding the window is
 # up. `l` runs on the TUI's keyboard thread, so the wait has to be bounded.

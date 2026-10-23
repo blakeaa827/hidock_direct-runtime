@@ -58,6 +58,7 @@ from .events import (
     LiveTurn,
     Severity,
 )
+from .config import SPEAKER_COUNT_DEFAULT
 from .realtime import Frame, SAMPLE_RATE_HZ
 from .retry import CLASS_OPERATOR_ACTIONABLE, classify_failure, redact, remediation
 
@@ -67,9 +68,9 @@ log = logging.getLogger(__name__)
 # retry path says "press r"; here the session is already gone.
 _LIVE_NEXT_ACTION = "then start live transcription again."
 
-# A modern meeting platform, not a room. Six is a conference call, not six
-# people around one microphone.
-DEFAULT_MAX_SPEAKERS = 6
+# The app's default, imported rather than restated (live_speaker_count_ten_prd.md
+# FR-1.2). Callers normally pass the operator's per-session count.
+DEFAULT_MAX_SPEAKERS = SPEAKER_COUNT_DEFAULT
 
 _ORDER = (LiveChannel.NEAR, LiveChannel.FAR)
 

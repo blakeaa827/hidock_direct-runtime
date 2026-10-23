@@ -484,3 +484,53 @@ def test_the_env_example_says_it_is_a_prepopulated_default_not_a_ceiling():
     assert "1-10" in comment, (
         f".env.example does not state the vendor range the prompt enforces:\n{comment}"
     )
+
+
+# -- 1j-a: the default IS the vendor cap, and every layer agrees -----------------
+# live_speaker_count_ten_prd.md FR-1.1 / FR-1.2 / FR-1.3
+
+
+def test_the_speaker_default_is_the_vendor_cap():
+    """FR-1.1. Derived from the cap, never a second literal: if the vendor raised
+    its cap, a hand-typed 10 would quietly stop being "the most it allows".
+
+    MUTATION: `SPEAKER_COUNT_DEFAULT = 10` restated as a literal survives this
+    (equal today), which is why the next test exists — it pins the two LIBRARY
+    copies, the place a stale literal actually lived (6, twice).
+    MUTATION: `SPEAKER_COUNT_DEFAULT = 8`.
+    """
+    from hidock_direct.config import SPEAKER_COUNT_DEFAULT, SPEAKER_COUNT_MAX
+
+    assert SPEAKER_COUNT_DEFAULT == SPEAKER_COUNT_MAX == 10
+
+
+def test_library_speaker_defaults_agree_with_the_app_default():
+    """FR-1.2. `live_server` and `live_transcribe` each carried their own `6`,
+    inert only because `__main__` always passes the configured value. A library
+    default that disagrees with the app default is the drift this project has
+    paid for twice (`10fba18`, the 2026-08-20 key defect).
+
+    MUTATION: set either module's DEFAULT_MAX_SPEAKERS back to 6.
+    """
+    from hidock_direct import live_server, live_transcribe
+    from hidock_direct.config import SPEAKER_COUNT_DEFAULT
+
+    assert live_server.DEFAULT_MAX_SPEAKERS == SPEAKER_COUNT_DEFAULT
+    assert live_transcribe.DEFAULT_MAX_SPEAKERS == SPEAKER_COUNT_DEFAULT
+
+
+def test_the_env_example_counts_the_other_end_not_you():
+    """FR-1.3 / FR-2.1. The template and the prompt define the number ONE way.
+    1e chose "including yourself" for one label of headroom; the 2026-10-23
+    measurement showed one label was not enough, so both now ask for the other
+    end plus headroom — changed together, so there is still one definition.
+
+    MUTATION: leave the "INCLUDING YOURSELF" comment block in place.
+    """
+    _assignment, comment = _env_example_block()
+    comment = comment.lower()
+
+    assert "other end" in comment, f".env.example does not say who to count:\n{comment}"
+    assert "including yourself" not in comment, (
+        f".env.example still carries the superseded definition:\n{comment}"
+    )

@@ -191,6 +191,12 @@ def diarize_config_for_archive(archive_dir):
 SPEAKER_COUNT_MIN = 1
 SPEAKER_COUNT_MAX = 10
 
+# What the `l` prompt opens with when HIDOCK_LIVE_MAX_SPEAKERS is unset: the cap
+# itself. Too low MERGES people into one label, which no name can undo; too high
+# only splits one voice across two nameable rows. Derived from the cap, never a
+# second literal (live_speaker_count_ten_prd.md FR-1.1).
+SPEAKER_COUNT_DEFAULT = SPEAKER_COUNT_MAX
+
 # Named once so a refusal cannot say one range while the check enforces another.
 _SPEAKER_RANGE = f"{SPEAKER_COUNT_MIN}-{SPEAKER_COUNT_MAX}"
 
@@ -285,7 +291,9 @@ def load_config(env_file: Optional[os.PathLike[str] | str] = None, overlay: Opti
     # invented on someone's disk without asking. Making the operator name it
     # also means they know where the raw call audio is accumulating.
     keep_wav = _resolve("HIDOCK_LIVE_KEEP_WAV_DIR", "", env_values, overlay).strip()
-    speakers = _resolve("HIDOCK_LIVE_MAX_SPEAKERS", "8", env_values, overlay)
+    speakers = _resolve(
+        "HIDOCK_LIVE_MAX_SPEAKERS", str(SPEAKER_COUNT_DEFAULT), env_values, overlay
+    )
     api_key = _resolve("ASSEMBLYAI_API_KEY", "", env_values, overlay)
 
     try:

@@ -954,6 +954,39 @@ def test_the_rendered_prompt_carries_the_vendors_own_guidance():
     assert "split" in text, f"the prompt omits the over-splitting warning: {text}"
 
 
+def test_the_rendered_prompt_asks_for_the_other_end_not_the_whole_call():
+    """live_speaker_count_ten_prd.md FR-2.1. The far channel is everyone except
+    the operator, so that is who the ceiling bounds; the question says so.
+
+    MUTATION: keep "People on this call, including you".
+    """
+    tui = _prompt_tui(_RecordingLiveController())
+
+    tui._on_key("l")
+    text = _text(tui._render()).lower()
+
+    assert "other end" in text, f"the prompt does not ask about the other end: {text}"
+    assert "including you" not in text, f"the superseded question is still on screen: {text}"
+
+
+def test_the_rendered_guidance_states_which_mistake_is_recoverable():
+    """FR-2.2. The asymmetry that decides the number, in words the operator can
+    act on mid-call: too low MERGES people (no name can separate them), too high
+    only splits one person across rows (name both the same). And the concrete
+    answers for the two common calls.
+
+    MUTATION: restore the 1e guidance text (no "same name", no "1:1").
+    """
+    tui = _prompt_tui(_RecordingLiveController())
+
+    tui._on_key("l")
+    text = _text(tui._render()).lower()
+
+    assert "merge" in text, f"the prompt omits the merge risk: {text}"
+    assert "same name" in text, f"the prompt omits that a split is recoverable: {text}"
+    assert "1:1" in text, f"the prompt omits the small-call answer: {text}"
+
+
 def test_the_rendered_prompt_tracks_the_edits():
     """U-3's display half, on the presentation path. A field whose displayed
     value lags the buffer would have the operator confirm a number other than

@@ -210,15 +210,17 @@ def _speaker_refusal(attempted: str) -> str:
     )
 
 
-# The vendor's own guidance, on screen, because the trade is not guessable from
-# the number alone and is counter-intuitive in one direction: too HIGH is also
-# wrong. "Give the model a little headroom above the number of speakers you
-# expect; setting it too high can cause over-splitting."
+# The vendor's own guidance ("give the model a little headroom above the
+# number of speakers you expect; setting it too high can cause over-splitting"),
+# restated as the asymmetry that actually decides the number: too LOW merges
+# people irreversibly, too HIGH only splits one person across rows the operator
+# can give the same name. Plus the answer for the two common calls
+# (live_speaker_count_ten_prd.md FR-2.2).
 SPEAKER_COUNT_GUIDANCE = (
-    f"Range {SPEAKER_COUNT_MIN}-{SPEAKER_COUNT_MAX}. Give the model a little "
-    "headroom above the number of speakers you expect — too high over-splits "
-    "one person across several labels, and past the cap extra speakers are "
-    "merged into the closest existing one."
+    f"Range {SPEAKER_COUNT_MIN}-{SPEAKER_COUNT_MAX}; leave headroom. Too low "
+    "merges people into one label, and no name can separate them. Too high may "
+    "split one person across two rows: give both the same name. 10 for a group "
+    "call; for a 1:1, 2."
 )
 
 
@@ -1067,7 +1069,7 @@ class TUI:
         # the line that is lost first is the one you can most afford to lose.
         rows: list[Text] = [
             Text.assemble(
-                ("People on this call, including you: ", "bold"),
+                ("People on the other end (not you): ", "bold"),
                 (prompt.value or "—", "bold cyan"),
             )
         ]
