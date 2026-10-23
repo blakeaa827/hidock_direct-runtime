@@ -309,6 +309,37 @@ def _speaker_key(channel: LiveChannel, label: Optional[str]) -> str:
     return _FAR_SPEAKER_PREFIX + label
 
 
+def merge_consecutive_utterances(utterances: List[dict]) -> List[dict]:
+    """Rejoin consecutive lines by the same speaker, for the rendered document.
+
+    The far session ends turns quickly so a fast exchange splits by speaker
+    (live_diarization_turns_prd.md FR-1). That makes one person's sentence arrive
+    as several turns, and the document should read as paragraphs, not fragments.
+
+    Joined only when the SPEAKER KEY matches. That means never on a display name
+    (two labels the operator gave one name stay apart; merging them would bake a
+    naming mistake in), and never across the near/far boundary. `far-unlabelled`
+    is never joined at all: an unattributed fragment, such as a PENDING turn, is
+    not attributed to a neighbour, and two of them may be two people. Texts join
+    with one space and the FIRST start is kept, because that is when the
+    paragraph began. Returns new dicts; the input is untouched, since the caller
+    writes it unmerged to the `.aai.json`.
+    """
+    merged: List[dict] = []
+    for utterance in utterances:
+        speaker = utterance.get("speaker")
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and speaker == previous.get("speaker")
+            and speaker != _UNLABELLED_FAR_SPEAKER_KEY
+        ):
+            previous["text"] = f"{previous['text']} {utterance['text']}"
+            continue
+        merged.append(dict(utterance))
+    return merged
+
+
 def _safe_unlink(path: Optional[Path]) -> None:
     if path is None:
         return
@@ -1061,10 +1092,11 @@ class LiveArchive:
             audio_path, TRANSCRIPT_SUFFIX, started_at
         )
         transcript = self._build_response(turns, samples, self._transcript_id(target))
+        rendered = self._joined_for_render(transcript)
         speaker_names = self._speaker_names(turns) if names is None else names
         try:
             text = render_markdown(
-                transcript,
+                rendered,
                 source_filename=audio_path.name,
                 recorded_at=started_at,
                 speaker_names=speaker_names,
@@ -1080,12 +1112,34 @@ class LiveArchive:
             self._publish(self._transcript_failed_message(audio_path, exc), Severity.ERROR)
             return
         self._transcript_path = target
-        self._rendered_response = transcript
+        # What was RENDERED: a rename derives its anchor from this document.
+        self._rendered_response = rendered
         self._rendered_names = dict(speaker_names)
         log.info("live: transcript written for %s", audio_path.name)
         if conflict is not None:
             self._publish(conflict, Severity.WARNING)
         self._write_raw_response(target, transcript)
+
+    def _joined_for_render(self, transcript: dict) -> dict:
+        """The response with consecutive same-speaker lines rejoined.
+
+        FR-ERR-1 of live_diarization_turns_prd.md: choppy is strictly better than
+        missing. A merge that fails for ANY reason renders the provider's turns
+        as they are, and says so once. The unmerged `transcript` is what the
+        `.aai.json` gets either way.
+        """
+        try:
+            utterances = merge_consecutive_utterances(transcript.get("utterances") or [])
+        except Exception as exc:  # noqa: BLE001 -- the transcript must still be written
+            log.warning("live: joining transcript lines failed: %s", type(exc).__name__)
+            self._publish(
+                "The live transcript was written with each turn on its own line: "
+                f"consecutive lines by the same speaker were not joined ({type(exc).__name__}). "
+                "Nothing is missing; it is only choppier to read.",
+                Severity.WARNING,
+            )
+            return transcript
+        return {**transcript, "utterances": utterances}
 
     def _sidecar_target(
         self, audio_path: Path, suffix: str, started_at: datetime

@@ -896,3 +896,54 @@ def test_a_malformed_revision_item_is_skipped_and_the_rest_still_apply(caplog):
     assert [(r.turn_order, r.speaker) for r in h.of(LiveSpeakerRevision)] == [(0, "B")]
     assert any("SimpleNamespace" in r.getMessage() for r in caplog.records)
     assert not any(SECRET_TEXT in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------
+# 1j-c — shorter far turns (live_diarization_turns_prd.md FR-1)
+# --------------------------------------------------------------------------
+
+
+def test_far_session_ends_turns_on_short_silences():
+    """FR-1.1. The provider gives a turn ONE label, so two people answering each
+    other without a pause become one turn under one speaker (16 of 222 far turns
+    on 2026-10-23). The vendor's "aggressive" preset for rapid exchanges ends a
+    turn on 160 ms of silence when confident, and forces it at 400 ms (defaults
+    400 / 1280). The archive rejoins the fragments.
+
+    MUTATION: drop either kwarg, which falls back to the vendor default.
+    """
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    assert (h.far.params.min_turn_silence, h.far.params.max_turn_silence) == (160, 400)
+
+
+def test_near_session_keeps_the_vendors_turn_detection():
+    """FR-1.2. The near channel is one person by construction: shorter turns buy
+    no attribution there and only fragment the operator's own lines.
+
+    MUTATION: apply the preset to both sessions.
+    """
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    assert (h.near.params.min_turn_silence, h.near.params.max_turn_silence) == (None, None)
+    assert h.near.params.end_of_turn_confidence_threshold is None
+    assert h.far.params.end_of_turn_confidence_threshold is None
+
+
+def test_the_turn_silences_reach_the_wire():
+    """The request, not the model, through the SDK's own URI builder.
+
+    MUTATION: drop the kwargs.
+    """
+    from assemblyai.streaming.v3 import client as sdk_client
+
+    h = Harness()
+    with h.transcriber:
+        pass
+
+    uri = sdk_client._build_uri("streaming.assemblyai.com", h.far.params)
+    assert "min_turn_silence=160" in uri and "max_turn_silence=400" in uri, uri

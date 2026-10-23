@@ -100,6 +100,18 @@ def _provider_label(label: Optional[str]) -> Optional[str]:
 # FR-2.1/2.2). The minimum is an authored copy of a vendor doc: it is not
 # readable at runtime, and is deletable once the SDK exposes it.
 SPEAKER_REVISION_INTERVAL_MS = 120_000
+
+# Far-channel turn detection: the vendor's "aggressive" preset for short, rapid
+# exchanges (end on 160 ms of silence when confident, force at 400 ms; defaults
+# 400 / 1280). A turn carries ONE speaker label, so a quick back-and-forth with
+# no pause used to arrive as one turn under one person (16 of 222 far turns on
+# 2026-10-23). Shorter turns let each voice carry its own label; the live
+# archive rejoins consecutive same-speaker lines so the document still reads as
+# paragraphs (live_diarization_turns_prd.md). The vendor's confidence threshold
+# default (0.4) already equals the preset, so it is not sent. These are authored
+# copies of a vendor doc, deletable once the SDK exposes named presets.
+FAR_MIN_TURN_SILENCE_MS = 160
+FAR_MAX_TURN_SILENCE_MS = 400
 _REVISION_INTERVAL_FIELD = "speaker_labels_revision_interval_ms"
 
 
@@ -446,6 +458,8 @@ class LiveTranscriber:
             speaker_labels_revision_interval_ms=(
                 SPEAKER_REVISION_INTERVAL_MS if diarize else None
             ),
+            min_turn_silence=FAR_MIN_TURN_SILENCE_MS if diarize else None,
+            max_turn_silence=FAR_MAX_TURN_SILENCE_MS if diarize else None,
             redact_pii=True if self._redact_pii else None,
             redact_pii_policies=self._redact_pii_policies if self._redact_pii else None,
         )

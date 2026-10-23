@@ -4415,3 +4415,216 @@ def test_no_log_record_carries_audio_bytes_when_a_wav_is_kept(
 
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert "\\x34\\x12" not in blob and "4660" not in blob
+
+
+# ==========================================================================
+# 1j-c — consecutive same-speaker lines are rejoined in the archived .md
+# (live_diarization_turns_prd.md FR-2). The far session now ends turns sooner
+# so a quick exchange splits by speaker; the document must not read as
+# fragments. The .aai.json keeps the provider's turns unmerged.
+# ==========================================================================
+
+
+def test_consecutive_lines_by_the_same_speaker_are_joined(sessions):
+    """FR-2.1. A, A, B, A becomes three lines: one A paragraph that keeps the FIRST
+    offset, then B, then A. A later A is not pulled back across B.
+
+    MUTATION: render from the unmerged response; four lines appear.
+    MUTATION: keep the LAST start; the first offset becomes 00:02.
+    """
+    harness = sessions(names={"A": "Dana", "B": "Priya"})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("Yeah,", label="A")
+        harness.write(1.0)
+        harness.turn("I think so.", label="A")
+        harness.write(1.0)
+        harness.turn("Okay.", label="B")
+        harness.write(1.0)
+        harness.turn("Good.", label="A")
+
+    text = harness.transcript_text()
+
+    assert turn_lines(text) == [
+        ("Dana", "00:01", "Yeah, I think so."),
+        ("Priya", "00:03", "Okay."),
+        ("Dana", "00:04", "Good."),
+    ]
+
+
+def test_the_operator_and_a_far_speaker_are_never_joined(sessions):
+    """FR-2.2. Near and far are different speaker keys, even back to back.
+
+    MUTATION: merge on display name with the operator's name equal to a far name.
+    """
+    harness = sessions(names={"A": OPERATOR})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.near("from my side")
+        harness.write(1.0)
+        harness.turn("from theirs", label="A")
+
+    assert len(turn_lines(harness.transcript_text())) == 2
+
+
+def test_two_labels_given_the_same_name_are_not_joined(sessions):
+    """FR-2.2. F and G both named "David Bible" stay two paragraphs. Merging on
+    the display name would bake a mid-call naming mistake into the document
+    irreversibly, and two labels with one name is exactly how the operator fixes
+    an over-split.
+
+    MUTATION: merge on the rendered label instead of the speaker key.
+    """
+    harness = sessions(names={"F": "David Bible", "G": "David Bible"})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("first half", label="F")
+        harness.write(1.0)
+        harness.turn("second half", label="G")
+
+    assert texts_of(harness.transcript_text()) == ["first half", "second half"]
+
+
+def test_unattributed_far_lines_are_never_absorbed_into_a_neighbour(sessions):
+    """FR-2.2. An unlabelled fragment, such as a PENDING turn (4e65bfd), is not
+    attributed to whoever spoke around it.
+
+    MUTATION: drop the far-unlabelled exception; with the key check alone,
+    A/unlabelled/A stays three lines anyway, so this fixture ALSO places two
+    unlabelled lines back to back. They must not join each other either: two
+    unattributed fragments may be two people.
+    """
+    harness = sessions(names={"A": "Dana"})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("before", label="A")
+        harness.write(1.0)
+        harness.turn("yep", label=None)
+        harness.write(1.0)
+        harness.turn("mm", label=None)
+        harness.write(1.0)
+        harness.turn("after", label="A")
+
+    assert texts_of(harness.transcript_text()) == ["before", "yep", "mm", "after"]
+
+
+def test_a_revision_before_stop_changes_how_lines_group(sessions):
+    """FR-2.3. The merge runs on FINAL labels: a fragment the provider re-clusters
+    from B to A joins its A neighbour.
+
+    MUTATION: merge on the label each turn first arrived with.
+    """
+    harness = sessions(names={"A": "Dana", "B": "Priya"})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("start of a sentence", label="A", order=0)
+        harness.write(1.0)
+        moved = harness.turn("and its end", label="B", order=1)
+        harness.bus.publish(
+            LiveSpeakerRevision(channel=moved.channel, turn_order=1, speaker="A")
+        )
+
+    assert turn_lines(harness.transcript_text()) == [
+        ("Dana", "00:01", "start of a sentence and its end"),
+    ]
+
+
+def test_the_aai_json_keeps_the_providers_turns_unmerged(sessions):
+    """FR-2.4. The parity file is the only record of where the provider ended
+    turns, and it is what compare_live_to_reference.py reads to count mixed
+    turns. Nothing downstream parses it (live_archive_prd.md FR-2.6).
+
+    MUTATION: write the merged response to the .aai.json.
+    """
+    harness = sessions(names={"A": "Dana"})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("one", label="A")
+        harness.write(1.0)
+        harness.turn("two", label="A")
+
+    raw = json.loads(harness.suffixed(RAW_RESPONSE_SUFFIX)[0].read_text())
+    assert [u["text"] for u in raw["utterances"]] == ["one", "two"]
+    assert texts_of(harness.transcript_text()) == ["one two"]
+
+
+def test_a_merge_that_raises_renders_every_turn_and_says_so(sessions, monkeypatch):
+    """FR-ERR-1. Choppy is strictly better than missing: if the merge fails for
+    any reason, the transcript is written unmerged and the operator is told.
+
+    MUTATION: let the exception reach `_write_transcript`'s render guard, which
+    writes NO transcript.
+    """
+    import hidock_direct.live_archive as module
+
+    def boom(_utterances):
+        raise ValueError("synthetic merge failure")
+
+    monkeypatch.setattr(module, "merge_consecutive_utterances", boom)
+    harness = sessions(names={"A": "Dana"})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("one", label="A")
+        harness.write(1.0)
+        harness.turn("two", label="A")
+
+    assert texts_of(harness.transcript_text()) == ["one", "two"]
+    warnings = [e for e in harness.errors() if e.severity is Severity.WARNING]
+    assert any("not joined" in e.message for e in warnings), harness.messages()
+
+
+def test_a_rename_after_the_merge_renames_the_joined_paragraph(sessions):
+    """FR-2.5. 1f's anchored substitution still finds the label: merging changes
+    how many lines carry it, not which labels exist.
+
+    MUTATION: keep the UNMERGED response as `_rendered_response`; the anchor is
+    then derived from a document that was never written. (It agrees today
+    because first-appearance order is preserved, so this pins the observable
+    outcome, not the mechanism.)
+    """
+    harness = sessions(names={})
+
+    with harness.rec:
+        harness.write(1.0)
+        harness.turn("one", label="A")
+        harness.write(1.0)
+        harness.turn("two", label="A")
+
+    outcome = harness.rec.rename_speaker("A", "Dana")
+
+    assert outcome.applied
+    assert turn_lines(harness.transcript_text()) == [("Dana", "00:01", "one two")]
+
+
+def test_merge_consecutive_utterances_matrix():
+    """The response-variant matrix from the PRD, on the pure helper.
+
+    MUTATION: join texts with "" (words run together).
+    """
+    from hidock_direct.live_archive import merge_consecutive_utterances as merge
+
+    def u(speaker, start, text):
+        return {"speaker": speaker, "start": start, "text": text}
+
+    assert merge([]) == []
+    assert merge([u("far-A", 0, "x")]) == [u("far-A", 0, "x")]
+    assert merge([u("far-A", 0, "a"), u("far-A", 5, "b"), u("far-A", 9, "c")]) == [
+        u("far-A", 0, "a b c")
+    ]
+    assert merge([u("far-A", 0, "a"), u("far-B", 1, "b"), u("far-A", 2, "c")]) == [
+        u("far-A", 0, "a"), u("far-B", 1, "b"), u("far-A", 2, "c")
+    ]
+    assert merge([u("near", 0, "a"), u("near", 1, "b"), u("far-A", 2, "c")]) == [
+        u("near", 0, "a b"), u("far-A", 2, "c")
+    ]
+    # The input is not mutated: the caller still writes it to .aai.json.
+    original = [u("far-A", 0, "a"), u("far-A", 1, "b")]
+    merge(original)
+    assert original == [u("far-A", 0, "a"), u("far-A", 1, "b")]
