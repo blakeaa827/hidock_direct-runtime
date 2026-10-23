@@ -484,6 +484,57 @@ def test_speaker_revision_emits_one_event_per_revised_turn_and_mutates_nothing()
     assert [t.speaker for t in h.of(LiveTurn)] == ["A", "A"]
 
 
+# The provider's "no speaker assigned yet" placeholder for a turn shorter than
+# about a second. `PENDING` is CAPTURED: archived live sessions 2026-09-11_133233,
+# 2026-09-11_090036 and 2026-10-21_105858 each carry a `far-PENDING` speaker,
+# which the archive can only key from a provider label of "PENDING". `UNKNOWN`
+# is unobserved-but-reachable: the vendor's earlier streaming diarization docs
+# name it as the label for the same short-turn case.
+# bug_report_live_pending_label_treated_as_speaker.md
+_PLACEHOLDER_LABELS = ("PENDING", "UNKNOWN")
+
+
+@pytest.mark.parametrize("placeholder", _PLACEHOLDER_LABELS)
+def test_placeholder_label_is_unattributed(placeholder):
+    """A placeholder is not a person: it reaches the bus as `speaker=None`, the
+    representation every surface already renders as attributed-to-nobody."""
+    h = Harness()
+    with h.transcriber:
+        h.far.emit(StreamingEvents.Turn, turn("Yep.", order=0, speaker=placeholder))
+
+    assert [t.speaker for t in h.of(LiveTurn)] == [None]
+
+
+@pytest.mark.parametrize("placeholder", _PLACEHOLDER_LABELS)
+def test_revision_to_a_placeholder_is_unattributed(placeholder):
+    from assemblyai.streaming.v3 import SpeakerRevisionEvent, SpeakerRevisionItem
+
+    h = Harness()
+    with h.transcriber:
+        h.far.emit(StreamingEvents.Turn, turn("Yep.", order=0, speaker="A"))
+        h.far.emit(
+            StreamingEvents.SpeakerRevision,
+            SpeakerRevisionEvent(revisions=[
+                SpeakerRevisionItem(turn_order=0, speaker_label=placeholder),
+            ]),
+        )
+
+    assert [r.speaker for r in h.of(LiveSpeakerRevision)] == [None]
+
+
+@pytest.mark.parametrize("label", ["A", "B", "P", "pending", "UNKNOWNS"])
+def test_real_labels_pass_through_unchanged(label):
+    """Exact-match only. A letter, a lowercase spelling and a longer string that
+    merely contains a placeholder are labels the provider gave, not the
+    placeholder, so they must survive — over-normalising would silently merge a
+    real speaker into nobody."""
+    h = Harness()
+    with h.transcriber:
+        h.far.emit(StreamingEvents.Turn, turn("Hello there.", order=0, speaker=label))
+
+    assert [t.speaker for t in h.of(LiveTurn)] == [label]
+
+
 # --------------------------------------------------------------------------
 # Response-variant coverage matrix
 # --------------------------------------------------------------------------

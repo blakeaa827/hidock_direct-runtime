@@ -73,6 +73,22 @@ DEFAULT_MAX_SPEAKERS = 6
 
 _ORDER = (LiveChannel.NEAR, LiveChannel.FAR)
 
+# The provider's "no speaker assigned yet" placeholder for a turn with less than
+# about a second of audio. It is a sentinel, not a person, and `None` is already
+# what every surface renders as attributed-to-nobody. Mapped HERE, at the one
+# boundary where provider labels enter, so no consumer ever sees it. Exact
+# matches only: anything else the provider sends is a real label.
+#   PENDING  captured: archived live sessions 2026-09-11_133233, 2026-09-11_090036
+#            and 2026-10-21_105858 each carry a `far-PENDING` speaker.
+#   UNKNOWN  unobserved-but-reachable: the vendor's earlier streaming
+#            diarization docs name it as the label for the same short-turn case.
+# bug_report_live_pending_label_treated_as_speaker.md
+_PLACEHOLDER_LABELS = frozenset({"PENDING", "UNKNOWN"})
+
+
+def _provider_label(label: Optional[str]) -> Optional[str]:
+    return None if label in _PLACEHOLDER_LABELS else label
+
 
 class LiveTranscriptionError(RuntimeError):
     """A live session could not be started, or died mid-call."""
@@ -148,7 +164,7 @@ class _ChannelSession:
             self._on_event(LiveSpeakerRevision(
                 channel=self.channel,
                 turn_order=item.turn_order,
-                speaker=item.speaker_label,
+                speaker=_provider_label(item.speaker_label),
             ))
 
     def _handle_termination(self, _client, event) -> None:
@@ -166,7 +182,7 @@ class _ChannelSession:
             # if one arrives keeps "near is the operator" true by structure
             # rather than by configuration.
             return None
-        return getattr(event, "speaker_label", None)
+        return _provider_label(getattr(event, "speaker_label", None))
 
     # -- lifecycle --------------------------------------------------------
 

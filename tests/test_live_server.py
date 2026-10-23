@@ -2509,6 +2509,49 @@ def test_variant_a_far_turn_with_no_label_renders_without_an_attribution(live):
     assert payload["display_name"] is None
 
 
+def test_a_provider_placeholder_label_grows_no_row_and_names_nobody(live):
+    """bug_report_live_pending_label_treated_as_speaker.md, end to end through the
+    REAL bridge: a turn the provider labels `PENDING` (its sub-second "no speaker
+    yet" placeholder, captured in three archived sessions) must not become a
+    nameable "Speaker PENDING" row. A later revision to a real label attributes
+    the line normally.
+
+    Driven through `LiveTranscriber` rather than by publishing a `LiveTurn`
+    directly: the placeholder arrives as a provider string, and publishing an
+    already-normalised event would only test the surface on an input the bridge
+    is supposed to guarantee."""
+    from assemblyai.streaming.v3 import (
+        SpeakerRevisionEvent,
+        SpeakerRevisionItem,
+        StreamingEvents,
+    )
+    from tests.test_live_transcribe import Harness, turn as provider_turn
+
+    h = Harness()
+    surface = live.surface(operator_name="Blake")
+    h.bus.subscribe(surface.publish)
+    with h.transcriber:
+        h.far.emit(StreamingEvents.Turn, provider_turn("Hello everyone.", order=0, speaker="A"))
+        h.far.emit(StreamingEvents.Turn, provider_turn("Yep.", order=1, speaker="PENDING"))
+        page = live.page(surface)
+        payloads = page.read(4)
+
+        assert kinds(payloads, "names")[-1]["labels"] == ["A"]
+        pending_line = [t for t in turns_of(payloads) if t["turn_order"] == 1][0]
+        assert pending_line["label"] is None
+        assert pending_line["display_name"] is None
+
+        h.far.emit(
+            StreamingEvents.SpeakerRevision,
+            SpeakerRevisionEvent(revisions=[
+                SpeakerRevisionItem(turn_order=1, speaker_label="A"),
+            ]),
+        )
+        revision = kinds(page.read(1), "revision")[-1]
+
+    assert (revision["turn_order"], revision["label"]) == (1, "A")
+
+
 def test_variant_an_empty_turn_never_reaches_the_page(live):
     """Row 9. A silent turn boundary is not something to show; a blank row in the
     scrollback is indistinguishable from a dropped line."""
