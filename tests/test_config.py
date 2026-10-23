@@ -230,9 +230,9 @@ def test_an_operator_chosen_bundle_is_never_overridden(monkeypatch):
 # value the `l` prompt is prepopulated with. Two consequences this section
 # pins:
 #
-#   1. The default moves 6 -> 8. The operator asked for 8 verbatim ("so the
-#      user can just hit enter if they choose not to override it"), and the
-#      vendor's own guidance is headroom above the expected count.
+#   1. The default moved 6 -> 8 (1e), then 8 -> 10 (1j-a,
+#      live_speaker_count_ten_prd.md): 8 left zero headroom on an 8-person
+#      call, and a merge past the cap is irreversible while a split is not.
 #   2. The range check 1..10 is the VENDOR's, quoted in the PRD ("a strict
 #      limit, not a hint"), and it now has to serve two callers — this loader
 #      at startup and the prompt at keypress time. It lives here, once, so the
@@ -259,19 +259,22 @@ def _speaker_config(tmp_path: Path, monkeypatch, value=None):
     return load_config(env_file=tmp_path / "absent.env")
 
 
-def test_the_prepopulated_speaker_default_is_eight(tmp_path, monkeypatch):
-    """U-12 / FR-2.4. The operator's stated requirement, quoted in the PRD:
-    "prepopulated with a default of 8 so the user can just hit enter if they
-    choose not to override it."
+def test_the_prepopulated_speaker_default_is_ten(tmp_path, monkeypatch):
+    """U-12 / FR-2.4, superseded by live_speaker_count_ten_prd.md FR-1.1.
 
-    This is no longer a fixed ceiling that silently governs every call — it is
-    the number the prompt shows, and Enter alone commits it. 6 was live on the
-    10-person call that collapsed 2-3 people into one label.
+    Operator decision 2026-10-23: "Make ten the default unless there's a reason
+    not to." The measured reason: on the 2026-10-23 standup, 8 far-side people
+    under a ceiling of 8 left Tanner with no label and Luke and Howard merged
+    into one. A merge cannot be undone by any name the operator types; an
+    over-split can (name both rows the same person). So the safe default is the
+    vendor's cap.
 
-    MUTATION: `_resolve("HIDOCK_LIVE_MAX_SPEAKERS", "6", ...)` — restore the old
-    default literal in `load_config` and this test fails.
+    This is the number the prompt shows, and Enter alone commits it.
+
+    MUTATION: restore the `"8"` (or `"6"`) default literal in `load_config` and
+    this test fails.
     """
-    assert _speaker_config(tmp_path, monkeypatch).live_max_speakers == 8
+    assert _speaker_config(tmp_path, monkeypatch).live_max_speakers == 10
 
 
 def test_the_speaker_default_is_still_overridable_and_typed(tmp_path, monkeypatch):
