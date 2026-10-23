@@ -1188,13 +1188,18 @@ def test_the_name_map_is_read_at_stop_so_a_late_name_reaches_the_earliest_line(
         harness.write(1.0)
         harness.turn("who is this", label="A")
         harness.write(1.0)
+        # The operator between Dana's two lines keeps them two LINES now that
+        # consecutive same-speaker lines are rejoined (1j-c), so this still
+        # pins the earliest line separately from the later one.
+        harness.near("hi, who just joined?")
+        harness.write(1.0)
         harness.turn("still me", label="A")
         # The operator finally types the name, mid-call.
         harness.names["A"] = "Dana"
 
     text = harness.transcript_text()
 
-    assert labels_of(text) == ["Dana", "Dana"], (
+    assert labels_of(text) == ["Dana", OPERATOR, "Dana"], (
         "a name typed mid-call did not reach the lines already spoken"
     )
 
@@ -1838,7 +1843,9 @@ def test_a_write_that_fails_mid_session_stops_recording_once_and_keeps_what_land
         harness.turn("before the mount dropped", label="A")
         for _ in range(8):
             harness.write(0.5)
-        harness.turn("and the session kept going", label="A")
+        # A second far speaker, so the two turns stay two lines under 1j-c's
+        # rejoining of consecutive same-speaker lines.
+        harness.turn("and the session kept going", label="B")
 
     problems = [e for e in harness.errors() if e.severity is Severity.ERROR]
     assert len(problems) == 1, (
